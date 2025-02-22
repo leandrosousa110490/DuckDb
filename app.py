@@ -88,32 +88,57 @@ class CodeEditor(QPlainTextEdit):
 
 
 class PandasModel(QAbstractTableModel):
+    CHUNK_SIZE = 1000  # Number of rows to load at a time
+
     def __init__(self, df=pd.DataFrame(), parent=None):
         super().__init__(parent)
         self._df = df
+        self._total_rows = len(df)
+        self._loaded_chunks = {}
+        self._column_names = list(df.columns)
+
+    def _ensure_chunk_loaded(self, row_index):
+        chunk_index = row_index // self.CHUNK_SIZE
+        if chunk_index not in self._loaded_chunks:
+            start_idx = chunk_index * self.CHUNK_SIZE
+            end_idx = min(start_idx + self.CHUNK_SIZE, self._total_rows)
+            self._loaded_chunks[chunk_index] = self._df.iloc[start_idx:end_idx]
+            # Keep only the most recent chunks to manage memory
+            if len(self._loaded_chunks) > 3:  # Keep only 3 chunks in memory
+                min_key = min(k for k in self._loaded_chunks.keys() if k != chunk_index)
+                del self._loaded_chunks[min_key]
 
     def rowCount(self, parent=None):
-        return self._df.shape[0]
+        return self._total_rows
 
     def columnCount(self, parent=None):
-        return self._df.shape[1]
+        return len(self._column_names)
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if index.isValid() and role == Qt.ItemDataRole.DisplayRole:
-            value = self._df.iat[index.row(), index.column()]
+        if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
+            return None
+
+        row = index.row()
+        col = index.column()
+
+        if 0 <= row < self._total_rows and 0 <= col < len(self._column_names):
+            chunk_index = row // self.CHUNK_SIZE
+            self._ensure_chunk_loaded(row)
+            chunk = self._loaded_chunks[chunk_index]
+            value = chunk.iat[row % self.CHUNK_SIZE, col]
             return str(value)
         return None
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
-        if role == Qt.ItemDataRole.DisplayRole:
-            if orientation == Qt.Orientation.Horizontal:
-                if self._df.columns.empty or section >= len(self._df.columns):
-                    return ""
-                return str(self._df.columns[section])
-            else:
-                if self._df.index.empty or section >= len(self._df.index):
-                    return ""
-                return str(self._df.index[section])
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+
+        if orientation == Qt.Orientation.Horizontal:
+            if 0 <= section < len(self._column_names):
+                return str(self._column_names[section])
+        else:
+            if 0 <= section < self._total_rows:
+                return str(section + 1)
         return None
 
 
