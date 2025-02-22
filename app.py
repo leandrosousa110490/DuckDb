@@ -16,7 +16,9 @@ from PyQt6.QtGui import QTextCursor, QSyntaxHighlighter, QTextCharFormat
 SQL_KEYWORDS = [
     'SELECT', 'FROM', 'WHERE', 'INSERT', 'UPDATE', 'DELETE', 'JOIN', 'INNER', 'LEFT', 'RIGHT',
     'FULL', 'ON', 'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET', 'CREATE', 'DROP', 'ALTER',
-    'TABLE', 'VIEW', 'INDEX', 'DISTINCT', 'VALUES', 'INTO'
+    'TABLE', 'VIEW', 'INDEX', 'DISTINCT', 'VALUES', 'INTO', 'AS', 'AND', 'OR', 'NOT', 'NULL',
+    'PRIMARY', 'KEY', 'FOREIGN', 'REFERENCES', 'DEFAULT', 'CONSTRAINT', 'UNIQUE', 'CHECK',
+    'AUTO_INCREMENT', 'CASCADE', 'SET', 'BETWEEN', 'LIKE', 'IN', 'EXISTS', 'ALL', 'ANY', 'SOME'
 ]
 
 class SQLHighlighter(QSyntaxHighlighter):
@@ -24,16 +26,28 @@ class SQLHighlighter(QSyntaxHighlighter):
         super().__init__(parent)
         self.highlightingRules = []
 
+        # SQL Keywords format (red)
         keywordFormat = QTextCharFormat()
         keywordFormat.setForeground(Qt.GlobalColor.red)
         keywords = SQL_KEYWORDS
         for word in keywords:
-            # Create regex that matches the whole word
-            expression = QRegularExpression(f"\b{word}\b")
+            expression = QRegularExpression(f"\\b{word}\\b")
             expression.setPatternOptions(QRegularExpression.PatternOption.CaseInsensitiveOption)
             self.highlightingRules.append((expression, keywordFormat))
 
+        # Single-line comment format (green)
+        singleLineCommentFormat = QTextCharFormat()
+        singleLineCommentFormat.setForeground(Qt.GlobalColor.darkGreen)
+        self.highlightingRules.append((QRegularExpression("--[^\n]*"), singleLineCommentFormat))
+
+        # Multi-line comment format (green)
+        self.multiLineCommentFormat = QTextCharFormat()
+        self.multiLineCommentFormat.setForeground(Qt.GlobalColor.darkGreen)
+        self.commentStartExpression = QRegularExpression("/\\*")
+        self.commentEndExpression = QRegularExpression("\\*/")
+
     def highlightBlock(self, text):
+        # Single-line comments and keywords
         for pattern, fmt in self.highlightingRules:
             iterator = pattern.globalMatch(text)
             while iterator.hasNext():
@@ -41,6 +55,25 @@ class SQLHighlighter(QSyntaxHighlighter):
                 start = match.capturedStart()
                 length = match.capturedLength()
                 self.setFormat(start, length, fmt)
+
+        # Multi-line comments
+        self.setCurrentBlockState(0)
+        startIndex = 0
+        if self.previousBlockState() != 1:
+            startIndex = self.commentStartExpression.match(text).capturedStart()
+
+        while startIndex >= 0:
+            endMatch = self.commentEndExpression.match(text, startIndex)
+            endIndex = endMatch.capturedStart()
+            commentLength = 0
+            if endIndex == -1:
+                self.setCurrentBlockState(1)
+                commentLength = len(text) - startIndex
+            else:
+                commentLength = endIndex - startIndex + endMatch.capturedLength()
+
+            self.setFormat(startIndex, commentLength, self.multiLineCommentFormat)
+            startIndex = self.commentStartExpression.match(text, startIndex + commentLength).capturedStart()
 
 
 class CodeEditor(QPlainTextEdit):
