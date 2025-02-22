@@ -1,4 +1,4 @@
-import streamlit as st
+import sys
 import duckdb
 import pandas as pd
 import os
@@ -6,177 +6,267 @@ import tempfile
 import shutil
 from pathlib import Path
 
-st.title("DuckDatabase Interactive Dashboard")
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+                             QLineEdit, QFileDialog, QTableView, QMessageBox, QLabel, QPlainTextEdit, QCompleter,
+                             QListWidget, QSplitter)
+from PyQt6.QtCore import QAbstractTableModel, Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QTextCursor
 
-# Connect to an in-memory DuckDB database
-conn = duckdb.connect(database=':memory:', read_only=False)
-st.write("Connected to DuckDB in-memory database.")
 
-# New section: Option to load DuckDB Database file
-db_upload = st.file_uploader("Upload DuckDB Database file (.db or .duckdb)", type=["db", "duckdb"])
-if db_upload:
-    import tempfile
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".duckdb") as temp_db:
-        temp_db.write(db_upload.getbuffer())
-        temp_db_path = temp_db.name
-    # Close the current in-memory connection and connect to the uploaded database file
-    conn.close()
-    conn = duckdb.connect(database=temp_db_path, read_only=False)
-    st.success("Connected to uploaded DuckDB database file.")
+SQL_KEYWORDS = [
+    'SELECT', 'FROM', 'WHERE', 'INSERT', 'UPDATE', 'DELETE', 'JOIN', 'INNER', 'LEFT', 'RIGHT',
+    'FULL', 'ON', 'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET', 'CREATE', 'DROP', 'ALTER',
+    'TABLE', 'VIEW', 'INDEX', 'DISTINCT', 'VALUES', 'INTO'
+]
 
-# Helper function to load CSV into a table using DuckDB's native CSV reader
+class CodeEditor(QPlainTextEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Auto-completion disabled as per user request
+        # Removed auto-completion related methods (setCompleter, insertCompletion, keyPressEvent, mousePressEvent, etc.)
+        
+    # Use default behavior from QPlainTextEdit for key events and mouse clicks
+    pass  # No additional methods needed
 
-def load_csv_table(conn, file_path, table_name):
-    conn.execute(f"DROP TABLE IF EXISTS {table_name};")
-    conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM read_csv_auto('{file_path}', sample_size=-1);")
 
-# Section: File upload for CSV/Excel files. Each file is loaded into its own table.
-uploaded_files = st.file_uploader("Upload CSV/Excel files", accept_multiple_files=True, type=["csv", "xlsx"])
+class PandasModel(QAbstractTableModel):
+    def __init__(self, df=pd.DataFrame(), parent=None):
+        super().__init__(parent)
+        self._df = df
 
-if uploaded_files:
-    uploaded_table_names = []
-    temp_dir = tempfile.mkdtemp()
-    for uploaded_file in uploaded_files:
-        file_suffix = uploaded_file.name.split('.')[-1].lower()
-        safe_name = uploaded_file.name.split('.')[0].replace(' ', '_').replace('-', '_')
-        table_name = f'{safe_name}'
-        temp_file_path = Path(temp_dir) / uploaded_file.name
-        with open(temp_file_path, 'wb') as f:
-            f.write(uploaded_file.getbuffer())
-        if file_suffix == 'csv':
-            try:
-                load_csv_table(conn, str(temp_file_path), table_name)
-                st.success(f"CSV file '{uploaded_file.name}' loaded into table '{table_name}'.")
-                uploaded_table_names.append(table_name)
-            except Exception as e:
-                st.error(f"Error loading CSV file '{uploaded_file.name}': {e}")
-        else:
-            try:
-                df = pd.read_excel(temp_file_path)
-                conn.execute(f"DROP TABLE IF EXISTS {table_name};")
-                conn.register(table_name, df)
-                st.success(f"Excel file '{uploaded_file.name}' loaded into table '{table_name}'.")
-                st.write(f"Preview of {table_name}:", df.head())
-                uploaded_table_names.append(table_name)
-            except Exception as e:
-                st.error(f"Error loading Excel file '{uploaded_file.name}': {e}")
-    shutil.rmtree(temp_dir)
+    def rowCount(self, parent=None):
+        return self._df.shape[0]
 
-# Section: Option to load files from a folder path
-folder_path = st.text_input("Or enter folder path to load CSV/Excel files")
-if folder_path and st.button("Load Folder Files"):
-    try:
-        folder_path = folder_path.strip().replace('\\', '/')
-        folder = Path(folder_path)
-        csv_files = list(folder.glob('*.csv'))
-        excel_files = list(folder.glob('*.xlsx'))
-        if not csv_files and not excel_files:
-            st.warning("No CSV or Excel files found in the given folder.")
-        else:
-            folder_table_names = []
-            # Process CSV files individually
-            if csv_files:
-                for f in csv_files:
-                    table_name = f.stem.replace(' ', '_').replace('-', '_')
-                    try:
-                        load_csv_table(conn, str(f), table_name)
-                        st.success(f"CSV file '{f.name}' loaded into table '{table_name}'.")
-                        folder_table_names.append(table_name)
-                    except Exception as e:
-                        st.error(f"Error loading CSV file '{f.name}': {e}")
-                st.write("Note: CSV files loaded. They are not previewed due to large size.")
-            # Process Excel files individually
-            if excel_files:
-                for f in excel_files:
-                    table_name = f.stem.replace(' ', '_').replace('-', '_')
-                    try:
-                        df = pd.read_excel(f)
-                        conn.execute(f"DROP TABLE IF EXISTS {table_name};")
-                        conn.register(table_name, df)
-                        st.success(f"Excel file '{f.name}' loaded into table '{table_name}'.")
-                        st.write(f"Preview of {table_name}:", df.head())
-                        folder_table_names.append(table_name)
-                    except Exception as e:
-                        st.error(f"Error loading Excel file '{f.name}': {e}")
-    except Exception as e:
-        st.error(f"Error: {e}")
+    def columnCount(self, parent=None):
+        return self._df.shape[1]
 
-# Display Available Tables
-try:
-    tables_df = conn.execute("SHOW TABLES;").fetchdf()
-    st.subheader("Available Tables")
-    st.dataframe(tables_df)
-except Exception as e:
-    st.error(f"Error retrieving tables: {e}")
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if index.isValid() and role == Qt.ItemDataRole.DisplayRole:
+            value = self._df.iat[index.row(), index.column()]
+            return str(value)
+        return None
 
-# Text area for SQL query input
-query = st.text_area("Enter your DuckDB command", "SELECT * FROM <table_name>;", height=250)
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.DisplayRole:
+            if orientation == Qt.Orientation.Horizontal:
+                if self._df.columns.empty or section >= len(self._df.columns):
+                    return ""
+                return str(self._df.columns[section])
+            else:
+                if self._df.index.empty or section >= len(self._df.index):
+                    return ""
+                return str(self._df.index[section])
+        return None
 
-if st.button("Run Query"):
-    try:
-        result = conn.execute(query).fetchdf()
-        st.session_state.query_result = result  # store result for export
-        st.dataframe(result)
-    except Exception as e:
-        st.error(f"Error: {e}")
 
-# Button to create a sample table for demonstration purposes
-if st.button("Create Sample Table"):
-    try:
-        conn.execute("CREATE TABLE my_table AS SELECT range(10) AS id, random() AS value;")
-        st.success("Sample table created. Try running: SELECT * FROM my_table;")
-    except Exception as e:
-        st.error(f"Error creating sample table: {e}")
+class QueryWorker(QThread):
+    resultReady = pyqtSignal(object)  # will emit a DataFrame
+    errorOccurred = pyqtSignal(str)
 
-# Section to export the loaded data as CSV with a selectable delimiter
-st.markdown("---")
-st.subheader("Export Data as CSV")
+    def __init__(self, db_path, query):
+        super().__init__()
+        self.db_path = db_path
+        self.query = query
 
-# Query for available tables for export selection
-try:
-    available_tables = conn.execute("SHOW TABLES;").fetchdf()['name'].tolist()
-except Exception as e:
-    st.error(f"Error fetching table names: {e}")
-    available_tables = []
-
-if available_tables:
-    export_table = st.selectbox("Select table to export", available_tables)
-    delimiter = st.text_input("Enter CSV delimiter", value=",")
-    if st.button("Export CSV"):
+    def run(self):
         try:
-            output_file = f"exported_{export_table}.csv"
-            conn.execute(f"COPY (SELECT * FROM {export_table}) TO '{output_file}' (DELIMITER '{delimiter}', HEADER true);")
-            with open(output_file, "rb") as f:
-                st.download_button(label="Download CSV", data=f, file_name=output_file, mime="text/csv")
+            # Open a new connection to avoid threading issues
+            conn = duckdb.connect(database=self.db_path, read_only=False)
+            # Split the queries by semicolon
+            queries = [q.strip() for q in self.query.split(';') if q.strip()]
+            last_df = None
+            for q in queries:
+                cur = conn.execute(q)
+                # Only fetch data for SELECT queries
+                if q.lower().startswith('select'):
+                    last_df = cur.fetchdf()
+            conn.close()
+            if last_df is None:
+                # For commands that do not return data, show a success message
+                last_df = pd.DataFrame({'message': ['Command executed successfully']})
+            self.resultReady.emit(last_df)
         except Exception as e:
-            st.error(f"Error exporting CSV: {e}")
-else:
-    st.info("No tables available for export.")
+            self.errorOccurred.emit(str(e))
 
-# Modify Export Section to export query result as CSV, Parquet or Excel
-st.markdown("---")
-st.subheader("Export Query Result")
 
-if 'query_result' in st.session_state and not st.session_state.query_result.empty:
-    export_format = st.radio("Select export format:", options=["CSV", "Parquet", "Excel"])
-    if st.button("Export Query Result"):
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Database Viewer")
+        self.connection = None
+        self.current_db_path = None
+        self.current_df = None
+        self.setup_ui()
+
+    def setup_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        # File loading widgets
+        file_layout = QHBoxLayout()
+        self.file_line_edit = QLineEdit()
+        self.file_line_edit.setReadOnly(True)
+        load_button = QPushButton("Load Database")
+        load_button.clicked.connect(self.load_database)
+        file_layout.addWidget(QLabel("Database File:"))
+        file_layout.addWidget(self.file_line_edit)
+        file_layout.addWidget(load_button)
+        main_layout.addLayout(file_layout)
+
+        # Splitter for table list and query/results area
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left panel: Table list and load selected table button
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.addWidget(QLabel("Tables:"))
+        self.table_list = QListWidget()
+        # Removed auto-load on table click
+        # self.table_list.itemClicked.connect(self.load_table_data)
+        left_layout.addWidget(self.table_list)
+        
+        load_table_button = QPushButton("Load Selected Table")
+        load_table_button.clicked.connect(self.load_selected_table_data)
+        left_layout.addWidget(load_table_button)
+        splitter.addWidget(left_panel)
+
+        # Right panel: Query editor, buttons and result view
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+
+        # SQL query input - Removed autocompletion setup
+        self.query_edit = CodeEditor()
+        self.query_edit.setPlaceholderText("Enter SQL query here...")
+        right_layout.addWidget(self.query_edit)
+
+        # Buttons for running query and exporting results
+        button_layout = QHBoxLayout()
+        run_query_button = QPushButton("Run Query")
+        run_query_button.clicked.connect(self.run_query)
+        button_layout.addWidget(run_query_button)
+
+        export_csv_button = QPushButton("Export CSV")
+        export_csv_button.clicked.connect(lambda: self.export_data('csv'))
+        button_layout.addWidget(export_csv_button)
+
+        export_excel_button = QPushButton("Export Excel")
+        export_excel_button.clicked.connect(lambda: self.export_data('excel'))
+        button_layout.addWidget(export_excel_button)
+
+        export_parquet_button = QPushButton("Export Parquet")
+        export_parquet_button.clicked.connect(lambda: self.export_data('parquet'))
+        button_layout.addWidget(export_parquet_button)
+
+        right_layout.addLayout(button_layout)
+
+        # Table view for showing query results
+        self.table_view = QTableView()
+        right_layout.addWidget(self.table_view)
+        
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(1, 3)
+        main_layout.addWidget(splitter)
+
+    # New method to load table data on button press
+    def load_selected_table_data(self):
+        item = self.table_list.currentItem()
+        if item is None:
+            QMessageBox.warning(self, "Warning", "Please select a table from the list.")
+            return
+        self.load_table_data(item)
+
+    def load_database(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Database File", "",
+                                                   "Database Files (*.duckdb *.db);;All Files (*)")
+        if file_path:
+            try:
+                if self.connection:
+                    self.connection.close()
+                self.connection = duckdb.connect(database=file_path, read_only=False)
+                self.current_db_path = file_path
+                self.file_line_edit.setText(file_path)
+
+                # Load table list
+                df_tables = self.connection.execute("SHOW TABLES;").fetchdf()
+                self.table_list.clear()
+                # Assume first column holds the table names
+                for table in df_tables.iloc[:, 0]:
+                    self.table_list.addItem(str(table))
+
+                # Also show table list in table view as initial view
+                self.current_df = df_tables
+                model = PandasModel(df_tables)
+                self.table_view.setModel(model)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load database: {e}")
+
+    def load_table_data(self, item):
+        table_name = item.text()
+        if not self.connection:
+            QMessageBox.warning(self, "Warning", "No database loaded")
+            return
         try:
-            if export_format == "CSV":
-                output_file = "query_result.csv"
-                st.session_state.query_result.to_csv(output_file, index=False)
-                with open(output_file, "rb") as f:
-                    st.download_button(label="Download CSV", data=f, file_name=output_file, mime="text/csv")
-            elif export_format == "Parquet":
-                output_file = "query_result.parquet"
-                st.session_state.query_result.to_parquet(output_file, index=False)
-                with open(output_file, "rb") as f:
-                    st.download_button(label="Download Parquet", data=f, file_name=output_file, mime="application/octet-stream")
-            elif export_format == "Excel":
-                output_file = "query_result.xlsx"
-                st.session_state.query_result.to_excel(output_file, index=False)
-                with open(output_file, "rb") as f:
-                    st.download_button(label="Download Excel", data=f, file_name=output_file, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            query = f"SELECT * FROM {table_name};"
+            df = self.connection.execute(query).fetchdf()
+            self.current_df = df
+            model = PandasModel(df)
+            self.table_view.setModel(model)
         except Exception as e:
-            st.error(f"Error exporting query result: {e}")
-else:
-    st.info("No query result available to export. Run a query first.")
+            QMessageBox.critical(self, "Query Error", f"Failed to load table data: {e}")
+
+    def run_query(self):
+        if not self.current_db_path:
+            QMessageBox.warning(self, "Warning", "No database loaded")
+            return
+        tc = self.query_edit.textCursor()
+        selected_text = tc.selectedText()
+        query = selected_text if selected_text.strip() else self.query_edit.toPlainText().strip()
+        if not query:
+            QMessageBox.warning(self, "Warning", "Please enter a SQL query")
+            return
+        # Disable UI components if needed during long query
+        self.setEnabled(False)
+        self.worker = QueryWorker(self.current_db_path, query)
+        self.worker.resultReady.connect(self.handle_query_result)
+        self.worker.errorOccurred.connect(self.handle_query_error)
+        self.worker.finished.connect(lambda: self.setEnabled(True))
+        self.worker.start()
+
+    def handle_query_result(self, df):
+        self.current_df = df
+        model = PandasModel(df)
+        self.table_view.setModel(model)
+
+    def handle_query_error(self, error):
+        QMessageBox.critical(self, "Query Error", f"Failed to execute query: {error}")
+
+    def export_data(self, format):
+        if self.current_df is None or self.current_df.empty:
+            QMessageBox.warning(self, "Warning", "No data to export")
+            return
+        # QFileDialog in PyQt6 does not use Options attribute directly
+        default_filter = "CSV Files (*.csv)" if format=='csv' else "Excel Files (*.xlsx)" if format=='excel' else "Parquet Files (*.parquet)"
+        file_ext = ".csv" if format=='csv' else ".xlsx" if format=='excel' else ".parquet"
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save File", "", default_filter)
+        if file_path:
+            if not file_path.endswith(file_ext):
+                file_path += file_ext
+            try:
+                if format == 'csv':
+                    self.current_df.to_csv(file_path, index=False)
+                elif format == 'excel':
+                    self.current_df.to_excel(file_path, index=False)
+                elif format == 'parquet':
+                    self.current_df.to_parquet(file_path, index=False)
+                QMessageBox.information(self, "Success", f"Data exported successfully to {file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", f"Failed to export data: {e}")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.resize(1000, 600)
+    window.show()
+    sys.exit(app.exec())
