@@ -190,29 +190,64 @@ class QueryTab(QWidget):
         self.query_edit.setPlaceholderText("Enter SQL query here...")
         layout.addWidget(self.query_edit, 2)
 
-        # Buttons
+        # Buttons with modern styling
         button_layout = QHBoxLayout()
-        run_query_button = QPushButton("Run Query")
-        run_query_button.clicked.connect(self.run_query)
-        button_layout.addWidget(run_query_button)
+        
+        # Run Query button with status indicator
+        self.run_button_container = QWidget()
+        run_button_layout = QHBoxLayout(self.run_button_container)
+        run_button_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.run_query_button = QPushButton("Run Query")
+        self.run_query_button.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white; padding: 5px 15px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #45a049; }"
+            "QPushButton:disabled { background-color: #cccccc; }"
+        )
+        self.run_query_button.clicked.connect(self.run_query)
+        run_button_layout.addWidget(self.run_query_button)
+        
+        # Status label
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet("color: #666666; margin-left: 10px;")
+        run_button_layout.addWidget(self.status_label)
+        
+        button_layout.addWidget(self.run_button_container)
+        button_layout.addStretch()
 
-        export_csv_button = QPushButton("Export CSV")
-        export_csv_button.clicked.connect(lambda: self.export_data('csv'))
-        button_layout.addWidget(export_csv_button)
+        # Export buttons
+        export_buttons = [
+            ("Export CSV", lambda: self.export_data('csv')),
+            ("Export Excel", lambda: self.export_data('excel')),
+            ("Export Parquet", lambda: self.export_data('parquet'))
+        ]
 
-        export_excel_button = QPushButton("Export Excel")
-        export_excel_button.clicked.connect(lambda: self.export_data('excel'))
-        button_layout.addWidget(export_excel_button)
-
-        export_parquet_button = QPushButton("Export Parquet")
-        export_parquet_button.clicked.connect(lambda: self.export_data('parquet'))
-        button_layout.addWidget(export_parquet_button)
+        for text, callback in export_buttons:
+            btn = QPushButton(text)
+            btn.setStyleSheet(
+                "QPushButton { background-color: #008CBA; color: white; padding: 5px 15px; border-radius: 3px; }"
+                "QPushButton:hover { background-color: #007399; }"
+                "QPushButton:disabled { background-color: #cccccc; }"
+            )
+            btn.clicked.connect(callback)
+            button_layout.addWidget(btn)
 
         layout.addLayout(button_layout)
 
-        # Results view
+        # Results view with styling
         self.table_view = QTableView()
+        self.table_view.setStyleSheet(
+            "QTableView { border: 1px solid #ddd; }"
+            "QHeaderView::section { background-color: #f5f5f5; padding: 5px; border: 1px solid #ddd; }"
+            "QTableView::item { padding: 5px; }"
+            "QTableView::item:selected { background-color: #e7f3ff; }"
+        )
         layout.addWidget(self.table_view, 3)
+
+        # Status bar for export progress
+        self.export_status = QLabel()
+        self.export_status.setStyleSheet("color: #666666; padding: 5px;")
+        layout.addWidget(self.export_status)
 
     def run_query(self):
         main_window = self.window()
@@ -227,28 +262,34 @@ class QueryTab(QWidget):
             QMessageBox.warning(self, "Warning", "Please enter a SQL query")
             return
 
-        # Create and show progress dialog
-        self.progress = QProgressDialog("Executing query...", "Cancel", 0, 0, self)
-        self.progress.setWindowModality(Qt.WindowModality.WindowModal)
-        self.progress.setAutoClose(True)
-        self.progress.setAutoReset(True)
-        self.progress.setMinimumDuration(0)
-        self.progress.canceled.connect(self.cancel_query)
+        # Update UI state
+        self.run_query_button.setEnabled(False)
+        self.status_label.setText("Executing query...")
 
         # Start query execution
         self.worker = QueryWorker(main_window.current_db_path, query)
         self.worker.resultReady.connect(self.handle_query_result)
         self.worker.errorOccurred.connect(self.handle_query_error)
-        self.worker.progressUpdate.connect(self.progress.setLabelText)
-        self.worker.finished.connect(self.progress.close)
+        self.worker.progressUpdate.connect(self.update_status)
+        self.worker.finished.connect(self.query_finished)
         self.worker.start()
+
+    def update_status(self, message):
+        self.status_label.setText(message)
+
+    def query_finished(self):
+        self.run_query_button.setEnabled(True)
+        self.status_label.setText("Query completed")
 
     def handle_query_result(self, df):
         self.current_df = df
         model = PandasModel(df)
         self.table_view.setModel(model)
+        self.status_label.setText(f"Query completed - {len(df)} rows returned")
 
     def handle_query_error(self, error):
+        self.run_query_button.setEnabled(True)
+        self.status_label.setText("Query failed")
         QMessageBox.critical(self, "Query Error", f"Failed to execute query: {error}")
 
     def export_data(self, format):
@@ -263,45 +304,194 @@ class QueryTab(QWidget):
             if not file_path.endswith(file_ext):
                 file_path += file_ext
 
-            # Create and show progress dialog for export
-            progress = QProgressDialog(f"Exporting data to {format.upper()}...", "Cancel", 0, 0, self)
-            progress.setWindowModality(Qt.WindowModality.WindowModal)
-            progress.setAutoClose(True)
-            progress.setMinimumDuration(0)
-
+            # Create a copy of the DataFrame to avoid thread issues
+            df_copy = self.current_df.copy()
+            
             # Create worker thread for export
-            self.export_worker = QThread()
-            self.export_worker.run = lambda: self.export_worker_run(file_path, format, progress)
-            self.export_worker.finished.connect(progress.close)
-            self.export_worker.start()
+            self.export_thread = QThread()
+            self.export_worker = ExportWorker(df_copy, file_path, format)
+            self.export_worker.moveToThread(self.export_thread)
+            
+            # Connect signals
+            self.export_thread.started.connect(self.export_worker.run)
+            self.export_worker.finished.connect(self.export_thread.quit)
+            self.export_worker.finished.connect(self.export_worker.deleteLater)
+            self.export_thread.finished.connect(self.export_thread.deleteLater)
+            self.export_worker.progress.connect(self.update_export_status)
+            self.export_worker.error.connect(self.handle_export_error)
+            self.export_worker.success.connect(self.handle_export_success)
+            
+            # Start export
+            self.export_status.setText(f"Exporting to {format.upper()}...")
+            self.export_thread.start()
 
-    def export_worker_run(self, file_path, format, progress):
-        try:
-            start_time = pd.Timestamp.now()
-            progress.setLabelText(f"Exporting to {format.upper()}... (0.0s)")
+    def update_export_status(self, message):
+        self.export_status.setText(message)
 
-            # Update progress message with timer
-            timer = QTimer()
-            timer.timeout.connect(lambda: progress.setLabelText(
-                f"Exporting to {format.upper()}... ({(pd.Timestamp.now() - start_time).total_seconds():.1f}s)"))
-            timer.start(100)
+    def handle_export_error(self, error):
+        self.export_status.setText("Export failed")
+        QMessageBox.critical(self, "Export Error", f"Failed to export data: {error}")
 
-            if format == 'csv':
-                self.current_df.to_csv(file_path, index=False)
-            elif format == 'excel':
-                self.current_df.to_excel(file_path, index=False)
-            elif format == 'parquet':
-                self.current_df.to_parquet(file_path, index=False)
-
-            timer.stop()
-            QMessageBox.information(self, "Success", f"Data exported successfully to {file_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Export Error", f"Failed to export data: {e}")
+    def handle_export_success(self, file_path):
+        self.export_status.setText("Export completed successfully")
+        QMessageBox.information(self, "Success", f"Data exported successfully to {file_path}")
 
     def cancel_query(self):
         if hasattr(self, 'worker') and self.worker.isRunning():
             self.worker.terminate()
             self.worker.wait()
+            self.status_label.setText("Query cancelled")
+            self.run_query_button.setEnabled(True)
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Database Viewer")
+        self.connection = None
+        self.current_db_path = None
+        self.setup_ui()
+
+    def setup_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        # Create a splitter to hold the available tables list and the query/result area
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_layout.addWidget(splitter)
+
+        # Left side: available tables list
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.addWidget(QLabel("Available Tables:"))
+        self.table_list = QListWidget()
+        self.table_list.setDisabled(True)
+        left_layout.addWidget(self.table_list)
+        splitter.addWidget(left_panel)
+
+        # Right side: query tabs
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+
+        # File loading widgets
+        file_layout = QHBoxLayout()
+        self.file_line_edit = QLineEdit()
+        self.file_line_edit.setReadOnly(True)
+        load_button = QPushButton("Load Database")
+        load_button.clicked.connect(self.load_database)
+        file_layout.addWidget(QLabel("Database File:"))
+        file_layout.addWidget(self.file_line_edit)
+        file_layout.addWidget(load_button)
+        right_layout.addLayout(file_layout)
+
+        # Tab widget for queries
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setTabsClosable(True)
+        self.tab_widget.tabCloseRequested.connect(self.close_tab)
+        right_layout.addWidget(self.tab_widget)
+
+        # New Query button
+        new_query_button = QPushButton("New Query")
+        new_query_button.clicked.connect(self.new_query)
+        right_layout.addWidget(new_query_button)
+
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(1, 3)
+
+        # Create initial tab
+        self.new_query()
+
+    def load_database(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Database File", "",
+                                                   "Database Files (*.duckdb *.db);;All Files (*)")
+        if file_path:
+            try:
+                if self.connection:
+                    self.connection.close()
+                self.connection = duckdb.connect(database=file_path, read_only=False)
+                self.current_db_path = file_path
+                self.file_line_edit.setText(file_path)
+
+                # Update available tables
+                self.update_table_list()
+                
+                # Show success message in current tab
+                current_tab = self.tab_widget.currentWidget()
+                if current_tab:
+                    df_message = pd.DataFrame({'message': [f"Database loaded. Use SQL commands to query tables."]})
+                    current_tab.current_df = df_message
+                    model = PandasModel(df_message)
+                    current_tab.table_view.setModel(model)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load database: {e}")
+
+    def update_table_list(self):
+        try:
+            df_tables = self.connection.execute("SHOW TABLES;").fetchdf()
+            table_names = df_tables.iloc[:,0].tolist() if not df_tables.empty else []
+            self.table_list.clear()
+            self.table_list.addItems(table_names)
+        except Exception as e:
+            QMessageBox.warning(self, "Warning", f"Failed to retrieve tables: {e}")
+
+    def new_query(self):
+        new_tab = QueryTab()
+        self.tab_widget.addTab(new_tab, f"Query {self.tab_widget.count() + 1}")
+        self.tab_widget.setCurrentWidget(new_tab)
+
+    def close_tab(self, index):
+        if self.tab_widget.count() > 1:  # Keep at least one tab open
+            self.tab_widget.removeTab(index)
+        else:
+            # If it's the last tab, clear it instead of closing
+            tab = self.tab_widget.widget(0)
+            tab.query_edit.clear()
+            tab.current_df = None
+            tab.table_view.setModel(PandasModel())
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.resize(1000, 600)
+    window.show()
+    sys.exit(app.exec())
+
+class ExportWorker(QObject):
+    finished = pyqtSignal(str)  # Signal to emit when export is complete
+    progress = pyqtSignal(str)  # Signal to emit progress updates
+    error = pyqtSignal(str)    # Signal to emit if an error occurs
+    success = pyqtSignal(str)  # Signal to emit on successful export
+
+    def __init__(self, df, file_path, format):
+        super().__init__()
+        self.df = df
+        self.file_path = file_path
+        self.format = format
+
+    def run(self):
+        try:
+            self.progress.emit(f"Starting {self.format.upper()} export...")
+            
+            if self.format == 'csv':
+                self.df.to_csv(self.file_path, index=False)
+            elif self.format == 'excel':
+                self.df.to_excel(self.file_path, index=False)
+            elif self.format == 'parquet':
+                self.df.to_parquet(self.file_path, index=False)
+            
+            self.progress.emit(f"Export completed successfully")
+            self.success.emit(self.file_path)
+            self.finished.emit(self.file_path)
+        except Exception as e:
+            self.error.emit(str(e))
+            self.finished.emit(self.file_path)
+
+    def cancel_query(self):
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait()
+            self.status_label.setText("Query cancelled")
+            self.run_query_button.setEnabled(True)
 
 class MainWindow(QMainWindow):
     def __init__(self):
