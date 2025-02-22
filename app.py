@@ -9,7 +9,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QFileDialog, QTableView, QMessageBox, QLabel, QPlainTextEdit, QCompleter,
                              QListWidget, QSplitter, QTabWidget, QProgressDialog)
-from PyQt6.QtCore import QAbstractTableModel, Qt, QThread, pyqtSignal, QRegularExpression, QTimer
+from PyQt6.QtCore import QAbstractTableModel, Qt, QThread, pyqtSignal, QRegularExpression, QTimer, QObject
 from PyQt6.QtGui import QTextCursor, QSyntaxHighlighter, QTextCharFormat
 
 
@@ -161,13 +161,21 @@ class QueryWorker(QThread):
             # Split the queries by semicolon
             queries = [q.strip() for q in self.query.split(';') if q.strip()]
             last_df = None
-            for i, q in enumerate(queries):
+            
+            def update_progress(i, q):
                 elapsed = (pd.Timestamp.now() - self.start_time).total_seconds()
                 self.progressUpdate.emit(f"Executing query {i+1}/{len(queries)}... (Elapsed: {elapsed:.1f}s)")
+            
+            for i, q in enumerate(queries):
+                update_progress(i, q)
                 cur = conn.execute(q)
+                # Update progress after execution
+                update_progress(i, q)
                 # Only fetch data for SELECT queries
                 if q.lower().startswith('select'):
                     last_df = cur.fetchdf()
+                    # Update progress after fetching data
+                    update_progress(i, q)
             conn.close()
             if last_df is None:
                 # For commands that do not return data, show a success message
