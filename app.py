@@ -160,14 +160,21 @@ class QueryWorker(QThread):
             elapsed = (pd.Timestamp.now() - self.start_time).total_seconds()
             self.progressUpdate.emit(f"{self.current_status} (Elapsed: {elapsed:.1f}s)")
 
+    def cleanup_timer(self):
+        if self.timer:
+            self.timer.stop()
+            self.timer.deleteLater()
+            self.timer = None
+
+    def start_timer(self):
+        self.start_time = pd.Timestamp.now()
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_elapsed_time)
+        self.timer.start(100)  # Update more frequently (every 100ms)
+
     def run(self):
         try:
-            self.start_time = pd.Timestamp.now()
-            # Start timer for continuous updates
-            self.timer = QTimer()
-            self.timer.timeout.connect(self.update_elapsed_time)
-            self.timer.start(1000)  # Update every second
-
+            self.start_timer()
             # Open a new connection to avoid threading issues
             conn = duckdb.connect(database=self.db_path, read_only=False)
             # Split the queries by semicolon
@@ -184,25 +191,31 @@ class QueryWorker(QThread):
                 if q.lower().startswith('select'):
                     self.current_status = f"Fetching data for query {i+1}/{len(queries)}"
                     self.update_elapsed_time()
-                    last_df = cur.fetchdf()
+                    
+                    # Fetch data in chunks to maintain timer responsiveness
+                    chunks = []
+                    chunk_size = 100000  # Adjust based on memory constraints
+                    while True:
+                        chunk = cur.fetch_df_chunk(chunk_size)
+                        if chunk is None or len(chunk) == 0:
+                            break
+                        chunks.append(chunk)
+                        self.update_elapsed_time()
+                    
+                    if chunks:
+                        last_df = pd.concat(chunks, ignore_index=True)
+                    else:
+                        last_df = pd.DataFrame()
             
             conn.close()
             if last_df is None:
                 # For commands that do not return data, show a success message
                 last_df = pd.DataFrame({'message': ['Command executed successfully']})
             
-            # Stop the timer
-            if self.timer:
-                self.timer.stop()
-                self.timer.deleteLater()
-                self.timer = None
-            
+            self.cleanup_timer()
             self.resultReady.emit(last_df)
         except Exception as e:
-            if self.timer:
-                self.timer.stop()
-                self.timer.deleteLater()
-                self.timer = None
+            self.cleanup_timer()
             self.errorOccurred.emit(str(e))
 
 class ExportWorker(QObject):
