@@ -162,20 +162,20 @@ class QueryWorker(QThread):
             queries = [q.strip() for q in self.query.split(';') if q.strip()]
             last_df = None
             
-            def update_progress(i, q):
+            def update_progress(i, q, status="Executing"):
                 elapsed = (pd.Timestamp.now() - self.start_time).total_seconds()
-                self.progressUpdate.emit(f"Executing query {i+1}/{len(queries)}... (Elapsed: {elapsed:.1f}s)")
+                self.progressUpdate.emit(f"{status} query {i+1}/{len(queries)}... (Elapsed: {elapsed:.1f}s)")
             
             for i, q in enumerate(queries):
-                update_progress(i, q)
+                update_progress(i, q, "Starting")
                 cur = conn.execute(q)
-                # Update progress after execution
-                update_progress(i, q)
+                update_progress(i, q, "Executed")
+                
                 # Only fetch data for SELECT queries
                 if q.lower().startswith('select'):
+                    update_progress(i, q, "Fetching data")
                     last_df = cur.fetchdf()
-                    # Update progress after fetching data
-                    update_progress(i, q)
+                    update_progress(i, q, "Completed")
             conn.close()
             if last_df is None:
                 # For commands that do not return data, show a success message
@@ -470,29 +470,83 @@ class ExportWorker(QObject):
     error = pyqtSignal(str)    # Signal to emit if an error occurs
     success = pyqtSignal(str)  # Signal to emit on successful export
 
+    CHUNK_SIZE = 100000  # Number of rows to process at once
+
     def __init__(self, df, file_path, format):
         super().__init__()
         self.df = df
         self.file_path = file_path
         self.format = format
+        self.is_cancelled = False
+
+    def export_csv_in_chunks(self):
+        total_rows = len(self.df)
+        with open(self.file_path, 'w', newline='') as f:
+            # Write header
+            self.df.head(0).to_csv(f, index=False)
+            
+            for start_idx in range(0, total_rows, self.CHUNK_SIZE):
+                if self.is_cancelled:
+                    break
+                end_idx = min(start_idx + self.CHUNK_SIZE, total_rows)
+                chunk = self.df.iloc[start_idx:end_idx]
+                chunk.to_csv(f, header=False, index=False, mode='a')
+                progress = (end_idx / total_rows) * 100
+                self.progress.emit(f"Exporting CSV: {progress:.1f}% complete...")
+
+    def export_excel_in_chunks(self):
+        total_rows = len(self.df)
+        writer = pd.ExcelWriter(self.file_path, engine='openpyxl')
+        
+        for start_idx in range(0, total_rows, self.CHUNK_SIZE):
+            if self.is_cancelled:
+                break
+            end_idx = min(start_idx + self.CHUNK_SIZE, total_rows)
+            chunk = self.df.iloc[start_idx:end_idx]
+            if start_idx == 0:
+                chunk.to_excel(writer, index=False, sheet_name='Sheet1')
+            else:
+                # Append to existing sheet
+                worksheet = writer.sheets['Sheet1']
+                for idx, row in enumerate(chunk.values):
+                    for col_idx, value in enumerate(row):
+                        worksheet.cell(row=start_idx + idx + 2, column=col_idx + 1, value=value)
+            
+            progress = (end_idx / total_rows) * 100
+            self.progress.emit(f"Exporting Excel: {progress:.1f}% complete...")
+        
+        writer.close()
+
+    def export_parquet_in_chunks(self):
+        # Parquet is already optimized for large datasets
+        self.progress.emit("Exporting to Parquet format...")
+        self.df.to_parquet(self.file_path, index=False)
 
     def run(self):
         try:
             self.progress.emit(f"Starting {self.format.upper()} export...")
             
             if self.format == 'csv':
-                self.df.to_csv(self.file_path, index=False)
+                self.export_csv_in_chunks()
             elif self.format == 'excel':
-                self.df.to_excel(self.file_path, index=False)
+                self.export_excel_in_chunks()
             elif self.format == 'parquet':
-                self.df.to_parquet(self.file_path, index=False)
+                self.export_parquet_in_chunks()
             
-            self.progress.emit(f"Export completed successfully")
-            self.success.emit(self.file_path)
+            if not self.is_cancelled:
+                self.progress.emit(f"Export completed successfully")
+                self.success.emit(self.file_path)
+            else:
+                self.progress.emit(f"Export cancelled")
+                self.error.emit("Export was cancelled")
+            
             self.finished.emit(self.file_path)
         except Exception as e:
             self.error.emit(str(e))
             self.finished.emit(self.file_path)
+
+    def cancel(self):
+        self.is_cancelled = True
 
     def cancel_query(self):
         if hasattr(self, 'worker') and self.worker.isRunning():
