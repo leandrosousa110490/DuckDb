@@ -321,6 +321,10 @@ class QueryTab(QWidget):
         # Query editor
         self.query_edit = CodeEditor()
         self.query_edit.setPlaceholderText("Enter SQL query here...")
+        self.query_edit.setStyleSheet(
+            "QPlainTextEdit { background-color: palette(base); color: palette(text); }"
+            "QPlainTextEdit[readOnly=\"true\"] { background-color: palette(window); }"
+        )
         layout.addWidget(self.query_edit, 2)
 
         # Buttons with modern styling
@@ -342,7 +346,7 @@ class QueryTab(QWidget):
         
         # Status label
         self.status_label = QLabel()
-        self.status_label.setStyleSheet("color: #666666; margin-left: 10px;")
+        self.status_label.setStyleSheet("color: palette(text); margin-left: 10px;")
         run_button_layout.addWidget(self.status_label)
         
         button_layout.addWidget(self.run_button_container)
@@ -370,16 +374,16 @@ class QueryTab(QWidget):
         # Results view with styling
         self.table_view = QTableView()
         self.table_view.setStyleSheet(
-            "QTableView { border: 1px solid #ddd; }"
-            "QHeaderView::section { background-color: #f5f5f5; padding: 5px; border: 1px solid #ddd; }"
-            "QTableView::item { padding: 5px; }"
-            "QTableView::item:selected { background-color: #e7f3ff; }"
+            "QTableView { border: 1px solid palette(mid); }"
+            "QHeaderView::section { background-color: palette(window); color: palette(text); padding: 5px; border: 1px solid palette(mid); }"
+            "QTableView::item { padding: 5px; color: palette(text); }"
+            "QTableView::item:selected { background-color: palette(highlight); color: palette(highlighted-text); }"
         )
         layout.addWidget(self.table_view, 3)
 
         # Status bar for export progress
         self.export_status = QLabel()
-        self.export_status.setStyleSheet("color: #666666; padding: 5px;")
+        self.export_status.setStyleSheet("color: palette(text); padding: 5px;")
         layout.addWidget(self.export_status)
 
     def run_query(self):
@@ -499,6 +503,10 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(QLabel("Available Tables:"))
         self.table_list = QListWidget()
         self.table_list.setDisabled(True)
+        self.table_list.setStyleSheet(
+            "QListWidget { background-color: palette(base); color: palette(text); border: 1px solid palette(mid); }"
+            "QListWidget::item:selected { background-color: palette(highlight); color: palette(highlighted-text); }"
+        )
         left_layout.addWidget(self.table_list)
         splitter.addWidget(left_panel)
 
@@ -723,6 +731,10 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(QLabel("Available Tables:"))
         self.table_list = QListWidget()
         self.table_list.setDisabled(True)
+        self.table_list.setStyleSheet(
+            "QListWidget { background-color: palette(base); color: palette(text); border: 1px solid palette(mid); }"
+            "QListWidget::item:selected { background-color: palette(highlight); color: palette(highlighted-text); }"
+        )
         left_layout.addWidget(self.table_list)
         splitter.addWidget(left_panel)
 
