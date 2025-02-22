@@ -8,8 +8,8 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QFileDialog, QTableView, QMessageBox, QLabel, QPlainTextEdit, QCompleter,
-                             QListWidget, QSplitter, QTabWidget)
-from PyQt6.QtCore import QAbstractTableModel, Qt, QThread, pyqtSignal, QRegularExpression
+                             QListWidget, QSplitter, QTabWidget, QProgressDialog)
+from PyQt6.QtCore import QAbstractTableModel, Qt, QThread, pyqtSignal, QRegularExpression, QTimer
 from PyQt6.QtGui import QTextCursor, QSyntaxHighlighter, QTextCharFormat
 
 
@@ -145,20 +145,25 @@ class PandasModel(QAbstractTableModel):
 class QueryWorker(QThread):
     resultReady = pyqtSignal(object)  # will emit a DataFrame
     errorOccurred = pyqtSignal(str)
+    progressUpdate = pyqtSignal(str)  # for updating progress message
 
     def __init__(self, db_path, query):
         super().__init__()
         self.db_path = db_path
         self.query = query
+        self.start_time = None
 
     def run(self):
         try:
+            self.start_time = pd.Timestamp.now()
             # Open a new connection to avoid threading issues
             conn = duckdb.connect(database=self.db_path, read_only=False)
             # Split the queries by semicolon
             queries = [q.strip() for q in self.query.split(';') if q.strip()]
             last_df = None
-            for q in queries:
+            for i, q in enumerate(queries):
+                elapsed = (pd.Timestamp.now() - self.start_time).total_seconds()
+                self.progressUpdate.emit(f"Executing query {i+1}/{len(queries)}... (Elapsed: {elapsed:.1f}s)")
                 cur = conn.execute(q)
                 # Only fetch data for SELECT queries
                 if q.lower().startswith('select'):
@@ -222,12 +227,20 @@ class QueryTab(QWidget):
             QMessageBox.warning(self, "Warning", "Please enter a SQL query")
             return
 
-        # Disable UI components during query execution
-        self.setEnabled(False)
+        # Create and show progress dialog
+        self.progress = QProgressDialog("Executing query...", "Cancel", 0, 0, self)
+        self.progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress.setAutoClose(True)
+        self.progress.setAutoReset(True)
+        self.progress.setMinimumDuration(0)
+        self.progress.canceled.connect(self.cancel_query)
+
+        # Start query execution
         self.worker = QueryWorker(main_window.current_db_path, query)
         self.worker.resultReady.connect(self.handle_query_result)
         self.worker.errorOccurred.connect(self.handle_query_error)
-        self.worker.finished.connect(lambda: self.setEnabled(True))
+        self.worker.progressUpdate.connect(self.progress.setLabelText)
+        self.worker.finished.connect(self.progress.close)
         self.worker.start()
 
     def handle_query_result(self, df):
@@ -249,16 +262,46 @@ class QueryTab(QWidget):
         if file_path:
             if not file_path.endswith(file_ext):
                 file_path += file_ext
-            try:
-                if format == 'csv':
-                    self.current_df.to_csv(file_path, index=False)
-                elif format == 'excel':
-                    self.current_df.to_excel(file_path, index=False)
-                elif format == 'parquet':
-                    self.current_df.to_parquet(file_path, index=False)
-                QMessageBox.information(self, "Success", f"Data exported successfully to {file_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Export Error", f"Failed to export data: {e}")
+
+            # Create and show progress dialog for export
+            progress = QProgressDialog(f"Exporting data to {format.upper()}...", "Cancel", 0, 0, self)
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setAutoClose(True)
+            progress.setMinimumDuration(0)
+
+            # Create worker thread for export
+            self.export_worker = QThread()
+            self.export_worker.run = lambda: self.export_worker_run(file_path, format, progress)
+            self.export_worker.finished.connect(progress.close)
+            self.export_worker.start()
+
+    def export_worker_run(self, file_path, format, progress):
+        try:
+            start_time = pd.Timestamp.now()
+            progress.setLabelText(f"Exporting to {format.upper()}... (0.0s)")
+
+            # Update progress message with timer
+            timer = QTimer()
+            timer.timeout.connect(lambda: progress.setLabelText(
+                f"Exporting to {format.upper()}... ({(pd.Timestamp.now() - start_time).total_seconds():.1f}s)"))
+            timer.start(100)
+
+            if format == 'csv':
+                self.current_df.to_csv(file_path, index=False)
+            elif format == 'excel':
+                self.current_df.to_excel(file_path, index=False)
+            elif format == 'parquet':
+                self.current_df.to_parquet(file_path, index=False)
+
+            timer.stop()
+            QMessageBox.information(self, "Success", f"Data exported successfully to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export data: {e}")
+
+    def cancel_query(self):
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait()
 
 class MainWindow(QMainWindow):
     def __init__(self):
