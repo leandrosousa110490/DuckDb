@@ -213,6 +213,14 @@ class QueryWorker(QThread):
                         if not (table_name.startswith('"') and table_name.endswith('"')) and ' ' in table_name:
                             table_name = f'"{table_name}"'
 
+                        # Process the clause
+                        clause = clause.strip()
+                        if clause == ";" or clause == "":
+                            clause = ""
+                        else:
+                            if not clause.startswith(" "):
+                                clause = " " + clause
+
                         # Rebuild the query using captured clause
                         q = f"SELECT {new_cols_str} FROM {table_name}{clause}"
                 
