@@ -1,3 +1,4 @@
+import re
 import sys
 import duckdb
 import pandas as pd
@@ -180,10 +181,31 @@ class QueryWorker(QThread):
             # Split the queries by semicolon
             queries = [q.strip() for q in self.query.split(';') if q.strip()]
             last_df = None
-            
             for i, q in enumerate(queries):
                 self.current_status = f"Executing query {i+1}/{len(queries)}"
                 self.update_elapsed_time()
+                
+                # Automatically quote the reserved keyword 'Transaction' if unquoted
+                import re
+                q = re.sub(r'(?<!")\b(transaction)\b(?!")', '"Transaction"', q, flags=re.IGNORECASE)
+                
+                # For SELECT queries, automatically quote column names containing spaces
+                if q.strip().lower().startswith('select'):
+                    # Simple heuristic: match the part between SELECT and FROM
+                    m = re.search(r'(?i)^select\s+(.*?)\s+from\s+(.*)$', q, flags=re.DOTALL)
+                    if m is not None:
+                        cols_str = m.group(1)
+                        rest = m.group(2)
+                        # Split columns by comma and quote those with spaces if not already quoted
+                        cols = [col.strip() for col in cols_str.split(",")]
+                        new_cols = []
+                        for col in cols:
+                            # Check if column is already quoted
+                            if not (col.startswith('"') and col.endswith('"')) and ' ' in col:
+                                col = f'"{col}"'
+                            new_cols.append(col)
+                        new_cols_str = ', '.join(new_cols)
+                        q = f"SELECT {new_cols_str} FROM {rest}"
                 
                 cur = conn.execute(q)
                 
@@ -485,234 +507,6 @@ class QueryTab(QWidget):
     def handle_export_success(self, file_path):
         self.export_status.setText("Export completed successfully")
         QMessageBox.information(self, "Success", f"Data exported successfully to {file_path}")
-
-    def cancel_query(self):
-        if hasattr(self, 'worker') and self.worker.isRunning():
-            self.worker.terminate()
-            self.worker.wait()
-            self.status_label.setText("Query cancelled")
-            self.run_query_button.setEnabled(True)
-
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Database Viewer")
-        self.connection = None
-        self.current_db_path = None
-        self.setup_ui()
-
-    def setup_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-
-        # Create a splitter to hold the available tables list and the query/result area
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(splitter)
-
-        # Left side: available tables list
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.addWidget(QLabel("Available Tables:"))
-        self.table_list = QListWidget()
-        self.table_list.setDisabled(True)
-        self.table_list.setStyleSheet(
-            "QListWidget { background-color: palette(base); color: palette(text); border: 1px solid palette(mid); }"
-            "QListWidget::item:selected { background-color: palette(highlight); color: palette(highlighted-text); }"
-        )
-        left_layout.addWidget(self.table_list)
-        splitter.addWidget(left_panel)
-
-        # Right side: query tabs
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-
-        # File loading widgets
-        file_layout = QHBoxLayout()
-        self.file_line_edit = QLineEdit()
-        self.file_line_edit.setReadOnly(True)
-        load_button = QPushButton("Load Database")
-        load_button.clicked.connect(self.load_database)
-        file_layout.addWidget(QLabel("Database File:"))
-        file_layout.addWidget(self.file_line_edit)
-        file_layout.addWidget(load_button)
-        right_layout.addLayout(file_layout)
-
-        # Tab widget for queries
-        self.tab_widget = QTabWidget()
-        self.tab_widget.setTabsClosable(True)
-        self.tab_widget.tabCloseRequested.connect(self.close_tab)
-        right_layout.addWidget(self.tab_widget)
-
-        # New Query button
-        new_query_button = QPushButton("New Query")
-        new_query_button.clicked.connect(self.new_query)
-        right_layout.addWidget(new_query_button)
-
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(1, 3)
-
-        # Create initial tab
-        self.new_query()
-
-    def load_database(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Database File", "",
-                                                   "Database Files (*.duckdb *.db);;All Files (*)")
-        if file_path:
-            try:
-                if self.connection:
-                    self.connection.close()
-                self.connection = duckdb.connect(database=file_path, read_only=False)
-                self.current_db_path = file_path
-                self.file_line_edit.setText(file_path)
-
-                # Update available tables
-                self.update_table_list()
-                
-                # Show success message in current tab
-                current_tab = self.tab_widget.currentWidget()
-                if current_tab:
-                    df_message = pd.DataFrame({'message': [f"Database loaded. Use SQL commands to query tables."]})
-                    current_tab.current_df = df_message
-                    model = PandasModel(df_message)
-                    current_tab.table_view.setModel(model)
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load database: {e}")
-
-    def update_table_list(self):
-        try:
-            df_tables = self.connection.execute("SHOW TABLES;").fetchdf()
-            table_names = df_tables.iloc[:,0].tolist() if not df_tables.empty else []
-            self.table_list.clear()
-            self.table_list.addItems(table_names)
-        except Exception as e:
-            QMessageBox.warning(self, "Warning", f"Failed to retrieve tables: {e}")
-
-    def new_query(self):
-        new_tab = QueryTab()
-        self.tab_widget.addTab(new_tab, f"Query {self.tab_widget.count() + 1}")
-        self.tab_widget.setCurrentWidget(new_tab)
-
-    def close_tab(self, index):
-        if self.tab_widget.count() > 1:  # Keep at least one tab open
-            self.tab_widget.removeTab(index)
-        else:
-            # If it's the last tab, clear it instead of closing
-            tab = self.tab_widget.widget(0)
-            tab.query_edit.clear()
-            tab.current_df = None
-            tab.table_view.setModel(PandasModel())
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.resize(1000, 600)
-    window.show()
-    sys.exit(app.exec())
-
-class ExportWorker(QObject):
-    finished = pyqtSignal(str)  # Signal to emit when export is complete
-    progress = pyqtSignal(str)  # Signal to emit progress updates
-    error = pyqtSignal(str)    # Signal to emit if an error occurs
-    success = pyqtSignal(str)  # Signal to emit on successful export
-
-    CHUNK_SIZE = 50000  # Reduced chunk size for better memory management
-
-    def __init__(self, df, file_path, format):
-        super().__init__()
-        self.df = df
-        self.file_path = file_path
-        self.format = format
-        self.is_cancelled = False
-        self.start_time = None
-
-    def export_csv_in_chunks(self):
-        total_rows = len(self.df)
-        with open(self.file_path, 'w', newline='') as f:
-            # Write header
-            self.df.head(0).to_csv(f, index=False)
-            
-            for start_idx in range(0, total_rows, self.CHUNK_SIZE):
-                if self.is_cancelled:
-                    break
-                end_idx = min(start_idx + self.CHUNK_SIZE, total_rows)
-                chunk = self.df.iloc[start_idx:end_idx]
-                chunk.to_csv(f, header=False, index=False, mode='a')
-                progress = (end_idx / total_rows) * 100
-                elapsed = (pd.Timestamp.now() - self.start_time).total_seconds()
-                self.progress.emit(f"Exporting CSV: {progress:.1f}% complete... (Elapsed: {elapsed:.1f}s)")
-
-    def export_excel_in_chunks(self):
-        try:
-            total_rows = len(self.df)
-            writer = pd.ExcelWriter(self.file_path, engine='openpyxl')
-            
-            for start_idx in range(0, total_rows, self.CHUNK_SIZE):
-                if self.is_cancelled:
-                    writer.close()
-                    return
-                    
-                end_idx = min(start_idx + self.CHUNK_SIZE, total_rows)
-                chunk = self.df.iloc[start_idx:end_idx]
-                
-                try:
-                    if start_idx == 0:
-                        chunk.to_excel(writer, index=False, sheet_name='Sheet1')
-                    else:
-                        # Append to existing sheet
-                        worksheet = writer.sheets['Sheet1']
-                        for idx, row in enumerate(chunk.values):
-                            for col_idx, value in enumerate(row):
-                                worksheet.cell(row=start_idx + idx + 2, column=col_idx + 1, value=value)
-                    
-                    progress = (end_idx / total_rows) * 100
-                    elapsed = (pd.Timestamp.now() - self.start_time).total_seconds()
-                    self.progress.emit(f"Exporting Excel: {progress:.1f}% complete... (Elapsed: {elapsed:.1f}s)")
-                    
-                except Exception as e:
-                    writer.close()
-                    raise Exception(f"Error while writing Excel chunk: {str(e)}")
-            
-            writer.close()
-        except Exception as e:
-            raise Exception(f"Excel export error: {str(e)}")
-
-    def export_parquet_in_chunks(self):
-        # Parquet is already optimized for large datasets
-        self.progress.emit("Exporting to Parquet format...")
-        self.df.to_parquet(self.file_path, index=False)
-
-    def run(self):
-        try:
-            self.start_time = pd.Timestamp.now()
-            self.progress.emit(f"Starting {self.format.upper()} export...")
-            
-            try:
-                if self.format == 'csv':
-                    self.export_csv_in_chunks()
-                elif self.format == 'excel':
-                    self.export_excel_in_chunks()
-                elif self.format == 'parquet':
-                    self.export_parquet_in_chunks()
-                
-                if not self.is_cancelled:
-                    elapsed = (pd.Timestamp.now() - self.start_time).total_seconds()
-                    self.progress.emit(f"Export completed successfully in {elapsed:.1f}s")
-                    self.success.emit(self.file_path)
-                else:
-                    self.progress.emit(f"Export cancelled")
-                    self.error.emit("Export was cancelled")
-                
-            except Exception as e:
-                self.error.emit(f"Export error: {str(e)}")
-            
-            self.finished.emit(self.file_path)
-        except Exception as e:
-            self.error.emit(f"Unexpected error: {str(e)}")
-            self.finished.emit(self.file_path)
-
-    def cancel(self):
-        self.is_cancelled = True
 
     def cancel_query(self):
         if hasattr(self, 'worker') and self.worker.isRunning():
