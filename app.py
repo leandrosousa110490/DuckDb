@@ -189,23 +189,32 @@ class QueryWorker(QThread):
                 import re
                 q = re.sub(r'(?<!")\b(transaction)\b(?!")', '"Transaction"', q, flags=re.IGNORECASE)
                 
-                # For SELECT queries, automatically quote column names containing spaces
+                # For SELECT queries, automatically quote column names containing spaces and table names with spaces
                 if q.strip().lower().startswith('select'):
-                    # Simple heuristic: match the part between SELECT and FROM
-                    m = re.search(r'(?i)^select\s+(.*?)\s+from\s+(.*)$', q, flags=re.DOTALL)
+                    # Use a more robust regex to capture columns and table name, handling multi-word table names
+                    m = re.search(r'(?i)^select\s+(.*?)\s+from\s+([^\s;]+(?:\s+[^\s;]+)*)(\s+where|\s+group by|\s+order by|\s+limit|;|$)', q, flags=re.DOTALL)
                     if m is not None:
                         cols_str = m.group(1)
-                        rest = m.group(2)
-                        # Split columns by comma and quote those with spaces if not already quoted
+                        table_name = m.group(2).strip()
+                        clause = m.group(3) if m.group(3) is not None else ""
+                        # Process columns
                         cols = [col.strip() for col in cols_str.split(",")]
                         new_cols = []
                         for col in cols:
-                            # Check if column is already quoted
-                            if not (col.startswith('"') and col.endswith('"')) and ' ' in col:
-                                col = f'"{col}"'
-                            new_cols.append(col)
+                            if col == '*':
+                                new_cols.append(col)
+                            else:
+                                if not (col.startswith('"') and col.endswith('"')) and ' ' in col:
+                                    col = f'"{col}"'
+                                new_cols.append(col)
                         new_cols_str = ', '.join(new_cols)
-                        q = f"SELECT {new_cols_str} FROM {rest}"
+
+                        # Quote table name if it contains spaces and isn't already quoted
+                        if not (table_name.startswith('"') and table_name.endswith('"')) and ' ' in table_name:
+                            table_name = f'"{table_name}"'
+
+                        # Rebuild the query using captured clause
+                        q = f"SELECT {new_cols_str} FROM {table_name}{clause}"
                 
                 cur = conn.execute(q)
                 
