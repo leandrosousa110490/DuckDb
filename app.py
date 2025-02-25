@@ -9,9 +9,9 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QFileDialog, QTableView, QMessageBox, QLabel, QPlainTextEdit, QCompleter,
-                             QListWidget, QSplitter, QTabWidget, QProgressDialog)
+                             QListWidget, QSplitter, QTabWidget, QProgressDialog, QStyle, QComboBox)
 from PyQt6.QtCore import QAbstractTableModel, Qt, QThread, pyqtSignal, QRegularExpression, QTimer, QObject
-from PyQt6.QtGui import QTextCursor, QSyntaxHighlighter, QTextCharFormat
+from PyQt6.QtGui import QTextCursor, QSyntaxHighlighter, QTextCharFormat, QAction
 
 
 SQL_KEYWORDS = [
@@ -19,7 +19,13 @@ SQL_KEYWORDS = [
     'FULL', 'ON', 'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET', 'CREATE', 'DROP', 'ALTER',
     'TABLE', 'VIEW', 'INDEX', 'DISTINCT', 'VALUES', 'INTO', 'AS', 'AND', 'OR', 'NOT', 'NULL',
     'PRIMARY', 'KEY', 'FOREIGN', 'REFERENCES', 'DEFAULT', 'CONSTRAINT', 'UNIQUE', 'CHECK',
-    'AUTO_INCREMENT', 'CASCADE', 'SET', 'BETWEEN', 'LIKE', 'IN', 'EXISTS', 'ALL', 'ANY', 'SOME'
+    'AUTO_INCREMENT', 'CASCADE', 'SET', 'BETWEEN', 'LIKE', 'IN', 'EXISTS', 'ALL', 'ANY', 'SOME',
+    'UNION', 'INTERSECT', 'EXCEPT', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'WITH',
+    'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'FIRST', 'LAST', 'COALESCE', 'NULLIF',
+    'CAST', 'CONVERT', 'UPPER', 'LOWER', 'TRIM', 'SUBSTRING', 'CONCAT',
+    'DESC', 'ASC', 'IS', 'TRUE', 'FALSE', 'USING', 'NATURAL', 'CROSS', 'OUTER',
+    'OVER', 'PARTITION', 'BY', 'ROWS', 'RANGE', 'UNBOUNDED', 'PRECEDING', 'FOLLOWING',
+    'CURRENT', 'ROW', 'RANK', 'DENSE_RANK', 'ROW_NUMBER', 'LAG', 'LEAD'
 ]
 
 class SQLHighlighter(QSyntaxHighlighter):
@@ -27,23 +33,37 @@ class SQLHighlighter(QSyntaxHighlighter):
         super().__init__(parent)
         self.highlightingRules = []
 
-        # SQL Keywords format (red)
+        # SQL Keywords format (blue)
         keywordFormat = QTextCharFormat()
-        keywordFormat.setForeground(Qt.GlobalColor.red)
-        keywords = SQL_KEYWORDS
-        for word in keywords:
-            expression = QRegularExpression(f"\\b{word}\\b")
-            expression.setPatternOptions(QRegularExpression.PatternOption.CaseInsensitiveOption)
-            self.highlightingRules.append((expression, keywordFormat))
+        keywordFormat.setForeground(Qt.GlobalColor.blue)
+        keywordFormat.setFontWeight(700)  # Bold
+        for word in SQL_KEYWORDS:
+            pattern = QRegularExpression(f"\\b{word}\\b")
+            pattern.setPatternOptions(QRegularExpression.PatternOption.CaseInsensitiveOption)
+            self.highlightingRules.append((pattern, keywordFormat))
 
-        # Single-line comment format (green)
-        singleLineCommentFormat = QTextCharFormat()
-        singleLineCommentFormat.setForeground(Qt.GlobalColor.darkGreen)
-        self.highlightingRules.append((QRegularExpression("--[^\n]*"), singleLineCommentFormat))
+        # Function format (dark cyan)
+        functionFormat = QTextCharFormat()
+        functionFormat.setForeground(Qt.GlobalColor.darkCyan)
+        functionPattern = QRegularExpression(r"\b[A-Za-z0-9_]+(?=\s*\()")
+        self.highlightingRules.append((functionPattern, functionFormat))
 
-        # Multi-line comment format (green)
+        # String format (dark red)
+        stringFormat = QTextCharFormat()
+        stringFormat.setForeground(Qt.GlobalColor.darkRed)
+        self.highlightingRules.append((QRegularExpression("'[^']*'"), stringFormat))
+        self.highlightingRules.append((QRegularExpression('"[^"]*"'), stringFormat))
+
+        # Comment format (dark green)
+        commentFormat = QTextCharFormat()
+        commentFormat.setForeground(Qt.GlobalColor.darkGreen)
+        self.highlightingRules.append((QRegularExpression("--[^\n]*"), commentFormat))
+
+        # Multi-line comment format
         self.multiLineCommentFormat = QTextCharFormat()
         self.multiLineCommentFormat.setForeground(Qt.GlobalColor.darkGreen)
+
+        # Multi-line comment expressions
         self.commentStartExpression = QRegularExpression("/\\*")
         self.commentEndExpression = QRegularExpression("\\*/")
 
@@ -81,22 +101,32 @@ class CodeEditor(QPlainTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.highlighter = SQLHighlighter(self.document())
-        # Auto-completion disabled as per user request
-        # Removed auto-completion related methods
-        
-    # Default behavior remains
-    pass  # No additional methods needed
+        self.setStyleSheet("""
+            QPlainTextEdit {
+                font-family: Consolas, Monaco, 'Courier New', monospace;
+                font-size: 12px;
+                background-color: #f8f9fa;
+                color: #212529;
+                border: 1px solid #dee2e6;
+                border-radius: 4px;
+                padding: 8px;
+            }
+        """)
 
+    def keyPressEvent(self, event):
+        super().keyPressEvent(event)
+        # Trigger rehighlighting after each keypress
+        self.highlighter.rehighlight()
 
 class PandasModel(QAbstractTableModel):
     CHUNK_SIZE = 1000  # Number of rows to load at a time
 
-    def __init__(self, df=pd.DataFrame(), parent=None):
+    def __init__(self, df=None, parent=None):
         super().__init__(parent)
-        self._df = df
-        self._total_rows = len(df)
+        self._df = pd.DataFrame() if df is None else df
+        self._total_rows = self._df.shape[0]
         self._loaded_chunks = {}
-        self._column_names = list(df.columns)
+        self._column_names = list(self._df.columns)
 
     def _ensure_chunk_loaded(self, row_index):
         chunk_index = row_index // self.CHUNK_SIZE
@@ -155,6 +185,8 @@ class QueryWorker(QThread):
         self.start_time = None
         self.timer = None
         self.current_status = ""
+        self.chunk_size = 250000  # Increased chunk size for better performance
+        self.max_workers = os.cpu_count() or 2  # Number of parallel workers
 
     def update_elapsed_time(self):
         if self.start_time:
@@ -173,6 +205,9 @@ class QueryWorker(QThread):
         self.timer.timeout.connect(self.update_elapsed_time)
         self.timer.start(100)  # Update more frequently (every 100ms)
 
+    def process_chunk(self, chunk):
+        return pd.DataFrame(chunk)
+
     def run(self):
         try:
             self.start_timer()
@@ -181,22 +216,22 @@ class QueryWorker(QThread):
             # Split the queries by semicolon
             queries = [q.strip() for q in self.query.split(';') if q.strip()]
             last_df = None
+
             for i, q in enumerate(queries):
                 self.current_status = f"Executing query {i+1}/{len(queries)}"
                 self.update_elapsed_time()
                 
                 # Automatically quote the reserved keyword 'Transaction' if unquoted
-                import re
                 q = re.sub(r'(?<!")\b(transaction)\b(?!")', '"Transaction"', q, flags=re.IGNORECASE)
                 
                 # For SELECT queries, automatically quote column names containing spaces and table names with spaces
                 if q.strip().lower().startswith('select'):
-                    # Use a more robust regex to capture columns and table name, handling multi-word table names
                     m = re.search(r'(?i)^select\s+(.*?)\s+from\s+([^\s;]+(?:\s+[^\s;]+)*)(\s+where|\s+group by|\s+order by|\s+limit|;|$)', q, flags=re.DOTALL)
                     if m is not None:
                         cols_str = m.group(1)
                         table_name = m.group(2).strip()
                         clause = m.group(3) if m.group(3) is not None else ""
+                        
                         # Process columns
                         cols = [col.strip() for col in cols_str.split(",")]
                         new_cols = []
@@ -231,18 +266,25 @@ class QueryWorker(QThread):
                     self.current_status = f"Fetching data for query {i+1}/{len(queries)}"
                     self.update_elapsed_time()
                     
-                    # Fetch data in chunks to maintain timer responsiveness
+                    # Optimized chunk processing with parallel execution
                     chunks = []
-                    chunk_size = 100000  # Adjust based on memory constraints
-                    while True:
-                        chunk = cur.fetch_df_chunk(chunk_size)
-                        if chunk is None or len(chunk) == 0:
-                            break
-                        chunks.append(chunk)
-                        self.update_elapsed_time()
+                    from concurrent.futures import ThreadPoolExecutor
                     
-                    if chunks:
-                        last_df = pd.concat(chunks, ignore_index=True)
+                    with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                        while True:
+                            chunk = cur.fetch_df_chunk(self.chunk_size)
+                            if chunk is None or len(chunk) == 0:
+                                break
+                            # Process chunks in parallel
+                            future = executor.submit(self.process_chunk, chunk)
+                            chunks.append(future)
+                            self.update_elapsed_time()
+                        
+                        # Collect results from futures
+                        processed_chunks = [future.result() for future in chunks]
+                    
+                    if processed_chunks:
+                        last_df = pd.concat(processed_chunks, ignore_index=True)
                     else:
                         last_df = pd.DataFrame()
             
@@ -362,199 +404,51 @@ class ExportWorker(QObject):
         self.is_cancelled = True
 
 class QueryTab(QWidget):
+    database_loaded = pyqtSignal(str)  # Signal when database is loaded
+    database_closed = pyqtSignal()     # Signal when database is closed
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setup_ui()
         self.current_df = None
-
-    def setup_ui(self):
-        layout = QVBoxLayout(self)
-        
-        # Query editor
-        self.query_edit = CodeEditor()
-        self.query_edit.setPlaceholderText("Enter SQL query here...")
-        self.query_edit.setStyleSheet(
-            "QPlainTextEdit { background-color: palette(base); color: palette(text); }"
-            "QPlainTextEdit[readOnly=\"true\"] { background-color: palette(window); }"
-        )
-        layout.addWidget(self.query_edit, 2)
-
-        # Buttons with modern styling
-        button_layout = QHBoxLayout()
-        
-        # Run Query button with status indicator
-        self.run_button_container = QWidget()
-        run_button_layout = QHBoxLayout(self.run_button_container)
-        run_button_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.run_query_button = QPushButton("Run Query")
-        self.run_query_button.setStyleSheet(
-            "QPushButton { background-color: #4CAF50; color: white; padding: 5px 15px; border-radius: 3px; }"
-            "QPushButton:hover { background-color: #45a049; }"
-            "QPushButton:disabled { background-color: #cccccc; }"
-        )
-        self.run_query_button.clicked.connect(self.run_query)
-        run_button_layout.addWidget(self.run_query_button)
-        
-        # Status label
-        self.status_label = QLabel()
-        self.status_label.setStyleSheet("color: palette(text); margin-left: 10px;")
-        run_button_layout.addWidget(self.status_label)
-        
-        button_layout.addWidget(self.run_button_container)
-        button_layout.addStretch()
-
-        # Export buttons
-        export_buttons = [
-            ("Export CSV", lambda: self.export_data('csv')),
-            ("Export Excel", lambda: self.export_data('excel')),
-            ("Export Parquet", lambda: self.export_data('parquet'))
-        ]
-
-        for text, callback in export_buttons:
-            btn = QPushButton(text)
-            btn.setStyleSheet(
-                "QPushButton { background-color: #008CBA; color: white; padding: 5px 15px; border-radius: 3px; }"
-                "QPushButton:hover { background-color: #007399; }"
-                "QPushButton:disabled { background-color: #cccccc; }"
-            )
-            btn.clicked.connect(callback)
-            button_layout.addWidget(btn)
-
-        layout.addLayout(button_layout)
-
-        # Results view with styling
-        self.table_view = QTableView()
-        self.table_view.setStyleSheet(
-            "QTableView { border: 1px solid palette(mid); }"
-            "QHeaderView::section { background-color: palette(window); color: palette(text); padding: 5px; border: 1px solid palette(mid); }"
-            "QTableView::item { padding: 5px; color: palette(text); }"
-            "QTableView::item:selected { background-color: palette(highlight); color: palette(highlighted-text); }"
-        )
-        layout.addWidget(self.table_view, 3)
-
-        # Status bar for export progress
-        self.export_status = QLabel()
-        self.export_status.setStyleSheet("color: palette(text); padding: 5px;")
-        layout.addWidget(self.export_status)
-
-    def run_query(self):
-        main_window = self.window()
-        if not main_window.current_db_path:
-            QMessageBox.warning(self, "Warning", "No database loaded")
-            return
-
-        tc = self.query_edit.textCursor()
-        selected_text = tc.selectedText()
-        query = selected_text if selected_text.strip() else self.query_edit.toPlainText().strip()
-        if not query:
-            QMessageBox.warning(self, "Warning", "Please enter a SQL query")
-            return
-
-        # Update UI state
-        self.run_query_button.setEnabled(False)
-        self.status_label.setText("Executing query...")
-
-        # Start query execution
-        self.worker = QueryWorker(main_window.current_db_path, query)
-        self.worker.resultReady.connect(self.handle_query_result)
-        self.worker.errorOccurred.connect(self.handle_query_error)
-        self.worker.progressUpdate.connect(self.update_status)
-        self.worker.finished.connect(self.query_finished)
-        self.worker.start()
-
-    def update_status(self, message):
-        self.status_label.setText(message)
-
-    def query_finished(self):
-        self.run_query_button.setEnabled(True)
-        self.status_label.setText("Query completed")
-
-    def handle_query_result(self, df):
-        self.current_df = df
-        model = PandasModel(df)
-        self.table_view.setModel(model)
-        self.status_label.setText(f"Query completed - {len(df)} rows returned")
-
-    def handle_query_error(self, error):
-        self.run_query_button.setEnabled(True)
-        self.status_label.setText("Query failed")
-        QMessageBox.critical(self, "Query Error", f"Failed to execute query: {error}")
-
-    def export_data(self, format):
-        if self.current_df is None or self.current_df.empty:
-            QMessageBox.warning(self, "Warning", "No data to export")
-            return
-
-        default_filter = "CSV Files (*.csv)" if format=='csv' else "Excel Files (*.xlsx)" if format=='excel' else "Parquet Files (*.parquet)"
-        file_ext = ".csv" if format=='csv' else ".xlsx" if format=='excel' else ".parquet"
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save File", "", default_filter)
-        if file_path:
-            if not file_path.endswith(file_ext):
-                file_path += file_ext
-
-            # Create a copy of the DataFrame to avoid thread issues
-            df_copy = self.current_df.copy()
-            
-            # Create worker thread for export
-            self.export_thread = QThread()
-            self.export_worker = ExportWorker(df_copy, file_path, format)
-            self.export_worker.moveToThread(self.export_thread)
-            
-            # Connect signals
-            self.export_thread.started.connect(self.export_worker.run)
-            self.export_worker.finished.connect(self.export_thread.quit)
-            self.export_worker.finished.connect(self.export_worker.deleteLater)
-            self.export_thread.finished.connect(self.export_thread.deleteLater)
-            self.export_worker.progress.connect(self.update_export_status)
-            self.export_worker.error.connect(self.handle_export_error)
-            self.export_worker.success.connect(self.handle_export_success)
-            
-            # Start export
-            self.export_status.setText(f"Exporting to {format.upper()}...")
-            self.export_thread.start()
-
-    def update_export_status(self, message):
-        self.export_status.setText(message)
-
-    def handle_export_error(self, error):
-        self.export_status.setText("Export failed")
-        QMessageBox.critical(self, "Export Error", f"Failed to export data: {error}")
-
-    def handle_export_success(self, file_path):
-        self.export_status.setText("Export completed successfully")
-        QMessageBox.information(self, "Success", f"Data exported successfully to {file_path}")
-
-    def cancel_query(self):
-        if hasattr(self, 'worker') and self.worker.isRunning():
-            self.worker.terminate()
-            self.worker.wait()
-            self.status_label.setText("Query cancelled")
-            self.run_query_button.setEnabled(True)
-
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Database Viewer")
-        self.connection = None
         self.current_db_path = None
-        self.setup_ui()
+        self.close_db_button = None  # Will be set by MainWindow
 
     def setup_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
+        self.setWindowTitle("SQL Query Editor")
+        layout = QVBoxLayout(self)
+
+        # Database list widget (hidden but maintained for functionality)
+        self.db_list = QListWidget()
+        self.db_list.hide()
+        self.db_list.itemClicked.connect(self.switch_database)
 
         # Create a splitter to hold the available tables list and the query/result area
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(splitter)
+        layout.addWidget(splitter)
 
-        # Left side: available tables list
+        # Left side: collapsible tables list
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_layout.addWidget(QLabel("Available Tables:"))
+        
+        # Header with collapse button
+        header_widget = QWidget()
+        header_layout = QHBoxLayout(header_widget)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.collapse_button = QPushButton("◀")
+        self.collapse_button.setFixedSize(20, 20)
+        self.collapse_button.clicked.connect(self.toggle_table_list)
+        header_layout.addWidget(self.collapse_button)
+        
+        header_layout.addWidget(QLabel("Available Tables:"))
+        header_layout.addStretch()
+        left_layout.addWidget(header_widget)
+        
         self.table_list = QListWidget()
         self.table_list.setDisabled(True)
+        self.table_list.setMaximumWidth(200)  # Set maximum width
+        self.table_list.setMinimumWidth(100)  # Set minimum width
         self.table_list.setStyleSheet(
             "QListWidget { background-color: palette(base); color: palette(text); border: 1px solid palette(mid); }"
             "QListWidget::item:selected { background-color: palette(highlight); color: palette(highlighted-text); }"
@@ -566,71 +460,176 @@ class MainWindow(QMainWindow):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
 
-        # File loading widgets
-        file_layout = QHBoxLayout()
-        self.file_line_edit = QLineEdit()
-        self.file_line_edit.setReadOnly(True)
-        load_button = QPushButton("Load Database")
-        load_button.clicked.connect(self.load_database)
-        file_layout.addWidget(QLabel("Database File:"))
-        file_layout.addWidget(self.file_line_edit)
-        file_layout.addWidget(load_button)
-        right_layout.addLayout(file_layout)
-
         # Tab widget for queries
         self.tab_widget = QTabWidget()
         self.tab_widget.setTabsClosable(True)
         self.tab_widget.tabCloseRequested.connect(self.close_tab)
         right_layout.addWidget(self.tab_widget)
 
-        # New Query button
-        new_query_button = QPushButton("New Query")
-        new_query_button.clicked.connect(self.new_query)
-        right_layout.addWidget(new_query_button)
+        # Add Query button with improved styling
+        self.add_query_button = QPushButton("+")
+        self.add_query_button.setFixedSize(30, 30)
+        self.add_query_button.setStyleSheet(
+            "QPushButton { background-color: palette(button); border-radius: 15px; }"
+            "QPushButton:hover { background-color: palette(highlight); color: palette(highlighted-text); }"
+        )
+        self.add_query_button.clicked.connect(self.add_query_tab)
+        right_layout.addWidget(self.add_query_button, alignment=Qt.AlignmentFlag.AlignRight)
 
         splitter.addWidget(right_panel)
-        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(0, 1)  # Left panel (tables)
+        splitter.setStretchFactor(1, 5)  # Right panel (query)
 
         # Create initial tab
-        self.new_query()
+        self.add_query_tab()
 
     def load_database(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Database File", "",
                                                    "Database Files (*.duckdb *.db);;All Files (*)")
         if file_path:
-            try:
-                if self.connection:
-                    self.connection.close()
-                self.connection = duckdb.connect(database=file_path, read_only=False)
-                self.current_db_path = file_path
-                self.file_line_edit.setText(file_path)
+            # Add the database to the list if it's not already there
+            items = [self.db_list.item(i).text() for i in range(self.db_list.count())]
+            if file_path not in items:
+                self.db_list.addItem(file_path)
+            
+            # Select the newly loaded database
+            for i in range(self.db_list.count()):
+                if self.db_list.item(i).text() == file_path:
+                    self.db_list.setCurrentRow(i)
+                    break
+            
+            # Switch to the selected database
+            self.switch_database(self.db_list.currentItem())
+            # Emit signal that database was loaded
+            self.database_loaded.emit(file_path)
 
-                # Update available tables
-                self.update_table_list()
+    def toggle_table_list(self):
+        if self.table_list.isVisible():
+            self.table_list.hide()
+            self.collapse_button.setText("▶")
+        else:
+            self.table_list.show()
+            self.collapse_button.setText("◀")
+
+    def close_database(self):
+        current_item = self.db_list.currentItem()
+        if current_item:
+            row = self.db_list.row(current_item)
+            self.db_list.takeItem(row)
+            
+            # Switch to another database if available, otherwise clear the current database
+            if self.db_list.count() > 0:
+                self.db_list.setCurrentRow(0)
+                self.switch_database(self.db_list.currentItem())
+            else:
+                self.current_db_path = None
                 
-                # Show success message in current tab
-                current_tab = self.tab_widget.currentWidget()
-                if current_tab:
-                    df_message = pd.DataFrame({'message': [f"Database loaded. Use SQL commands to query tables."]})
-                    current_tab.current_df = df_message
-                    model = PandasModel(df_message)
-                    current_tab.table_view.setModel(model)
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load database: {e}")
+                # Clear all query tabs
+                for i in range(self.tab_widget.count()):
+                    tab = self.tab_widget.widget(i)
+                    if tab:
+                        df_message = pd.DataFrame({'message': ['No database loaded. Please load a database first.']})
+                        tab.current_df = df_message
+                        model = PandasModel(df_message)
+                        tab.table_view.setModel(model)
+                        tab.status_label.setText("No database loaded")
+                self.table_list.clear()
+                self.table_list.setDisabled(True)
+                self.database_closed.emit()
 
     def update_table_list(self):
         try:
-            df_tables = self.connection.execute("SHOW TABLES;").fetchdf()
-            table_names = df_tables.iloc[:,0].tolist() if not df_tables.empty else []
+            # Clear the current list
             self.table_list.clear()
-            self.table_list.addItems(table_names)
+            
+            # Connect to the database and get table list
+            conn = duckdb.connect(database=self.current_db_path, read_only=True)
+            tables = conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").fetchall()
+            conn.close()
+            
+            # Add tables to the list widget
+            for table in tables:
+                self.table_list.addItem(table[0])
         except Exception as e:
-            QMessageBox.warning(self, "Warning", f"Failed to retrieve tables: {e}")
+            QMessageBox.warning(self, "Error", f"Failed to update table list: {str(e)}")
 
     def new_query(self):
-        new_tab = QueryTab()
-        self.tab_widget.addTab(new_tab, f"Query {self.tab_widget.count() + 1}")
-        self.tab_widget.setCurrentWidget(new_tab)
+        # Create a new tab with query editor and result view
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+
+        # Add query editor with improved height
+        tab.query_edit = CodeEditor()  # Use CodeEditor instead of QPlainTextEdit
+        tab.query_edit.setPlaceholderText("Enter your SQL query here...")
+        tab.query_edit.setMinimumHeight(150)  # Set minimum height
+        tab_layout.addWidget(tab.query_edit)
+
+        # Add Run Query button with styling
+        run_button = QPushButton("Run Query")
+        run_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        run_button.clicked.connect(lambda: self.run_query(tab))
+        tab_layout.addWidget(run_button)
+
+        # Add table view for results
+        tab.table_view = QTableView()
+        tab.table_view.setModel(PandasModel())
+        tab_layout.addWidget(tab.table_view)
+
+        # Add status label
+        tab.status_label = QLabel("Ready")
+        tab_layout.addWidget(tab.status_label)
+
+        # Add the tab to the tab widget
+        self.tab_widget.addTab(tab, f"Query {self.tab_widget.count() + 1}")
+        self.tab_widget.setCurrentWidget(tab)
+
+    def switch_database(self, item):
+        # Handle both QListWidgetItem and string inputs
+        db_path = item.text() if hasattr(item, 'text') else item
+        self.switch_to_database(db_path)
+
+    def switch_to_database(self, db_path):
+        if db_path == self.current_db_path:
+            return
+
+        try:
+            # Connect to the new database without closing the current one
+            conn = duckdb.connect(database=db_path, read_only=False)
+            tables = conn.execute("SHOW TABLES").fetchall()
+            conn.close()
+
+            # Update UI
+            self.table_list.clear()
+            self.table_list.addItems([table[0] for table in tables])
+            self.table_list.setEnabled(True)
+            self.current_db_path = db_path
+            self.database_loaded.emit(db_path)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to switch database: {str(e)}")
+            self.database_closed.emit()
+
+    def close_database(self):
+        if self.current_db_path:
+            self.table_list.clear()
+            self.table_list.setEnabled(False)
+            self.current_db_path = None
+            self.database_closed.emit()
 
     def close_tab(self, index):
         if self.tab_widget.count() > 1:  # Keep at least one tab open
@@ -642,9 +641,150 @@ class MainWindow(QMainWindow):
             tab.current_df = None
             tab.table_view.setModel(PandasModel())
 
-if __name__ == "__main__":
+    def run_query(self, tab):
+        if not self.current_db_path:
+            QMessageBox.warning(self, "Error", "No database loaded. Please load a database first.")
+            return
+
+        query = tab.query_edit.toPlainText().strip()
+        if not query:
+            QMessageBox.warning(self, "Error", "Please enter a query.")
+            return
+
+        tab.status_label.setText("Executing query...")
+        
+        # Create and start the worker thread
+        self.worker = QueryWorker(self.current_db_path, query)
+        self.worker.resultReady.connect(lambda df: self.handle_query_result(tab, df))
+        self.worker.errorOccurred.connect(lambda error: self.handle_query_error(tab, error))
+        self.worker.progressUpdate.connect(lambda msg: tab.status_label.setText(msg))
+        self.worker.start()
+
+    def handle_query_result(self, tab, df):
+        tab.current_df = df
+        model = PandasModel(df)
+        tab.table_view.setModel(model)
+        tab.status_label.setText(f"Query completed successfully. Rows: {len(df)}")
+
+    def handle_query_error(self, tab, error):
+        tab.status_label.setText("Error executing query")
+        QMessageBox.critical(self, "Error", f"Failed to execute query: {str(error)}")
+
+    def add_query_tab(self):
+        # Create a new tab with query editor and result view
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+
+        # Add query editor with improved height
+        tab.query_edit = CodeEditor()  # Use CodeEditor instead of QPlainTextEdit
+        tab.query_edit.setPlaceholderText("Enter your SQL query here...")
+        tab.query_edit.setMinimumHeight(150)  # Set minimum height
+        tab_layout.addWidget(tab.query_edit)
+
+        # Add Run Query button with styling
+        run_button = QPushButton("Run Query")
+        run_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        run_button.clicked.connect(lambda: self.run_query(tab))
+        tab_layout.addWidget(run_button)
+
+        # Add table view for results
+        tab.table_view = QTableView()
+        tab.table_view.setModel(PandasModel())
+        tab_layout.addWidget(tab.table_view)
+
+        # Add status label
+        tab.status_label = QLabel("Ready")
+        tab_layout.addWidget(tab.status_label)
+
+        # Add the tab to the tab widget
+        self.tab_widget.addTab(tab, f"Query {self.tab_widget.count() + 1}")
+        self.tab_widget.setCurrentWidget(tab)
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("SQL Query Editor")
+        
+        # Create and set the central widget first
+        self.query_tab = QueryTab(self)
+        self.setCentralWidget(self.query_tab)
+        self.resize(1200, 800)
+        
+        # Create toolbar
+        self.toolbar = self.addToolBar("Database Controls")
+        self.toolbar.setMovable(False)
+        
+        # Database control icons
+        self.load_db_button = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton), "Load Database", self)
+        self.load_db_button.setStatusTip("Load Database")
+        self.load_db_button.triggered.connect(self.load_database)
+        self.toolbar.addAction(self.load_db_button)
+        
+        # Database selection dropdown
+        self.db_selector = QComboBox()
+        self.db_selector.setMinimumWidth(300)
+        self.db_selector.setStyleSheet("padding: 0 10px; background: palette(window); border: 1px solid palette(mid);")
+        self.db_selector.addItem("No database loaded")
+        self.db_selector.setEnabled(False)
+        self.db_selector.currentTextChanged.connect(self.on_database_selected)
+        self.toolbar.addWidget(self.db_selector)
+        
+        # Close database button
+        self.close_db_button = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCloseButton), "Close Database", self)
+        self.close_db_button.setStatusTip("Close Database")
+        self.close_db_button.setEnabled(False)
+        self.close_db_button.triggered.connect(self.close_database)
+        self.toolbar.addAction(self.close_db_button)
+        
+        # Connect signals
+        self.query_tab.database_loaded.connect(self.on_database_loaded)
+        self.query_tab.database_closed.connect(self.on_database_closed)
+
+    def load_database(self):
+        self.query_tab.load_database()
+
+    def on_database_loaded(self, db_path):
+        # Update the dropdown
+        if self.db_selector.findText(db_path) == -1:
+            self.db_selector.addItem(db_path)
+        self.db_selector.setCurrentText(db_path)
+        self.db_selector.setEnabled(True)
+        self.close_db_button.setEnabled(True)
+
+    def on_database_closed(self):
+        current_text = self.db_selector.currentText()
+        if current_text != "No database loaded":
+            self.db_selector.removeItem(self.db_selector.findText(current_text))
+        
+        if self.db_selector.count() <= 1:
+            self.db_selector.setCurrentText("No database loaded")
+            self.db_selector.setEnabled(False)
+            self.close_db_button.setEnabled(False)
+
+    def on_database_selected(self, db_path):
+        if db_path != "No database loaded":
+            self.query_tab.switch_database(db_path)
+
+    def close_database(self):
+        self.query_tab.close_database()
+
+if __name__ == '__main__':
     app = QApplication(sys.argv)
     window = MainWindow()
-    window.resize(1000, 600)
     window.show()
     sys.exit(app.exec())
