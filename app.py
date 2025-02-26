@@ -9,7 +9,8 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QFileDialog, QTableView, QMessageBox, QLabel, QPlainTextEdit, QCompleter,
-                             QListWidget, QSplitter, QTabWidget, QProgressDialog, QStyle, QComboBox)
+                             QListWidget, QSplitter, QTabWidget, QProgressDialog, QStyle, QComboBox, QMenuBar, QDialog, QDialogButtonBox,
+                             QComboBox, QFormLayout)
 from PyQt6.QtCore import QAbstractTableModel, Qt, QThread, pyqtSignal, QRegularExpression, QTimer, QObject
 from PyQt6.QtGui import QTextCursor, QSyntaxHighlighter, QTextCharFormat, QAction
 
@@ -414,14 +415,44 @@ class QueryTab(QWidget):
         self.current_db_path = None
         self.close_db_button = None  # Will be set by MainWindow
 
+    def export_data(self, format_type):
+        current_tab = self.tab_widget.currentWidget()
+        if not current_tab or not hasattr(current_tab, 'current_df') or current_tab.current_df is None:
+            QMessageBox.warning(self, "Warning", "No data to export.")
+            return
+
+        file_dialog = QFileDialog(self)
+        file_dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        
+        file_types = {
+            'csv': ('CSV Files (*.csv)', '.csv'),
+            'excel': ('Excel Files (*.xlsx)', '.xlsx'),
+            'parquet': ('Parquet Files (*.parquet)', '.parquet')
+        }
+        
+        file_type, extension = file_types[format_type]
+        file_dialog.setNameFilter(file_type)
+        
+        if file_dialog.exec() == QFileDialog.DialogCode.Accepted:
+            file_path = file_dialog.selectedFiles()[0]
+            if not file_path.endswith(extension):
+                file_path += extension
+                
+            try:
+                # Create and configure the export worker
+                self.export_worker = ExportWorker(current_tab.current_df, file_path, format_type)
+                self.export_worker.progress.connect(lambda msg: current_tab.status_label.setText(msg))
+                self.export_worker.success.connect(lambda path: QMessageBox.information(self, "Success", f"File saved successfully to {path}"))
+                self.export_worker.error.connect(lambda msg: QMessageBox.critical(self, "Error", f"Export failed: {msg}"))
+                
+                # Start the export process
+                self.export_worker.run()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to export file: {str(e)}")
+
     def setup_ui(self):
         self.setWindowTitle("SQL Query Editor")
         layout = QVBoxLayout(self)
-
-        # Database list widget (hidden but maintained for functionality)
-        self.db_list = QListWidget()
-        self.db_list.hide()
-        self.db_list.itemClicked.connect(self.switch_database)
 
         # Create a splitter to hold the available tables list and the query/result area
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -431,7 +462,7 @@ class QueryTab(QWidget):
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         
-        # Header with collapse button
+        # Header with collapse button and file menu
         header_widget = QWidget()
         header_layout = QHBoxLayout(header_widget)
         header_layout.setContentsMargins(0, 0, 0, 0)
@@ -441,9 +472,21 @@ class QueryTab(QWidget):
         self.collapse_button.clicked.connect(self.toggle_table_list)
         header_layout.addWidget(self.collapse_button)
         
+        # Remove the file menu as it's no longer needed
+        
         header_layout.addWidget(QLabel("Available Tables:"))
         header_layout.addStretch()
         left_layout.addWidget(header_widget)
+        
+        # Add database list widget
+        self.db_list = QListWidget()
+        self.db_list.setMaximumWidth(200)
+        self.db_list.setMinimumWidth(100)
+        self.db_list.setStyleSheet(
+            "QListWidget { background-color: palette(base); color: palette(text); border: 1px solid palette(mid); }"
+            "QListWidget::item:selected { background-color: palette(highlight); color: palette(highlighted-text); }"
+        )
+        left_layout.addWidget(self.db_list)
         
         self.table_list = QListWidget()
         self.table_list.setDisabled(True)
@@ -466,7 +509,46 @@ class QueryTab(QWidget):
         self.tab_widget.tabCloseRequested.connect(self.close_tab)
         right_layout.addWidget(self.tab_widget)
 
-        # Add Query button with improved styling
+        # Create bottom button layout
+        bottom_layout = QHBoxLayout()
+        
+        # Export buttons
+        export_button_style = """
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:pressed {
+                background-color: #1565C0;
+            }
+        """
+        
+        # Create export buttons
+        export_csv_btn = QPushButton("Export CSV")
+        export_csv_btn.setStyleSheet(export_button_style)
+        export_csv_btn.clicked.connect(lambda: self.export_data('csv'))
+        bottom_layout.addWidget(export_csv_btn)
+        
+        export_excel_btn = QPushButton("Export Excel")
+        export_excel_btn.setStyleSheet(export_button_style)
+        export_excel_btn.clicked.connect(lambda: self.export_data('excel'))
+        bottom_layout.addWidget(export_excel_btn)
+        
+        export_parquet_btn = QPushButton("Export Parquet")
+        export_parquet_btn.setStyleSheet(export_button_style)
+        export_parquet_btn.clicked.connect(lambda: self.export_data('parquet'))
+        bottom_layout.addWidget(export_parquet_btn)
+        
+        bottom_layout.addStretch()
+        
+        # Add Query button
         self.add_query_button = QPushButton("+")
         self.add_query_button.setFixedSize(30, 30)
         self.add_query_button.setStyleSheet(
@@ -474,7 +556,9 @@ class QueryTab(QWidget):
             "QPushButton:hover { background-color: palette(highlight); color: palette(highlighted-text); }"
         )
         self.add_query_button.clicked.connect(self.add_query_tab)
-        right_layout.addWidget(self.add_query_button, alignment=Qt.AlignmentFlag.AlignRight)
+        bottom_layout.addWidget(self.add_query_button)
+        
+        right_layout.addLayout(bottom_layout)
 
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 1)  # Left panel (tables)
@@ -715,6 +799,95 @@ class QueryTab(QWidget):
         self.tab_widget.addTab(tab, f"Query {self.tab_widget.count() + 1}")
         self.tab_widget.setCurrentWidget(tab)
 
+class CreateDatabaseDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Create New Database")
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        form_layout = QFormLayout()
+        
+        # Database name
+        self.name_input = QLineEdit()
+        form_layout.addRow("Database Name:", self.name_input)
+        
+        # Database type selection
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["DuckDB (.duckdb)", "SQLite (.db)"])
+        form_layout.addRow("Database Type:", self.type_combo)
+        
+        # Location selection
+        location_layout = QHBoxLayout()
+        self.location_input = QLineEdit()
+        self.location_input.setText(str(Path.home()))
+        browse_button = QPushButton("Browse...")
+        browse_button.clicked.connect(self.browse_location)
+        location_layout.addWidget(self.location_input)
+        location_layout.addWidget(browse_button)
+        form_layout.addRow("Save Location:", location_layout)
+        
+        layout.addLayout(form_layout)
+        
+        # Status message
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: red;")
+        layout.addWidget(self.status_label)
+        
+        # Buttons
+        self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.button_box.accepted.connect(self.create_database)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+    
+    def browse_location(self):
+        directory = QFileDialog.getExistingDirectory(self, "Select Directory")
+        if directory:
+            self.location_input.setText(directory)
+    
+    def create_database(self):
+        # Get values from form
+        name = self.name_input.text().strip()
+        db_type = self.type_combo.currentText()
+        location = self.location_input.text()
+        
+        # Validate input
+        if not name:
+            self.status_label.setText("Database name cannot be empty.")
+            return
+        
+        # Determine file extension based on selected type
+        extension = ".duckdb" if "DuckDB" in db_type else ".db"
+        
+        # Make sure the filename has the correct extension
+        if not name.endswith(extension):
+            name += extension
+        
+        # Create full path
+        path = Path(location) / name
+        
+        # Check if file already exists
+        if path.exists():
+            self.status_label.setText(f"A file named '{name}' already exists in this location.")
+            return
+        
+        try:
+            # Create the database
+            if extension == ".duckdb":
+                conn = duckdb.connect(str(path))
+                conn.close()
+            else:
+                import sqlite3
+                conn = sqlite3.connect(str(path))
+                conn.close()
+            
+            self.db_path = str(path)
+            self.accept()
+        except Exception as e:
+            self.status_label.setText(f"Error creating database: {str(e)}")
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -728,6 +901,12 @@ class MainWindow(QMainWindow):
         # Create toolbar
         self.toolbar = self.addToolBar("Database Controls")
         self.toolbar.setMovable(False)
+        
+        # Create New Database button
+        self.create_db_button = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon), "Create Database", self)
+        self.create_db_button.setStatusTip("Create New Database")
+        self.create_db_button.triggered.connect(self.create_database)
+        self.toolbar.addAction(self.create_db_button)
         
         # Database control icons
         self.load_db_button = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton), "Load Database", self)
@@ -782,6 +961,32 @@ class MainWindow(QMainWindow):
 
     def close_database(self):
         self.query_tab.close_database()
+
+    def create_database(self):
+        """Open the dialog to create a new database"""
+        dialog = CreateDatabaseDialog(self)
+        result = dialog.exec()
+        
+        if result == QDialog.DialogCode.Accepted and hasattr(dialog, 'db_path'):
+            # Database created successfully, load it
+            db_path = dialog.db_path
+            
+            # Add the database to the selector if it's not already there
+            if self.db_selector.findText(db_path) == -1:
+                self.db_selector.addItem(db_path)
+            
+            # Select this database
+            self.db_selector.setCurrentText(db_path)
+            
+            # Set it as the current database
+            self.query_tab.switch_to_database(db_path)
+            
+            # Update UI state
+            self.db_selector.setEnabled(True)
+            self.close_db_button.setEnabled(True)
+            
+            # Show success message
+            QMessageBox.information(self, "Success", f"Database created successfully at:\n{db_path}")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
