@@ -307,102 +307,356 @@ class ExportWorker(QObject):
     success = pyqtSignal(str)  # Signal to emit on successful export
 
     CHUNK_SIZE = 50000  # Chunk size for better memory management
-
+    
     def __init__(self, df, file_path, format):
         super().__init__()
         self.df = df
         self.file_path = file_path
         self.format = format
         self.is_cancelled = False
-        self.start_time = None
-
+    
     def export_csv_in_chunks(self):
+        # Write header first
+        self.df.iloc[0:0].to_csv(self.file_path, index=False)
+        
+        # Then append data in chunks
         total_rows = len(self.df)
-        with open(self.file_path, 'w', newline='') as f:
-            # Write header
-            self.df.head(0).to_csv(f, index=False)
+        for i in range(0, total_rows, self.CHUNK_SIZE):
+            if self.is_cancelled:
+                return
             
-            for start_idx in range(0, total_rows, self.CHUNK_SIZE):
-                if self.is_cancelled:
-                    break
-                end_idx = min(start_idx + self.CHUNK_SIZE, total_rows)
-                chunk = self.df.iloc[start_idx:end_idx]
-                chunk.to_csv(f, header=False, index=False, mode='a')
-                progress = (end_idx / total_rows) * 100
-                elapsed = (pd.Timestamp.now() - self.start_time).total_seconds()
-                self.progress.emit(f"Exporting CSV: {progress:.1f}% complete... (Elapsed: {elapsed:.1f}s)")
-
+            end_idx = min(i + self.CHUNK_SIZE, total_rows)
+            chunk = self.df.iloc[i:end_idx]
+            
+            chunk.to_csv(self.file_path, mode='a', header=False, index=False)
+            
+            progress_pct = min(100, int((end_idx / total_rows) * 100))
+            self.progress.emit(f"Exporting CSV: {progress_pct}% complete ({end_idx}/{total_rows} rows)")
+    
     def export_excel_in_chunks(self):
-        try:
+        # For Excel, we need to use ExcelWriter
+        with pd.ExcelWriter(self.file_path, engine='openpyxl') as writer:
+            # Write data in chunks
             total_rows = len(self.df)
-            writer = pd.ExcelWriter(self.file_path, engine='openpyxl')
+            rows_written = 0
             
-            for start_idx in range(0, total_rows, self.CHUNK_SIZE):
+            # Write the header
+            header_df = pd.DataFrame(columns=self.df.columns)
+            header_df.to_excel(writer, sheet_name='Sheet1', index=False)
+            
+            # Write the data in chunks
+            for i in range(0, total_rows, self.CHUNK_SIZE):
                 if self.is_cancelled:
-                    writer.close()
                     return
-                    
-                end_idx = min(start_idx + self.CHUNK_SIZE, total_rows)
-                chunk = self.df.iloc[start_idx:end_idx]
                 
-                try:
-                    if start_idx == 0:
-                        chunk.to_excel(writer, index=False, sheet_name='Sheet1')
-                    else:
-                        # Append to existing sheet
-                        worksheet = writer.sheets['Sheet1']
-                        for idx, row in enumerate(chunk.values):
-                            for col_idx, value in enumerate(row):
-                                worksheet.cell(row=start_idx + idx + 2, column=col_idx + 1, value=value)
-                    
-                    progress = (end_idx / total_rows) * 100
-                    elapsed = (pd.Timestamp.now() - self.start_time).total_seconds()
-                    self.progress.emit(f"Exporting Excel: {progress:.1f}% complete... (Elapsed: {elapsed:.1f}s)")
-                    
-                except Exception as e:
-                    writer.close()
-                    raise Exception(f"Error while writing Excel chunk: {str(e)}")
-            
-            writer.close()
-        except Exception as e:
-            raise Exception(f"Excel export error: {str(e)}")
-
+                end_idx = min(i + self.CHUNK_SIZE, total_rows)
+                chunk = self.df.iloc[i:end_idx]
+                
+                # Write this chunk to Excel, starting after the header
+                chunk.to_excel(
+                    writer, 
+                    sheet_name='Sheet1', 
+                    index=False,
+                    header=False,
+                    startrow=rows_written + 1  # +1 for the header
+                )
+                
+                rows_written += len(chunk)
+                progress_pct = min(100, int((rows_written / total_rows) * 100))
+                self.progress.emit(f"Exporting Excel: {progress_pct}% complete ({rows_written}/{total_rows} rows)")
+    
     def export_parquet_in_chunks(self):
         # Parquet is already optimized for large datasets
         self.progress.emit("Exporting to Parquet format...")
         self.df.to_parquet(self.file_path, index=False)
-
+        self.progress.emit("Parquet export complete")
+    
     def run(self):
         try:
-            self.start_time = pd.Timestamp.now()
-            self.progress.emit(f"Starting {self.format.upper()} export...")
+            self.progress.emit(f"Starting export to {self.format} format...")
             
-            try:
-                if self.format == 'csv':
-                    self.export_csv_in_chunks()
-                elif self.format == 'excel':
-                    self.export_excel_in_chunks()
-                elif self.format == 'parquet':
-                    self.export_parquet_in_chunks()
-                
-                if not self.is_cancelled:
-                    elapsed = (pd.Timestamp.now() - self.start_time).total_seconds()
-                    self.progress.emit(f"Export completed successfully in {elapsed:.1f}s")
-                    self.success.emit(self.file_path)
-                else:
-                    self.progress.emit(f"Export cancelled")
-                    self.error.emit("Export was cancelled")
-                
-            except Exception as e:
-                self.error.emit(f"Export error: {str(e)}")
+            if self.format == 'csv':
+                self.export_csv_in_chunks()
+            elif self.format == 'excel':
+                self.export_excel_in_chunks()
+            elif self.format == 'parquet':
+                self.export_parquet_in_chunks()
+            else:
+                self.error.emit(f"Unsupported format: {self.format}")
+                return
             
+            if not self.is_cancelled:
+                self.success.emit(self.file_path)
             self.finished.emit(self.file_path)
+            
         except Exception as e:
             self.error.emit(f"Unexpected error: {str(e)}")
             self.finished.emit(self.file_path)
 
     def cancel(self):
         self.is_cancelled = True
+
+class MergeFilesWorker(QObject):
+    progress = pyqtSignal(str)  # Signal to emit progress updates
+    error = pyqtSignal(str)     # Signal to emit if an error occurs
+    success = pyqtSignal(str)   # Signal to emit on successful merge
+    finished = pyqtSignal()     # Signal to emit when process is complete
+    table_created = pyqtSignal(str, str)  # Signal to emit when a table is created (db_path, table_name)
+    
+    CHUNK_SIZE = 100000  # Chunk size for better memory management
+    
+    def __init__(self, folder_path, db_path, table_name=None, use_existing_table=False):
+        super().__init__()
+        self.folder_path = folder_path
+        self.db_path = db_path
+        self.table_name = table_name or "merged_data"
+        self.use_existing_table = use_existing_table
+        self.is_cancelled = False
+        self.is_duckdb = db_path.lower().endswith('.duckdb')
+        
+    def get_file_list(self):
+        """Get list of supported files in the folder"""
+        supported_extensions = ['.csv', '.xlsx', '.xls', '.parquet']
+        files = []
+        
+        for ext in supported_extensions:
+            files.extend(list(Path(self.folder_path).glob(f'*{ext}')))
+        
+        return files
+    
+    def analyze_column_types(self, sample_df):
+        """Analyze column types to ensure proper database insertion"""
+        column_types = {}
+        
+        for col in sample_df.columns:
+            # Check for numeric columns
+            if pd.api.types.is_numeric_dtype(sample_df[col]):
+                if pd.api.types.is_integer_dtype(sample_df[col]):
+                    column_types[col] = 'INTEGER'
+                else:
+                    column_types[col] = 'DOUBLE'
+            # Check for datetime columns
+            elif pd.api.types.is_datetime64_dtype(sample_df[col]):
+                column_types[col] = 'TIMESTAMP'
+            # Check for boolean columns
+            elif pd.api.types.is_bool_dtype(sample_df[col]):
+                column_types[col] = 'BOOLEAN'
+            # Default to text for other types
+            else:
+                column_types[col] = 'TEXT'
+                
+        return column_types
+    
+    def get_existing_columns(self, conn):
+        """Get existing columns from the table"""
+        try:
+            if self.is_duckdb:
+                result = conn.execute(f"PRAGMA table_info({self.table_name})").fetchall()
+                return [row[1] for row in result]  # Column name is at index 1
+            else:
+                import sqlite3
+                cursor = conn.cursor()
+                result = cursor.execute(f"PRAGMA table_info({self.table_name})").fetchall()
+                return [row[1] for row in result]  # Column name is at index 1
+        except Exception as e:
+            self.progress.emit(f"Error getting existing columns: {str(e)}")
+            return []
+    
+    def add_missing_columns(self, conn, sample_df, existing_columns):
+        """Add missing columns to the existing table"""
+        new_columns = []
+        column_types = self.analyze_column_types(sample_df)
+        
+        for col in sample_df.columns:
+            if col not in existing_columns:
+                new_columns.append((col, column_types[col]))
+        
+        if not new_columns:
+            return
+            
+        self.progress.emit(f"Adding {len(new_columns)} new columns to the table...")
+        
+        try:
+            for col_name, col_type in new_columns:
+                if self.is_duckdb:
+                    conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col_name}" {col_type}')
+                else:
+                    cursor = conn.cursor()
+                    cursor.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col_name}" {col_type}')
+                    conn.commit()
+                    
+            self.progress.emit(f"Added {len(new_columns)} new columns to the table.")
+        except Exception as e:
+            self.error.emit(f"Error adding new columns: {str(e)}")
+    
+    def create_table_if_not_exists(self, conn, sample_df):
+        """Create table with appropriate column types if it doesn't exist"""
+        column_types = self.analyze_column_types(sample_df)
+        
+        # Build CREATE TABLE statement
+        columns_sql = ', '.join([f'"{col}" {dtype}' for col, dtype in column_types.items()])
+        create_table_sql = f'CREATE TABLE IF NOT EXISTS "{self.table_name}" ({columns_sql})'
+        
+        # Execute the statement
+        if self.is_duckdb:
+            conn.execute(create_table_sql)
+        else:
+            cursor = conn.cursor()
+            cursor.execute(create_table_sql)
+            conn.commit()
+    
+    def read_file_in_chunks(self, file_path):
+        """Read a file in chunks to handle large files efficiently"""
+        file_ext = file_path.suffix.lower()
+        
+        if file_ext == '.csv':
+            # For CSV, use chunked reading
+            for chunk in pd.read_csv(file_path, chunksize=self.CHUNK_SIZE):
+                if self.is_cancelled:
+                    return
+                yield chunk
+                
+        elif file_ext in ['.xlsx', '.xls']:
+            # For Excel, we need to read it all at once, but we can process it in chunks
+            df = pd.read_excel(file_path)
+            total_rows = len(df)
+            
+            for i in range(0, total_rows, self.CHUNK_SIZE):
+                if self.is_cancelled:
+                    return
+                end_idx = min(i + self.CHUNK_SIZE, total_rows)
+                yield df.iloc[i:end_idx]
+                
+        elif file_ext == '.parquet':
+            # For Parquet, use chunked reading if available
+            try:
+                # Try using pyarrow for chunked reading
+                import pyarrow.parquet as pq
+                table = pq.read_table(file_path)
+                total_rows = table.num_rows
+                
+                for i in range(0, total_rows, self.CHUNK_SIZE):
+                    if self.is_cancelled:
+                        return
+                    end_idx = min(i + self.CHUNK_SIZE, total_rows)
+                    chunk = table.slice(i, end_idx - i).to_pandas()
+                    yield chunk
+            except ImportError:
+                # Fall back to pandas if pyarrow is not available
+                df = pd.read_parquet(file_path)
+                total_rows = len(df)
+                
+                for i in range(0, total_rows, self.CHUNK_SIZE):
+                    if self.is_cancelled:
+                        return
+                    end_idx = min(i + self.CHUNK_SIZE, total_rows)
+                    yield df.iloc[i:end_idx]
+    
+    def insert_data(self, conn, df):
+        """Insert data into the database"""
+        if self.is_duckdb:
+            # For DuckDB, we can use the append method
+            conn.execute(f"INSERT INTO {self.table_name} SELECT * FROM df")
+        else:
+            # For SQLite, we need to use the pandas to_sql method
+            df.to_sql(self.table_name, conn, if_exists='append', index=False)
+    
+    # Make run a slot that can be connected to QThread.started signal
+    def run(self):
+        try:
+            files = self.get_file_list()
+            
+            if not files:
+                self.error.emit("No supported files found in the selected folder.")
+                self.finished.emit()
+                return
+                
+            self.progress.emit(f"Found {len(files)} files to process.")
+            
+            # Connect to the database
+            if self.is_duckdb:
+                conn = duckdb.connect(self.db_path)
+            else:
+                import sqlite3
+                conn = sqlite3.connect(self.db_path)
+            
+            # Process the first file to get the schema
+            first_file = files[0]
+            self.progress.emit(f"Analyzing schema from {first_file.name}...")
+            
+            # Read a small sample to determine schema
+            if first_file.suffix.lower() == '.csv':
+                sample_df = pd.read_csv(first_file, nrows=1000)
+            elif first_file.suffix.lower() in ['.xlsx', '.xls']:
+                sample_df = pd.read_excel(first_file, nrows=1000)
+            else:  # parquet
+                sample_df = pd.read_parquet(first_file)
+                if len(sample_df) > 1000:
+                    sample_df = sample_df.iloc[:1000]
+            
+            # Check if we're using an existing table
+            if self.use_existing_table:
+                # Get existing columns
+                existing_columns = self.get_existing_columns(conn)
+                
+                # Add any missing columns
+                self.add_missing_columns(conn, sample_df, existing_columns)
+            else:
+                # Create the table if it doesn't exist
+                self.create_table_if_not_exists(conn, sample_df)
+            
+            # Process all files
+            total_files = len(files)
+            for i, file_path in enumerate(files, 1):
+                if self.is_cancelled:
+                    break
+                    
+                self.progress.emit(f"Processing file {i}/{total_files}: {file_path.name}")
+                
+                # Process the file in chunks
+                chunk_count = 0
+                rows_processed = 0
+                
+                for chunk in self.read_file_in_chunks(file_path):
+                    if self.is_cancelled:
+                        break
+                        
+                    chunk_count += 1
+                    rows_processed += len(chunk)
+                    
+                    # Insert the chunk into the database
+                    if self.is_duckdb:
+                        # Register the DataFrame as a view
+                        conn.register('df', chunk)
+                        self.insert_data(conn, None)
+                    else:
+                        self.insert_data(conn, chunk)
+                    
+                    self.progress.emit(f"Processed {rows_processed} rows from {file_path.name} (chunk {chunk_count})")
+                
+                self.progress.emit(f"Completed file {i}/{total_files}: {file_path.name}")
+            
+            # Close the database connection
+            if self.is_duckdb:
+                conn.close()
+            else:
+                conn.commit()
+                conn.close()
+            
+            if not self.is_cancelled:
+                self.success.emit(f"Successfully merged {len(files)} files into {self.db_path}")
+                # Emit signal that table was created/updated
+                self.table_created.emit(self.db_path, self.table_name)
+            
+            self.finished.emit()
+            
+        except Exception as e:
+            self.error.emit(f"Error merging files: {str(e)}")
+            self.finished.emit()
+    
+    def cancel(self):
+        self.is_cancelled = True
+        self.progress.emit("Cancelling operation...")
 
 class QueryTab(QWidget):
     database_loaded = pyqtSignal(str)  # Signal when database is loaded
@@ -439,14 +693,39 @@ class QueryTab(QWidget):
                 file_path += extension
                 
             try:
+                # Create a progress dialog
+                progress_dialog = QProgressDialog("Exporting data...", "Cancel", 0, 0, self)
+                progress_dialog.setWindowTitle("Export Progress")
+                progress_dialog.setMinimumDuration(0)
+                progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+                progress_dialog.setAutoClose(False)
+                progress_dialog.setAutoReset(False)
+                
                 # Create and configure the export worker
                 self.export_worker = ExportWorker(current_tab.current_df, file_path, format_type)
-                self.export_worker.progress.connect(lambda msg: current_tab.status_label.setText(msg))
+                
+                # Create a thread to run the worker
+                self.export_thread = QThread()
+                self.export_worker.moveToThread(self.export_thread)
+                
+                # Connect signals
+                self.export_worker.progress.connect(progress_dialog.setLabelText)
                 self.export_worker.success.connect(lambda path: QMessageBox.information(self, "Success", f"File saved successfully to {path}"))
                 self.export_worker.error.connect(lambda msg: QMessageBox.critical(self, "Error", f"Export failed: {msg}"))
+                self.export_worker.finished.connect(progress_dialog.close)
+                self.export_worker.finished.connect(self.export_thread.quit)
                 
-                # Start the export process
-                self.export_worker.run()
+                # Connect thread signals
+                self.export_thread.started.connect(self.export_worker.run)
+                self.export_thread.finished.connect(self.export_thread.deleteLater)
+                
+                # Connect cancel button
+                progress_dialog.canceled.connect(self.export_worker.cancel)
+                
+                # Start the thread
+                progress_dialog.show()
+                self.export_thread.start()
+                
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to export file: {str(e)}")
 
@@ -626,14 +905,28 @@ class QueryTab(QWidget):
             # Clear the current list
             self.table_list.clear()
             
+            if not self.current_db_path:
+                return
+                
             # Connect to the database and get table list
-            conn = duckdb.connect(database=self.current_db_path, read_only=True)
-            tables = conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").fetchall()
+            if self.current_db_path.lower().endswith('.duckdb'):
+                conn = duckdb.connect(database=self.current_db_path, read_only=True)
+                tables = conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").fetchall()
+            else:
+                import sqlite3
+                conn = sqlite3.connect(self.current_db_path)
+                cursor = conn.cursor()
+                tables = cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                
             conn.close()
             
             # Add tables to the list widget
             for table in tables:
                 self.table_list.addItem(table[0])
+                
+            # Enable the table list if there are tables
+            self.table_list.setEnabled(len(tables) > 0)
+            
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to update table list: {str(e)}")
 
@@ -804,49 +1097,54 @@ class CreateDatabaseDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Create New Database")
         self.setup_ui()
-    
+        
     def setup_ui(self):
         layout = QVBoxLayout(self)
         
+        # Create form layout
         form_layout = QFormLayout()
         
-        # Database name
+        # Database name field
         self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Enter database name")
         form_layout.addRow("Database Name:", self.name_input)
         
         # Database type selection
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["DuckDB (.duckdb)", "SQLite (.db)"])
+        self.type_combo.addItem("DuckDB (Recommended for analytics)")
+        self.type_combo.addItem("SQLite")
         form_layout.addRow("Database Type:", self.type_combo)
         
-        # Location selection
+        # Location field with browse button
         location_layout = QHBoxLayout()
         self.location_input = QLineEdit()
-        self.location_input.setText(str(Path.home()))
+        self.location_input.setText(os.path.expanduser("~"))  # Default to user's home directory
+        location_layout.addWidget(self.location_input)
+        
         browse_button = QPushButton("Browse...")
         browse_button.clicked.connect(self.browse_location)
-        location_layout.addWidget(self.location_input)
         location_layout.addWidget(browse_button)
-        form_layout.addRow("Save Location:", location_layout)
+        
+        form_layout.addRow("Location:", location_layout)
         
         layout.addLayout(form_layout)
         
-        # Status message
-        self.status_label = QLabel("")
+        # Status label for error messages
+        self.status_label = QLabel()
         self.status_label.setStyleSheet("color: red;")
         layout.addWidget(self.status_label)
         
         # Buttons
-        self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        self.button_box.accepted.connect(self.create_database)
-        self.button_box.rejected.connect(self.reject)
-        layout.addWidget(self.button_box)
-    
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.create_database)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+        
     def browse_location(self):
-        directory = QFileDialog.getExistingDirectory(self, "Select Directory")
-        if directory:
-            self.location_input.setText(directory)
-    
+        folder = QFileDialog.getExistingDirectory(self, "Select Location", self.location_input.text())
+        if folder:
+            self.location_input.setText(folder)
+            
     def create_database(self):
         # Get values from form
         name = self.name_input.text().strip()
@@ -887,6 +1185,243 @@ class CreateDatabaseDialog(QDialog):
             self.accept()
         except Exception as e:
             self.status_label.setText(f"Error creating database: {str(e)}")
+
+class MergeFilesDialog(QDialog):
+    def __init__(self, parent=None, available_databases=None):
+        super().__init__(parent)
+        self.setWindowTitle("Merge Files into Database")
+        self.available_databases = available_databases or []
+        self.parent = parent
+        self.setup_ui()
+        
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Create form layout
+        form_layout = QFormLayout()
+        
+        # Source folder selection
+        folder_layout = QHBoxLayout()
+        self.folder_input = QLineEdit()
+        self.folder_input.setPlaceholderText("Select folder containing files to merge")
+        folder_layout.addWidget(self.folder_input)
+        
+        browse_folder_button = QPushButton("Browse...")
+        browse_folder_button.clicked.connect(self.browse_folder)
+        folder_layout.addWidget(browse_folder_button)
+        
+        form_layout.addRow("Source Folder:", folder_layout)
+        
+        # Target database selection
+        self.db_combo = QComboBox()
+        
+        # Add available databases
+        if self.available_databases:
+            for db in self.available_databases:
+                self.db_combo.addItem(db)
+        else:
+            self.db_combo.addItem("No database loaded")
+            self.db_combo.setEnabled(False)
+        
+        # Add option to create new database
+        self.db_combo.addItem("Create new database...")
+        self.db_combo.currentIndexChanged.connect(self.on_database_changed)
+        
+        form_layout.addRow("Target Database:", self.db_combo)
+        
+        # Table selection options
+        self.table_option_layout = QVBoxLayout()
+        
+        # Radio buttons for table selection
+        self.new_table_radio = QPushButton("Create new table")
+        self.new_table_radio.setCheckable(True)
+        self.new_table_radio.setChecked(True)
+        self.new_table_radio.clicked.connect(self.toggle_table_options)
+        
+        self.existing_table_radio = QPushButton("Use existing table")
+        self.existing_table_radio.setCheckable(True)
+        self.existing_table_radio.clicked.connect(self.toggle_table_options)
+        
+        # Style the buttons to look like radio buttons
+        button_style = """
+            QPushButton {
+                background-color: palette(button);
+                border: 1px solid palette(mid);
+                border-radius: 4px;
+                padding: 4px 8px;
+                text-align: left;
+            }
+            QPushButton:checked {
+                background-color: palette(highlight);
+                color: palette(highlighted-text);
+            }
+        """
+        self.new_table_radio.setStyleSheet(button_style)
+        self.existing_table_radio.setStyleSheet(button_style)
+        
+        # Button layout
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.new_table_radio)
+        button_layout.addWidget(self.existing_table_radio)
+        button_layout.addStretch()
+        
+        self.table_option_layout.addLayout(button_layout)
+        
+        # New table name input
+        self.new_table_layout = QHBoxLayout()
+        self.table_name_input = QLineEdit("merged_data")
+        self.new_table_layout.addWidget(self.table_name_input)
+        self.table_option_layout.addLayout(self.new_table_layout)
+        
+        # Existing table selection
+        self.existing_table_layout = QHBoxLayout()
+        self.table_combo = QComboBox()
+        self.table_combo.setEnabled(False)
+        self.existing_table_layout.addWidget(self.table_combo)
+        self.refresh_tables_button = QPushButton("Refresh")
+        self.refresh_tables_button.clicked.connect(self.load_tables)
+        self.refresh_tables_button.setEnabled(False)
+        self.existing_table_layout.addWidget(self.refresh_tables_button)
+        self.table_option_layout.addLayout(self.existing_table_layout)
+        
+        form_layout.addRow("Table Options:", self.table_option_layout)
+        
+        layout.addLayout(form_layout)
+        
+        # Status label for error messages
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet("color: red;")
+        layout.addWidget(self.status_label)
+        
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.validate_and_accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+        
+        # Initialize UI state
+        self.toggle_table_options()
+        
+        # Load tables if a database is selected
+        if self.db_combo.currentText() not in ["No database loaded", "Create new database..."]:
+            self.load_tables()
+    
+    def on_database_changed(self, index):
+        # Load tables when database selection changes
+        selected_db = self.db_combo.currentText()
+        if selected_db not in ["No database loaded", "Create new database..."]:
+            self.load_tables()
+            self.existing_table_radio.setEnabled(True)
+            self.refresh_tables_button.setEnabled(True)
+        else:
+            self.table_combo.clear()
+            self.existing_table_radio.setEnabled(False)
+            self.refresh_tables_button.setEnabled(False)
+            # Force new table option if no database or creating new database
+            self.new_table_radio.setChecked(True)
+            self.existing_table_radio.setChecked(False)
+            self.toggle_table_options()
+    
+    def load_tables(self):
+        selected_db = self.db_combo.currentText()
+        if selected_db in ["No database loaded", "Create new database..."]:
+            return
+            
+        try:
+            # Connect to the database and get table list
+            if selected_db.lower().endswith('.duckdb'):
+                conn = duckdb.connect(selected_db, read_only=True)
+                tables = conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").fetchall()
+            else:
+                import sqlite3
+                conn = sqlite3.connect(selected_db)
+                cursor = conn.cursor()
+                tables = cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            
+            conn.close()
+            
+            # Update the table combo box
+            self.table_combo.clear()
+            for table in tables:
+                self.table_combo.addItem(table[0])
+                
+            # Enable existing table option if tables exist
+            self.existing_table_radio.setEnabled(self.table_combo.count() > 0)
+            
+        except Exception as e:
+            self.status_label.setText(f"Error loading tables: {str(e)}")
+    
+    def toggle_table_options(self):
+        # Show/hide appropriate widgets based on selection
+        if self.new_table_radio.isChecked():
+            self.table_name_input.setEnabled(True)
+            self.table_combo.setEnabled(False)
+            self.refresh_tables_button.setEnabled(False)
+        else:
+            self.table_name_input.setEnabled(False)
+            self.table_combo.setEnabled(True)
+            self.refresh_tables_button.setEnabled(True)
+            
+            # Load tables if needed
+            if self.table_combo.count() == 0 and self.db_combo.currentText() not in ["No database loaded", "Create new database..."]:
+                self.load_tables()
+        
+    def browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder with Files", self.folder_input.text() or os.path.expanduser("~"))
+        if folder:
+            self.folder_input.setText(folder)
+            
+    def validate_and_accept(self):
+        # Get values from form
+        folder_path = self.folder_input.text().strip()
+        selected_db = self.db_combo.currentText()
+        
+        # Validate input
+        if not folder_path:
+            self.status_label.setText("Please select a source folder.")
+            return
+            
+        if not os.path.isdir(folder_path):
+            self.status_label.setText("Selected path is not a valid directory.")
+            return
+            
+        if selected_db == "No database loaded":
+            self.status_label.setText("Please load or create a database first.")
+            return
+        
+        # Get table name based on selection
+        if self.new_table_radio.isChecked():
+            table_name = self.table_name_input.text().strip()
+            if not table_name:
+                self.status_label.setText("Table name cannot be empty.")
+                return
+            self.use_existing_table = False
+        else:
+            if self.table_combo.count() == 0:
+                self.status_label.setText("No tables available. Please create a new table.")
+                return
+            table_name = self.table_combo.currentText()
+            self.use_existing_table = True
+        
+        # If user selected "Create new database...", open the create database dialog
+        if selected_db == "Create new database...":
+            create_dialog = CreateDatabaseDialog(self)
+            result = create_dialog.exec()
+            
+            if result == QDialog.DialogCode.Accepted and hasattr(create_dialog, 'db_path'):
+                self.db_path = create_dialog.db_path
+            else:
+                # User cancelled database creation
+                return
+        else:
+            self.db_path = selected_db
+        
+        # Store the values for later use
+        self.folder_path = folder_path
+        self.table_name = table_name
+        
+        # Accept the dialog
+        self.accept()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -929,6 +1464,12 @@ class MainWindow(QMainWindow):
         self.close_db_button.setEnabled(False)
         self.close_db_button.triggered.connect(self.close_database)
         self.toolbar.addAction(self.close_db_button)
+        
+        # Add Merge Files button
+        self.merge_files_button = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveFDIcon), "Merge Files", self)
+        self.merge_files_button.setStatusTip("Merge files from a folder into database")
+        self.merge_files_button.triggered.connect(self.merge_files)
+        self.toolbar.addAction(self.merge_files_button)
         
         # Connect signals
         self.query_tab.database_loaded.connect(self.on_database_loaded)
@@ -987,6 +1528,85 @@ class MainWindow(QMainWindow):
             
             # Show success message
             QMessageBox.information(self, "Success", f"Database created successfully at:\n{db_path}")
+    
+    def merge_files(self):
+        """Open dialog to merge files from a folder into a database"""
+        # Get list of available databases
+        available_dbs = []
+        for i in range(self.db_selector.count()):
+            db_text = self.db_selector.itemText(i)
+            if db_text != "No database loaded":
+                available_dbs.append(db_text)
+        
+        # Create and show the merge files dialog
+        dialog = MergeFilesDialog(self, available_dbs)
+        result = dialog.exec()
+        
+        if result == QDialog.DialogCode.Accepted:
+            # Get the values from the dialog
+            folder_path = dialog.folder_path
+            db_path = dialog.db_path
+            table_name = dialog.table_name
+            use_existing_table = dialog.use_existing_table
+            
+            # Create a progress dialog
+            progress_dialog = QProgressDialog("Merging files...", "Cancel", 0, 0, self)
+            progress_dialog.setWindowTitle("Merge Progress")
+            progress_dialog.setMinimumDuration(0)
+            progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            progress_dialog.setAutoClose(False)
+            progress_dialog.setAutoReset(False)
+            
+            # Create the worker
+            self.merge_worker = MergeFilesWorker(folder_path, db_path, table_name, use_existing_table)
+            
+            # Create a thread to run the worker
+            self.merge_thread = QThread()
+            self.merge_worker.moveToThread(self.merge_thread)
+            
+            # Connect signals
+            self.merge_worker.progress.connect(progress_dialog.setLabelText)
+            self.merge_worker.error.connect(lambda msg: QMessageBox.critical(self, "Error", msg))
+            self.merge_worker.success.connect(lambda msg: QMessageBox.information(self, "Success", msg))
+            self.merge_worker.finished.connect(progress_dialog.close)
+            self.merge_worker.finished.connect(self.merge_thread.quit)
+            
+            # Connect table created signal to refresh tables
+            self.merge_worker.table_created.connect(self.on_table_created)
+            
+            # Connect thread signals
+            self.merge_thread.started.connect(self.merge_worker.run)
+            self.merge_thread.finished.connect(self.merge_thread.deleteLater)
+            
+            # Connect cancel button
+            progress_dialog.canceled.connect(self.merge_worker.cancel)
+            
+            # Start the thread
+            progress_dialog.show()
+            self.merge_thread.start()
+            
+            # If this is a new database, add it to the selector
+            if self.db_selector.findText(db_path) == -1:
+                self.db_selector.addItem(db_path)
+                self.db_selector.setCurrentText(db_path)
+                self.db_selector.setEnabled(True)
+                self.close_db_button.setEnabled(True)
+                self.query_tab.switch_to_database(db_path)
+    
+    def on_table_created(self, db_path, table_name):
+        """Handle table created/updated signal"""
+        # Make sure the database is selected
+        if self.db_selector.currentText() != db_path:
+            self.db_selector.setCurrentText(db_path)
+        
+        # Refresh the table list
+        self.query_tab.update_table_list()
+        
+        # Select the table in the list if it exists
+        for i in range(self.query_tab.table_list.count()):
+            if self.query_tab.table_list.item(i).text() == table_name:
+                self.query_tab.table_list.setCurrentRow(i)
+                break
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
