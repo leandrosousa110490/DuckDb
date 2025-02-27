@@ -2630,8 +2630,8 @@ class MainWindow(QMainWindow):
         self.toolbar = self.addToolBar("Database Controls")
         self.toolbar.setMovable(False)
         
-        # Create New Database button
-        self.create_db_button = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon), "Create Database", self)
+        # Create New Database button with a database-like icon
+        self.create_db_button = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveHDIcon), "Create Database", self)
         self.create_db_button.setStatusTip("Create New Database")
         self.create_db_button.triggered.connect(self.create_database)
         self.toolbar.addAction(self.create_db_button)
@@ -2658,8 +2658,8 @@ class MainWindow(QMainWindow):
         self.close_db_button.triggered.connect(self.close_database)
         self.toolbar.addAction(self.close_db_button)
         
-        # Add Import Single File button
-        self.import_file_button = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon), "Import File", self)
+        # Add Import Single File button with a distinct icon
+        self.import_file_button = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_FileLinkIcon), "Import File", self)
         self.import_file_button.setStatusTip("Import a single file (CSV, Excel, Parquet) into database")
         self.import_file_button.triggered.connect(self.import_single_file)
         self.toolbar.addAction(self.import_file_button)
