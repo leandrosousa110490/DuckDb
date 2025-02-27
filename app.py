@@ -10,7 +10,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QFileDialog, QTableView, QMessageBox, QLabel, QPlainTextEdit, QCompleter,
                              QListWidget, QSplitter, QTabWidget, QProgressDialog, QStyle, QComboBox, QMenuBar, QDialog, QDialogButtonBox,
-                             QComboBox, QFormLayout, QMenu)
+                             QComboBox, QFormLayout, QMenu, QCheckBox, QRadioButton, QButtonGroup)
 from PyQt6.QtCore import QAbstractTableModel, Qt, QThread, pyqtSignal, QRegularExpression, QTimer, QObject
 from PyQt6.QtGui import QTextCursor, QSyntaxHighlighter, QTextCharFormat, QAction
 
@@ -1552,31 +1552,17 @@ class MergeFilesDialog(QDialog):
         self.table_option_layout = QVBoxLayout()
         
         # Radio buttons for table selection
-        self.new_table_radio = QPushButton("Create new table")
-        self.new_table_radio.setCheckable(True)
+        self.table_button_group = QButtonGroup(self)
+        
+        self.new_table_radio = QRadioButton("Create new table")
         self.new_table_radio.setChecked(True)
-        self.new_table_radio.clicked.connect(self.toggle_table_options)
+        self.table_button_group.addButton(self.new_table_radio)
         
-        self.existing_table_radio = QPushButton("Use existing table")
-        self.existing_table_radio.setCheckable(True)
-        self.existing_table_radio.clicked.connect(self.toggle_table_options)
+        self.existing_table_radio = QRadioButton("Use existing table")
+        self.table_button_group.addButton(self.existing_table_radio)
         
-        # Style the buttons to look like radio buttons
-        button_style = """
-            QPushButton {
-                background-color: palette(button);
-                border: 1px solid palette(mid);
-                border-radius: 4px;
-                padding: 4px 8px;
-                text-align: left;
-            }
-            QPushButton:checked {
-                background-color: palette(highlight);
-                color: palette(highlighted-text);
-            }
-        """
-        self.new_table_radio.setStyleSheet(button_style)
-        self.existing_table_radio.setStyleSheet(button_style)
+        # Connect signals
+        self.table_button_group.buttonClicked.connect(self.toggle_table_options)
         
         # Button layout
         button_layout = QHBoxLayout()
@@ -1684,7 +1670,7 @@ class MergeFilesDialog(QDialog):
             # Load tables if needed
             if self.table_combo.count() == 0 and self.db_combo.currentText() not in ["No database loaded", "Create new database..."]:
                 self.load_tables()
-        
+    
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder with Files", self.folder_input.text() or os.path.expanduser("~"))
         if folder:
@@ -1742,6 +1728,713 @@ class MergeFilesDialog(QDialog):
         # Accept the dialog
         self.accept()
 
+class ImportFileDialog(QDialog):
+    def __init__(self, parent=None, available_databases=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import File into Database")
+        self.available_databases = available_databases or []
+        self.parent = parent
+        self.setup_ui()
+        
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Create form layout
+        form_layout = QFormLayout()
+        
+        # Source file selection
+        file_layout = QHBoxLayout()
+        self.file_input = QLineEdit()
+        self.file_input.setPlaceholderText("Select file to import")
+        self.file_input.setReadOnly(True)
+        file_layout.addWidget(self.file_input)
+        
+        browse_file_button = QPushButton("Browse...")
+        browse_file_button.clicked.connect(self.browse_file)
+        file_layout.addWidget(browse_file_button)
+        
+        form_layout.addRow("Source File:", file_layout)
+        
+        # Target database selection
+        self.db_combo = QComboBox()
+        
+        # Add available databases
+        if self.available_databases:
+            for db in self.available_databases:
+                self.db_combo.addItem(db)
+        else:
+            self.db_combo.addItem("No database loaded")
+            self.db_combo.setEnabled(False)
+        
+        # Add option to create new database
+        self.db_combo.addItem("Create new database...")
+        self.db_combo.currentIndexChanged.connect(self.on_database_changed)
+        
+        form_layout.addRow("Target Database:", self.db_combo)
+        
+        # Table selection options
+        self.table_option_layout = QVBoxLayout()
+        
+        # Radio buttons for table selection
+        self.table_button_group = QButtonGroup(self)
+        
+        self.new_table_radio = QRadioButton("Create new table")
+        self.new_table_radio.setChecked(True)
+        self.table_button_group.addButton(self.new_table_radio)
+        
+        self.existing_table_radio = QRadioButton("Use existing table")
+        self.table_button_group.addButton(self.existing_table_radio)
+        
+        # Connect signals
+        self.table_button_group.buttonClicked.connect(self.toggle_table_options)
+        
+        # Button layout
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.new_table_radio)
+        button_layout.addWidget(self.existing_table_radio)
+        button_layout.addStretch()
+        
+        self.table_option_layout.addLayout(button_layout)
+        
+        # New table name input
+        self.new_table_layout = QHBoxLayout()
+        self.table_name_input = QLineEdit("imported_data")
+        self.new_table_layout.addWidget(self.table_name_input)
+        self.table_option_layout.addLayout(self.new_table_layout)
+        
+        # Existing table selection
+        self.existing_table_layout = QHBoxLayout()
+        self.table_combo = QComboBox()
+        self.table_combo.setEnabled(False)
+        self.existing_table_layout.addWidget(self.table_combo)
+        self.refresh_tables_button = QPushButton("Refresh")
+        self.refresh_tables_button.clicked.connect(self.load_tables)
+        self.refresh_tables_button.setEnabled(False)
+        self.existing_table_layout.addWidget(self.refresh_tables_button)
+        self.table_option_layout.addLayout(self.existing_table_layout)
+        
+        form_layout.addRow("Table Options:", self.table_option_layout)
+        
+        # Import options
+        self.options_group = QWidget()
+        options_layout = QVBoxLayout(self.options_group)
+        
+        # CSV options
+        self.csv_options = QWidget()
+        csv_layout = QFormLayout(self.csv_options)
+        
+        self.header_checkbox = QCheckBox("First row contains headers")
+        self.header_checkbox.setChecked(True)
+        csv_layout.addRow("", self.header_checkbox)
+        
+        self.delimiter_combo = QComboBox()
+        self.delimiter_combo.addItem("Comma (,)", ",")
+        self.delimiter_combo.addItem("Semicolon (;)", ";")
+        self.delimiter_combo.addItem("Tab (\\t)", "\t")
+        self.delimiter_combo.addItem("Pipe (|)", "|")
+        csv_layout.addRow("Delimiter:", self.delimiter_combo)
+        
+        options_layout.addWidget(self.csv_options)
+        
+        # Excel options
+        self.excel_options = QWidget()
+        excel_layout = QFormLayout(self.excel_options)
+        
+        self.sheet_combo = QComboBox()
+        self.sheet_combo.addItem("First sheet")
+        excel_layout.addRow("Sheet:", self.sheet_combo)
+        
+        self.excel_header_checkbox = QCheckBox("First row contains headers")
+        self.excel_header_checkbox.setChecked(True)
+        excel_layout.addRow("", self.excel_header_checkbox)
+        
+        options_layout.addWidget(self.excel_options)
+        
+        # Parquet options (minimal since parquet has schema)
+        self.parquet_options = QWidget()
+        parquet_layout = QFormLayout(self.parquet_options)
+        
+        parquet_info = QLabel("Parquet files include schema information and will be imported as-is.")
+        parquet_info.setWordWrap(True)
+        parquet_layout.addRow("", parquet_info)
+        
+        options_layout.addWidget(self.parquet_options)
+        
+        # Hide all options initially
+        self.csv_options.hide()
+        self.excel_options.hide()
+        self.parquet_options.hide()
+        
+        form_layout.addRow("Import Options:", self.options_group)
+        
+        layout.addLayout(form_layout)
+        
+        # Status label for error messages
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet("color: red;")
+        layout.addWidget(self.status_label)
+        
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.validate_and_accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+        
+        # Initialize UI state
+        self.toggle_table_options()
+        
+        # Load tables if a database is selected
+        if self.db_combo.currentText() not in ["No database loaded", "Create new database..."]:
+            self.load_tables()
+    
+    def browse_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "Select File to Import", 
+            "", 
+            "Data Files (*.csv *.xlsx *.xls *.parquet);;CSV Files (*.csv);;Excel Files (*.xlsx *.xls);;Parquet Files (*.parquet);;All Files (*)"
+        )
+        
+        if file_path:
+            self.file_input.setText(file_path)
+            
+            # Set a default table name based on the file name
+            file_name = Path(file_path).stem
+            self.table_name_input.setText(file_name)
+            
+            # Show appropriate options based on file type
+            self.update_options_for_file(file_path)
+            
+            # If it's an Excel file, load sheet names
+            if file_path.lower().endswith(('.xlsx', '.xls')):
+                self.load_excel_sheets(file_path)
+    
+    def update_options_for_file(self, file_path):
+        # Hide all options first
+        self.csv_options.hide()
+        self.excel_options.hide()
+        self.parquet_options.hide()
+        
+        # Show appropriate options based on file extension
+        if file_path.lower().endswith('.csv'):
+            self.csv_options.show()
+        elif file_path.lower().endswith(('.xlsx', '.xls')):
+            self.excel_options.show()
+        elif file_path.lower().endswith('.parquet'):
+            self.parquet_options.show()
+    
+    def load_excel_sheets(self, file_path):
+        try:
+            import openpyxl
+            workbook = openpyxl.load_workbook(file_path, read_only=True)
+            
+            # Clear and update sheet combo
+            self.sheet_combo.clear()
+            
+            for sheet_name in workbook.sheetnames:
+                self.sheet_combo.addItem(sheet_name)
+                
+            workbook.close()
+            
+        except Exception as e:
+            # If openpyxl fails, try pandas
+            try:
+                import pandas as pd
+                xls = pd.ExcelFile(file_path)
+                
+                # Clear and update sheet combo
+                self.sheet_combo.clear()
+                
+                for sheet_name in xls.sheet_names:
+                    self.sheet_combo.addItem(sheet_name)
+                    
+            except Exception as e2:
+                self.status_label.setText(f"Error reading Excel sheets: {str(e2)}")
+                self.sheet_combo.clear()
+                self.sheet_combo.addItem("First sheet")
+    
+    def on_database_changed(self, index):
+        # Load tables when database selection changes
+        selected_db = self.db_combo.currentText()
+        if selected_db not in ["No database loaded", "Create new database..."]:
+            self.load_tables()
+            self.existing_table_radio.setEnabled(True)
+            self.refresh_tables_button.setEnabled(True)
+        else:
+            self.table_combo.clear()
+            self.existing_table_radio.setEnabled(False)
+            self.refresh_tables_button.setEnabled(False)
+            # Force new table option if no database or creating new database
+            self.new_table_radio.setChecked(True)
+            self.existing_table_radio.setChecked(False)
+            self.toggle_table_options()
+    
+    def load_tables(self):
+        selected_db = self.db_combo.currentText()
+        if selected_db in ["No database loaded", "Create new database..."]:
+            return
+            
+        try:
+            # Connect to the database and get table list
+            if selected_db.lower().endswith('.duckdb'):
+                conn = duckdb.connect(selected_db, read_only=True)
+                tables = conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").fetchall()
+            else:
+                import sqlite3
+                conn = sqlite3.connect(selected_db)
+                cursor = conn.cursor()
+                tables = cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            
+            conn.close()
+            
+            # Update the table combo box
+            self.table_combo.clear()
+            for table in tables:
+                self.table_combo.addItem(table[0])
+                
+            # Enable existing table option if tables exist
+            self.existing_table_radio.setEnabled(self.table_combo.count() > 0)
+            
+        except Exception as e:
+            self.status_label.setText(f"Error loading tables: {str(e)}")
+    
+    def toggle_table_options(self):
+        # Show/hide appropriate widgets based on selection
+        if self.new_table_radio.isChecked():
+            self.table_name_input.setEnabled(True)
+            self.table_combo.setEnabled(False)
+            self.refresh_tables_button.setEnabled(False)
+        else:
+            self.table_name_input.setEnabled(False)
+            self.table_combo.setEnabled(True)
+            self.refresh_tables_button.setEnabled(True)
+            
+            # Load tables if needed
+            if self.table_combo.count() == 0 and self.db_combo.currentText() not in ["No database loaded", "Create new database..."]:
+                self.load_tables()
+    
+    def validate_and_accept(self):
+        # Get values from form
+        file_path = self.file_input.text().strip()
+        selected_db = self.db_combo.currentText()
+        
+        # Validate input
+        if not file_path:
+            self.status_label.setText("Please select a file to import.")
+            return
+            
+        if not os.path.isfile(file_path):
+            self.status_label.setText("Selected path is not a valid file.")
+            return
+            
+        if selected_db == "No database loaded":
+            self.status_label.setText("Please load or create a database first.")
+            return
+        
+        # Get table name based on selection
+        if self.new_table_radio.isChecked():
+            table_name = self.table_name_input.text().strip()
+            if not table_name:
+                self.status_label.setText("Table name cannot be empty.")
+                return
+            self.use_existing_table = False
+        else:
+            if self.table_combo.count() == 0:
+                self.status_label.setText("No tables available. Please create a new table.")
+                return
+            table_name = self.table_combo.currentText()
+            self.use_existing_table = True
+        
+        # If user selected "Create new database...", open the create database dialog
+        if selected_db == "Create new database...":
+            create_dialog = CreateDatabaseDialog(self)
+            result = create_dialog.exec()
+            
+            if result == QDialog.DialogCode.Accepted and hasattr(create_dialog, 'db_path'):
+                self.db_path = create_dialog.db_path
+            else:
+                # User cancelled database creation
+                return
+        else:
+            self.db_path = selected_db
+        
+        # Store the values for later use
+        self.file_path = file_path
+        self.table_name = table_name
+        
+        # Store import options
+        self.import_options = {}
+        
+        # CSV options
+        if file_path.lower().endswith('.csv'):
+            self.import_options['header'] = self.header_checkbox.isChecked()
+            self.import_options['delimiter'] = self.delimiter_combo.currentData()
+        
+        # Excel options
+        elif file_path.lower().endswith(('.xlsx', '.xls')):
+            self.import_options['header'] = self.excel_header_checkbox.isChecked()
+            self.import_options['sheet_name'] = self.sheet_combo.currentText()
+        
+        # Accept the dialog
+        self.accept()
+
+class ImportFileWorker(QObject):
+    progress = pyqtSignal(str)  # Signal to emit progress updates
+    error = pyqtSignal(str)     # Signal to emit if an error occurs
+    success = pyqtSignal(str)   # Signal to emit on successful import
+    finished = pyqtSignal()     # Signal to emit when process is complete
+    table_created = pyqtSignal(str, str)  # Signal to emit when a table is created (db_path, table_name)
+    
+    def __init__(self, file_path, db_path, table_name, use_existing_table=False, import_options=None):
+        super().__init__()
+        self.file_path = file_path
+        self.db_path = db_path
+        self.table_name = table_name
+        self.use_existing_table = use_existing_table
+        self.import_options = import_options or {}
+        self.is_cancelled = False
+        self.is_duckdb = db_path.lower().endswith('.duckdb')
+        self.chunk_size = 50000  # Chunk size for better memory management
+    
+    def analyze_column_types(self, df):
+        """Analyze column types to ensure proper database insertion"""
+        column_types = {}
+        
+        for col in df.columns:
+            # Check for numeric columns
+            if pd.api.types.is_numeric_dtype(df[col]):
+                if pd.api.types.is_integer_dtype(df[col]):
+                    column_types[col] = 'INTEGER'
+                else:
+                    column_types[col] = 'DOUBLE'
+            # Check for datetime columns
+            elif pd.api.types.is_datetime64_dtype(df[col]):
+                column_types[col] = 'TIMESTAMP'
+            # Check for boolean columns
+            elif pd.api.types.is_bool_dtype(df[col]):
+                column_types[col] = 'BOOLEAN'
+            # Default to text for other types
+            else:
+                column_types[col] = 'TEXT'
+                
+        return column_types
+    
+    def get_existing_columns(self, conn):
+        """Get existing columns from the table"""
+        try:
+            if self.is_duckdb:
+                result = conn.execute(f"PRAGMA table_info('{self.table_name}')").fetchall()
+                return [row[1] for row in result]  # Column name is at index 1
+            else:
+                import sqlite3
+                cursor = conn.cursor()
+                result = cursor.execute(f"PRAGMA table_info('{self.table_name}')").fetchall()
+                return [row[1] for row in result]  # Column name is at index 1
+        except Exception as e:
+            self.progress.emit(f"Error getting existing columns: {str(e)}")
+            return []
+    
+    def add_missing_columns(self, conn, df, existing_columns):
+        """Add missing columns to the existing table"""
+        new_columns = []
+        column_types = self.analyze_column_types(df)
+        
+        for col in df.columns:
+            if col not in existing_columns:
+                new_columns.append((col, column_types[col]))
+        
+        if not new_columns:
+            return
+            
+        self.progress.emit(f"Adding {len(new_columns)} new columns to the table...")
+        
+        try:
+            for col_name, col_type in new_columns:
+                if self.is_duckdb:
+                    conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col_name}" {col_type}')
+                else:
+                    cursor = conn.cursor()
+                    cursor.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col_name}" {col_type}')
+                    conn.commit()
+                    
+            self.progress.emit(f"Added {len(new_columns)} new columns to the table.")
+        except Exception as e:
+            self.error.emit(f"Error adding new columns: {str(e)}")
+    
+    def create_table_if_not_exists(self, conn, df):
+        """Create table with appropriate column types if it doesn't exist"""
+        column_types = self.analyze_column_types(df)
+        
+        # Build CREATE TABLE statement
+        columns_sql = ', '.join([f'"{col}" {dtype}' for col, dtype in column_types.items()])
+        create_table_sql = f'CREATE TABLE IF NOT EXISTS "{self.table_name}" ({columns_sql})'
+        
+        # Execute the statement
+        if self.is_duckdb:
+            conn.execute(create_table_sql)
+        else:
+            cursor = conn.cursor()
+            cursor.execute(create_table_sql)
+            conn.commit()
+    
+    def read_file(self):
+        """Read the file based on its type and options"""
+        file_ext = self.file_path.lower()
+        
+        try:
+            if file_ext.endswith('.csv'):
+                # Get CSV options
+                header = 0 if self.import_options.get('header', True) else None
+                delimiter = self.import_options.get('delimiter', ',')
+                
+                self.progress.emit(f"Reading CSV file with delimiter '{delimiter}'...")
+                # Read CSV in chunks to avoid memory issues
+                return pd.read_csv(self.file_path, header=header, delimiter=delimiter, chunksize=self.chunk_size)
+                
+            elif file_ext.endswith(('.xlsx', '.xls')):
+                # Get Excel options
+                header = 0 if self.import_options.get('header', True) else None
+                sheet_name = self.import_options.get('sheet_name', 0)
+                
+                self.progress.emit(f"Reading Excel file, sheet: {sheet_name}...")
+                
+                # For Excel files, we need a different approach since pandas doesn't support chunksize for Excel
+                # First, check the file size to determine if we need special handling
+                file_size = os.path.getsize(self.file_path) / (1024 * 1024)  # Size in MB
+                
+                if file_size > 10:  # If file is larger than 10MB
+                    self.progress.emit(f"Large Excel file detected ({file_size:.1f} MB). Using optimized loading...")
+                    
+                    # Use openpyxl with read_only mode for better performance
+                    import openpyxl
+                    wb = openpyxl.load_workbook(self.file_path, read_only=True, data_only=True)
+                    
+                    # Get the requested sheet
+                    if isinstance(sheet_name, int):
+                        sheet = wb.worksheets[sheet_name]
+                    else:
+                        sheet = wb[sheet_name]
+                    
+                    # Get headers if needed
+                    headers = None
+                    if header == 0:
+                        # Get first row as headers
+                        header_row = next(sheet.rows)
+                        headers = [cell.value for cell in header_row]
+                    
+                    # Create a generator to yield chunks of data
+                    def excel_chunk_generator():
+                        chunk = []
+                        rows_processed = 0
+                        
+                        # Skip header row if needed
+                        row_iter = sheet.rows
+                        if header == 0:
+                            next(row_iter)  # Skip header row
+                        
+                        for row in row_iter:
+                            if self.is_cancelled:
+                                break
+                                
+                            # Convert row to list of values
+                            row_data = [cell.value for cell in row]
+                            chunk.append(row_data)
+                            rows_processed += 1
+                            
+                            # Yield chunk when it reaches chunk_size
+                            if len(chunk) >= self.chunk_size:
+                                # Convert chunk to DataFrame
+                                df_chunk = pd.DataFrame(chunk, columns=headers)
+                                yield df_chunk
+                                
+                                # Update progress
+                                self.progress.emit(f"Processed {rows_processed} rows from Excel file...")
+                                
+                                # Reset chunk
+                                chunk = []
+                        
+                        # Yield remaining rows
+                        if chunk and not self.is_cancelled:
+                            df_chunk = pd.DataFrame(chunk, columns=headers)
+                            yield df_chunk
+                    
+                    # Return the generator
+                    return excel_chunk_generator()
+                else:
+                    # For smaller files, use pandas directly
+                    return [pd.read_excel(self.file_path, sheet_name=sheet_name, header=header)]
+                
+            elif file_ext.endswith('.parquet'):
+                self.progress.emit("Reading Parquet file...")
+                try:
+                    # Try using pyarrow for better performance with chunking
+                    import pyarrow.parquet as pq
+                    
+                    # Open the parquet file
+                    parquet_file = pq.ParquetFile(self.file_path)
+                    
+                    # Create a generator to yield chunks
+                    def parquet_chunk_generator():
+                        for i in range(0, parquet_file.metadata.num_row_groups, self.chunk_size):
+                            if self.is_cancelled:
+                                break
+                                
+                            # Calculate how many row groups to read
+                            end_group = min(i + self.chunk_size, parquet_file.metadata.num_row_groups)
+                            row_groups = list(range(i, end_group))
+                            
+                            # Read the chunk
+                            table = parquet_file.read_row_groups(row_groups)
+                            df_chunk = table.to_pandas()
+                            
+                            # Update progress
+                            self.progress.emit(f"Read chunk {i//self.chunk_size + 1} from Parquet file...")
+                            
+                            yield df_chunk
+                    
+                    # Return the generator
+                    return parquet_chunk_generator()
+                    
+                except (ImportError, AttributeError):
+                    # Fall back to pandas
+                    self.progress.emit("PyArrow not available, using pandas for Parquet...")
+                    return [pd.read_parquet(self.file_path)]
+            else:
+                raise ValueError(f"Unsupported file format: {file_ext}")
+            
+        except Exception as e:
+            self.error.emit(f"Error reading file: {str(e)}")
+            return None
+    
+    def run(self):
+        try:
+            self.progress.emit(f"Reading file: {self.file_path}")
+            
+            # Read the file
+            df_chunks = self.read_file()
+            if df_chunks is None or self.is_cancelled:
+                self.finished.emit()
+                return
+            
+            # Connect to the database
+            if self.is_duckdb:
+                conn = duckdb.connect(self.db_path)
+            else:
+                import sqlite3
+                conn = sqlite3.connect(self.db_path)
+            
+            # Process the first chunk to set up the table
+            try:
+                # Get the first chunk to analyze schema
+                first_chunk = next(df_chunks) if hasattr(df_chunks, '__next__') else df_chunks[0]
+                
+                # Clean column names for the first chunk
+                first_chunk.columns = [re.sub(r'[^\w]', '_', col).strip('_') for col in first_chunk.columns]
+                
+                self.progress.emit(f"File read successfully. Processing data...")
+                
+                # Check if we're using an existing table
+                if self.use_existing_table:
+                    # Get existing columns
+                    existing_columns = self.get_existing_columns(conn)
+                    
+                    # Add any missing columns
+                    self.add_missing_columns(conn, first_chunk, existing_columns)
+                else:
+                    # Create the table if it doesn't exist
+                    self.create_table_if_not_exists(conn, first_chunk)
+                
+                # Insert the first chunk
+                self.progress.emit(f"Importing data into table '{self.table_name}'...")
+                
+                if self.is_duckdb:
+                    # For DuckDB, we can use the append method
+                    conn.register('df', first_chunk)
+                    conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
+                else:
+                    # For SQLite, we need to use the pandas to_sql method
+                    first_chunk.to_sql(self.table_name, conn, if_exists='append', index=False)
+                
+                # Process remaining chunks if any
+                rows_imported = len(first_chunk)
+                chunk_count = 1
+                
+                # If df_chunks is a generator or list with more chunks
+                if hasattr(df_chunks, '__next__'):
+                    # Process remaining chunks from generator
+                    for chunk in df_chunks:
+                        if self.is_cancelled:
+                            break
+                        
+                        # Clean column names
+                        chunk.columns = [re.sub(r'[^\w]', '_', col).strip('_') for col in chunk.columns]
+                        
+                        # Insert the chunk
+                        if self.is_duckdb:
+                            conn.register('df', chunk)
+                            conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
+                        else:
+                            chunk.to_sql(self.table_name, conn, if_exists='append', index=False)
+                        
+                        # Update progress
+                        rows_imported += len(chunk)
+                        chunk_count += 1
+                        self.progress.emit(f"Imported chunk {chunk_count}: {rows_imported} rows total...")
+                
+                elif isinstance(df_chunks, list) and len(df_chunks) > 1:
+                    # Process remaining chunks from list
+                    for i in range(1, len(df_chunks)):
+                        if self.is_cancelled:
+                            break
+                        
+                        chunk = df_chunks[i]
+                        
+                        # Clean column names
+                        chunk.columns = [re.sub(r'[^\w]', '_', col).strip('_') for col in chunk.columns]
+                        
+                        # Insert the chunk
+                        if self.is_duckdb:
+                            conn.register('df', chunk)
+                            conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
+                        else:
+                            chunk.to_sql(self.table_name, conn, if_exists='append', index=False)
+                        
+                        # Update progress
+                        rows_imported += len(chunk)
+                        self.progress.emit(f"Imported chunk {i+1}: {rows_imported} rows total...")
+                
+            except StopIteration:
+                # No data in the file
+                self.error.emit("No data found in the file or file is empty.")
+                if self.is_duckdb:
+                    conn.close()
+                else:
+                    conn.close()
+                self.finished.emit()
+                return
+            
+            # Close the database connection
+            if self.is_duckdb:
+                conn.close()
+            else:
+                conn.commit()
+                conn.close()
+            
+            if not self.is_cancelled:
+                self.success.emit(f"Successfully imported {rows_imported} rows into {self.db_path}")
+                # Emit signal that table was created/updated
+                self.table_created.emit(self.db_path, self.table_name)
+            
+            self.finished.emit()
+            
+        except Exception as e:
+            self.error.emit(f"Error importing file: {str(e)}")
+            self.finished.emit()
+    
+    def cancel(self):
+        self.is_cancelled = True
+        self.progress.emit("Cancelling operation...")
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1783,6 +2476,12 @@ class MainWindow(QMainWindow):
         self.close_db_button.setEnabled(False)
         self.close_db_button.triggered.connect(self.close_database)
         self.toolbar.addAction(self.close_db_button)
+        
+        # Add Import Single File button
+        self.import_file_button = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon), "Import File", self)
+        self.import_file_button.setStatusTip("Import a single file (CSV, Excel, Parquet) into database")
+        self.import_file_button.triggered.connect(self.import_single_file)
+        self.toolbar.addAction(self.import_file_button)
         
         # Add Merge Files button
         self.merge_files_button = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveFDIcon), "Merge Files", self)
@@ -1926,6 +2625,70 @@ class MainWindow(QMainWindow):
             if self.query_tab.table_list.item(i).text() == table_name:
                 self.query_tab.table_list.setCurrentRow(i)
                 break
+
+    def import_single_file(self):
+        """Open dialog to import a single file into a database"""
+        # Get list of available databases
+        available_dbs = []
+        for i in range(self.db_selector.count()):
+            db_text = self.db_selector.itemText(i)
+            if db_text != "No database loaded":
+                available_dbs.append(db_text)
+        
+        # Create and show the import file dialog
+        dialog = ImportFileDialog(self, available_dbs)
+        result = dialog.exec()
+        
+        if result == QDialog.DialogCode.Accepted:
+            # Get the values from the dialog
+            file_path = dialog.file_path
+            db_path = dialog.db_path
+            table_name = dialog.table_name
+            use_existing_table = dialog.use_existing_table
+            
+            # Create a progress dialog
+            progress_dialog = QProgressDialog("Importing file...", "Cancel", 0, 0, self)
+            progress_dialog.setWindowTitle("Import Progress")
+            progress_dialog.setMinimumDuration(0)
+            progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            progress_dialog.setAutoClose(False)
+            progress_dialog.setAutoReset(False)
+            
+            # Create the worker
+            self.import_worker = ImportFileWorker(file_path, db_path, table_name, use_existing_table)
+            
+            # Create a thread to run the worker
+            self.import_thread = QThread()
+            self.import_worker.moveToThread(self.import_thread)
+            
+            # Connect signals
+            self.import_worker.progress.connect(progress_dialog.setLabelText)
+            self.import_worker.error.connect(lambda msg: QMessageBox.critical(self, "Error", msg))
+            self.import_worker.success.connect(lambda msg: QMessageBox.information(self, "Success", msg))
+            self.import_worker.finished.connect(progress_dialog.close)
+            self.import_worker.finished.connect(self.import_thread.quit)
+            
+            # Connect table created signal to refresh tables
+            self.import_worker.table_created.connect(self.on_table_created)
+            
+            # Connect thread signals
+            self.import_thread.started.connect(self.import_worker.run)
+            self.import_thread.finished.connect(self.import_thread.deleteLater)
+            
+            # Connect cancel button
+            progress_dialog.canceled.connect(self.import_worker.cancel)
+            
+            # Start the thread
+            progress_dialog.show()
+            self.import_thread.start()
+            
+            # If this is a new database, add it to the selector
+            if self.db_selector.findText(db_path) == -1:
+                self.db_selector.addItem(db_path)
+                self.db_selector.setCurrentText(db_path)
+                self.db_selector.setEnabled(True)
+                self.close_db_button.setEnabled(True)
+                self.query_tab.switch_to_database(db_path)
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
