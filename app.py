@@ -10,7 +10,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QFileDialog, QTableView, QMessageBox, QLabel, QPlainTextEdit, QCompleter,
                              QListWidget, QSplitter, QTabWidget, QProgressDialog, QStyle, QComboBox, QMenuBar, QDialog, QDialogButtonBox,
-                             QComboBox, QFormLayout)
+                             QComboBox, QFormLayout, QMenu)
 from PyQt6.QtCore import QAbstractTableModel, Qt, QThread, pyqtSignal, QRegularExpression, QTimer, QObject
 from PyQt6.QtGui import QTextCursor, QSyntaxHighlighter, QTextCharFormat, QAction
 
@@ -775,6 +775,12 @@ class QueryTab(QWidget):
             "QListWidget { background-color: palette(base); color: palette(text); border: 1px solid palette(mid); }"
             "QListWidget::item:selected { background-color: palette(highlight); color: palette(highlighted-text); }"
         )
+        # Enable context menu for table list
+        self.table_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table_list.customContextMenuRequested.connect(self.show_table_context_menu)
+        # Connect double-click handler
+        self.table_list.itemDoubleClicked.connect(self.on_table_double_clicked)
+        
         left_layout.addWidget(self.table_list)
         splitter.addWidget(left_panel)
 
@@ -1091,6 +1097,186 @@ class QueryTab(QWidget):
         # Add the tab to the tab widget
         self.tab_widget.addTab(tab, f"Query {self.tab_widget.count() + 1}")
         self.tab_widget.setCurrentWidget(tab)
+
+    def show_table_context_menu(self, position):
+        """Show context menu for table list"""
+        # Only show if a table is selected and database is connected
+        if not self.current_db_path or not self.table_list.currentItem():
+            return
+            
+        # Get the selected table name
+        selected_table = self.table_list.currentItem().text()
+        
+        # Create context menu
+        context_menu = QMenu(self)
+        
+        # Add view data action
+        view_data_action = QAction(f"View data in '{selected_table}'", self)
+        view_data_action.triggered.connect(lambda: self.view_table_data(selected_table))
+        context_menu.addAction(view_data_action)
+        
+        # Add view structure action
+        view_structure_action = QAction(f"View structure of '{selected_table}'", self)
+        view_structure_action.triggered.connect(lambda: self.view_table_structure(selected_table))
+        context_menu.addAction(view_structure_action)
+        
+        # Add separator
+        context_menu.addSeparator()
+        
+        # Add delete action
+        delete_action = QAction(f"Delete table '{selected_table}'", self)
+        delete_action.triggered.connect(lambda: self.delete_table(selected_table))
+        context_menu.addAction(delete_action)
+        
+        # Show the menu at the cursor position
+        context_menu.exec(self.table_list.mapToGlobal(position))
+    
+    def view_table_data(self, table_name):
+        """View the data in a table"""
+        if not self.current_db_path:
+            return
+            
+        # Create a new tab
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        
+        # Add a query editor with the SELECT query
+        tab.query_edit = CodeEditor()
+        tab.query_edit.setPlainText(f'SELECT * FROM "{table_name}" LIMIT 1000')
+        tab.query_edit.setMinimumHeight(100)
+        tab_layout.addWidget(tab.query_edit)
+        
+        # Add Run Query button
+        run_button = QPushButton("Run Query")
+        run_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        run_button.clicked.connect(lambda: self.run_query(tab))
+        tab_layout.addWidget(run_button)
+        
+        # Add table view for results
+        tab.table_view = QTableView()
+        tab.table_view.setModel(PandasModel())
+        tab_layout.addWidget(tab.table_view)
+        
+        # Add status label
+        tab.status_label = QLabel("Ready")
+        tab_layout.addWidget(tab.status_label)
+        
+        # Add the tab to the tab widget
+        self.tab_widget.addTab(tab, f"Data: {table_name}")
+        self.tab_widget.setCurrentWidget(tab)
+        
+        # Run the query automatically
+        self.run_query(tab)
+    
+    def view_table_structure(self, table_name):
+        """View the structure of a table"""
+        if not self.current_db_path:
+            return
+            
+        try:
+            # Connect to the database
+            if self.current_db_path.lower().endswith('.duckdb'):
+                conn = duckdb.connect(self.current_db_path, read_only=True)
+                # Get table structure
+                result = conn.execute(f"PRAGMA table_info(\"{table_name}\")").fetchall()
+                # Create a DataFrame from the result
+                columns = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+                df = pd.DataFrame(result, columns=columns)
+                conn.close()
+            else:
+                import sqlite3
+                conn = sqlite3.connect(self.current_db_path)
+                cursor = conn.cursor()
+                # Get table structure
+                result = cursor.execute(f"PRAGMA table_info(\"{table_name}\")").fetchall()
+                # Create a DataFrame from the result
+                columns = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+                df = pd.DataFrame(result, columns=columns)
+                conn.close()
+            
+            # Create a new tab to display the structure
+            tab = QWidget()
+            tab_layout = QVBoxLayout(tab)
+            
+            # Add a label with the table name
+            header_label = QLabel(f"Structure of table '{table_name}':")
+            header_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+            tab_layout.addWidget(header_label)
+            
+            # Add table view for the structure
+            table_view = QTableView()
+            table_view.setModel(PandasModel(df))
+            tab_layout.addWidget(table_view)
+            
+            # Add the tab to the tab widget
+            self.tab_widget.addTab(tab, f"Structure: {table_name}")
+            self.tab_widget.setCurrentWidget(tab)
+            
+            # Store the DataFrame in the tab
+            tab.current_df = df
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to view table structure: {str(e)}")
+    
+    def delete_table(self, table_name):
+        """Delete a table from the database"""
+        if not self.current_db_path:
+            return
+            
+        # Confirm deletion
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Deletion",
+            f"Are you sure you want to delete the table '{table_name}'?\nThis action cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+            
+        try:
+            # Connect to the database
+            if self.current_db_path.lower().endswith('.duckdb'):
+                conn = duckdb.connect(self.current_db_path)
+                conn.execute(f"DROP TABLE IF EXISTS \"{table_name}\"")
+                conn.close()
+            else:
+                import sqlite3
+                conn = sqlite3.connect(self.current_db_path)
+                cursor = conn.cursor()
+                cursor.execute(f"DROP TABLE IF EXISTS \"{table_name}\"")
+                conn.commit()
+                conn.close()
+                
+            # Update the table list
+            self.update_table_list()
+            
+            # Show success message
+            QMessageBox.information(self, "Success", f"Table '{table_name}' has been deleted.")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to delete table: {str(e)}")
+
+    def on_table_double_clicked(self, item):
+        """Handle double-click on a table item"""
+        if item and self.current_db_path:
+            self.view_table_data(item.text())
 
 class CreateDatabaseDialog(QDialog):
     def __init__(self, parent=None):
