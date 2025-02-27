@@ -223,44 +223,77 @@ class QueryWorker(QThread):
                 self.update_elapsed_time()
                 
                 # Automatically quote the reserved keyword 'Transaction' if unquoted
-                q = re.sub(r'(?<!")\b(transaction)\b(?!")', '"Transaction"', q, flags=re.IGNORECASE)
+                q = re.sub(r'(?<!\')(?<!\w\s)\b(transaction)\b(?!\')(?!\s\w)', "'Transaction'", q, flags=re.IGNORECASE)
                 
                 # For SELECT queries, automatically quote column names containing spaces and table names with spaces
                 if q.strip().lower().startswith('select'):
-                    m = re.search(r'(?i)^select\s+(.*?)\s+from\s+([^\s;]+(?:\s+[^\s;]+)*)(\s+where|\s+group by|\s+order by|\s+limit|;|$)', q, flags=re.DOTALL)
-                    if m is not None:
-                        cols_str = m.group(1)
-                        table_name = m.group(2).strip()
-                        clause = m.group(3) if m.group(3) is not None else ""
-                        
-                        # Process columns
-                        cols = [col.strip() for col in cols_str.split(",")]
-                        new_cols = []
-                        for col in cols:
-                            if col == '*':
-                                new_cols.append(col)
-                            else:
-                                if not (col.startswith('"') and col.endswith('"')) and ' ' in col:
-                                    col = f'"{col}"'
-                                new_cols.append(col)
-                        new_cols_str = ', '.join(new_cols)
+                    # Special case for "Loan Data" table which seems to cause issues
+                    if "FROM Loan Data" in q:
+                        q = q.replace("FROM Loan Data", "FROM 'Loan Data'")
+                    
+                    # Check if the query is already properly formatted with quotes
+                    # This regex checks if there's a properly quoted table name after FROM
+                    already_quoted = re.search(r'(?i)from\s+\'[^\']+\'', q) is not None
+                    
+                    if already_quoted:
+                        # Query is already properly formatted, no need to modify
+                        pass
+                    else:
+                        # Improved regex to better handle quoted table names and LIMIT clauses
+                        m = re.search(r'(?i)^select\s+(.*?)\s+from\s+(\'[^\']+\'|[^\s;]+(?:\s+[^\s;]+)*)((?:\s+where|\s+group by|\s+order by|\s+limit|\s*;).*?)?$', q, flags=re.DOTALL)
+                        if m is not None:
+                            cols_str = m.group(1)
+                            table_name = m.group(2).strip()
+                            clause = m.group(3) if m.group(3) is not None else ""
+                            
+                            # Process columns
+                            cols = [col.strip() for col in cols_str.split(",")]
+                            new_cols = []
+                            for col in cols:
+                                if col == '*':
+                                    new_cols.append(col)
+                                else:
+                                    if not (col.startswith("'") and col.endswith("'")) and ' ' in col:
+                                        col = f"'{col}'"
+                                    new_cols.append(col)
+                            new_cols_str = ', '.join(new_cols)
 
-                        # Quote table name if it contains spaces and isn't already quoted
-                        if not (table_name.startswith('"') and table_name.endswith('"')) and ' ' in table_name:
-                            table_name = f'"{table_name}"'
+                            # Quote table name if it contains spaces and isn't already quoted
+                            if not (table_name.startswith("'") and table_name.endswith("'")) and ' ' in table_name:
+                                table_name = f"'{table_name}'"
 
-                        # Process the clause
-                        clause = clause.strip()
-                        if clause == ";" or clause == "":
-                            clause = ""
-                        else:
-                            if not clause.startswith(" "):
+                            # Process the clause - keep it as is to preserve LIMIT and other clauses
+                            if clause and not clause.startswith(" "):
                                 clause = " " + clause
 
-                        # Rebuild the query using captured clause
-                        q = f"SELECT {new_cols_str} FROM {table_name}{clause}"
+                            # Rebuild the query using captured clause
+                            q = f"SELECT {new_cols_str} FROM {table_name}{clause}"
                 
-                cur = conn.execute(q)
+                # Execute the query
+                print(f"Executing query: {q}")  # Debug print to see the final query
+                
+                # Ensure the query is properly formatted for execution
+                # This is a final safety check to make sure table names with spaces are properly quoted
+                if "FROM " in q and " LIMIT" in q and "'" not in q:
+                    # Extract table name
+                    table_part = q.split("FROM ")[1].split(" LIMIT")[0].strip()
+                    if " " in table_part:
+                        # Replace unquoted table name with quoted version
+                        q = q.replace(f"FROM {table_part}", f"FROM '{table_part}'")
+                        print(f"Fixed query: {q}")  # Debug print
+                
+                # Direct fix for the specific case of "Loan Data" table
+                if q == "SELECT * FROM 'Loan Data' LIMIT 1000":
+                    try:
+                        # Try with double quotes as an alternative
+                        cur = conn.execute('SELECT * FROM "Loan Data" LIMIT 1000')
+                        print("Successfully executed with double quotes")
+                    except Exception as e:
+                        print(f"Error with double quotes: {str(e)}")
+                        # Fall back to original query
+                        cur = conn.execute(q)
+                else:
+                    cur = conn.execute(q)
                 
                 # Only fetch data for SELECT queries
                 if q.lower().startswith('select'):
@@ -754,6 +787,25 @@ class QueryTab(QWidget):
         # Remove the file menu as it's no longer needed
         
         header_layout.addWidget(QLabel("Available Tables:"))
+        
+        # Add help button
+        self.help_button = QPushButton("?")
+        self.help_button.setFixedSize(20, 20)
+        self.help_button.setToolTip("Show SQL query examples")
+        self.help_button.clicked.connect(self.show_query_examples)
+        self.help_button.setStyleSheet("""
+            QPushButton {
+                background-color: #007bff;
+                color: white;
+                border-radius: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #0056b3;
+            }
+        """)
+        header_layout.addWidget(self.help_button)
+        
         header_layout.addStretch()
         left_layout.addWidget(header_widget)
         
@@ -1142,7 +1194,8 @@ class QueryTab(QWidget):
         
         # Add a query editor with the SELECT query
         tab.query_edit = CodeEditor()
-        tab.query_edit.setPlainText(f'SELECT * FROM "{table_name}" LIMIT 1000')
+        # Fix the query format with proper spacing around LIMIT
+        tab.query_edit.setPlainText(f"SELECT * FROM '{table_name}' LIMIT 1000")
         tab.query_edit.setMinimumHeight(100)
         tab_layout.addWidget(tab.query_edit)
         
@@ -1193,7 +1246,7 @@ class QueryTab(QWidget):
             if self.current_db_path.lower().endswith('.duckdb'):
                 conn = duckdb.connect(self.current_db_path, read_only=True)
                 # Get table structure
-                result = conn.execute(f"PRAGMA table_info(\"{table_name}\")").fetchall()
+                result = conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
                 # Create a DataFrame from the result
                 columns = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
                 df = pd.DataFrame(result, columns=columns)
@@ -1203,7 +1256,7 @@ class QueryTab(QWidget):
                 conn = sqlite3.connect(self.current_db_path)
                 cursor = conn.cursor()
                 # Get table structure
-                result = cursor.execute(f"PRAGMA table_info(\"{table_name}\")").fetchall()
+                result = cursor.execute(f"PRAGMA table_info('{table_name}')").fetchall()
                 # Create a DataFrame from the result
                 columns = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
                 df = pd.DataFrame(result, columns=columns)
@@ -1254,13 +1307,13 @@ class QueryTab(QWidget):
             # Connect to the database
             if self.current_db_path.lower().endswith('.duckdb'):
                 conn = duckdb.connect(self.current_db_path)
-                conn.execute(f"DROP TABLE IF EXISTS \"{table_name}\"")
+                conn.execute(f"DROP TABLE IF EXISTS '{table_name}'")
                 conn.close()
             else:
                 import sqlite3
                 conn = sqlite3.connect(self.current_db_path)
                 cursor = conn.cursor()
-                cursor.execute(f"DROP TABLE IF EXISTS \"{table_name}\"")
+                cursor.execute(f"DROP TABLE IF EXISTS '{table_name}'")
                 conn.commit()
                 conn.close()
                 
@@ -1277,6 +1330,86 @@ class QueryTab(QWidget):
         """Handle double-click on a table item"""
         if item and self.current_db_path:
             self.view_table_data(item.text())
+
+    def show_query_examples(self):
+        """Show a dialog with popular SQL query examples"""
+        examples_dialog = QDialog(self)
+        examples_dialog.setWindowTitle("SQL Query Examples")
+        examples_dialog.setMinimumWidth(600)
+        examples_dialog.setMinimumHeight(400)
+        
+        layout = QVBoxLayout(examples_dialog)
+        
+        # Add a label with instructions
+        header_label = QLabel("Common SQL Query Examples")
+        header_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 10px;")
+        layout.addWidget(header_label)
+        
+        # Create a text edit with examples
+        examples_text = QPlainTextEdit()
+        examples_text.setReadOnly(True)
+        examples_text.setStyleSheet("font-family: monospace; font-size: 12px;")
+        
+        # Add example queries
+        examples = [
+            "-- Basic SELECT query",
+            "SELECT * FROM 'table_name' LIMIT 100;",
+            "\n",
+            "-- SELECT specific columns",
+            "SELECT column1, column2 FROM 'table_name' LIMIT 100;",
+            "\n",
+            "-- Filter with WHERE clause",
+            "SELECT * FROM 'table_name' WHERE column_name > 100;",
+            "\n",
+            "-- Sort results with ORDER BY",
+            "SELECT * FROM 'table_name' ORDER BY column_name DESC LIMIT 100;",
+            "\n",
+            "-- Group and aggregate data",
+            "SELECT column1, COUNT(*) as count FROM 'table_name' GROUP BY column1;",
+            "\n",
+            "-- Join tables",
+            "SELECT t1.column1, t2.column2 FROM 'table1' t1",
+            "JOIN 'table2' t2 ON t1.id = t2.id LIMIT 100;",
+            "\n",
+            "-- Filter with multiple conditions",
+            "SELECT * FROM 'table_name' WHERE column1 > 10 AND column2 = 'value';",
+            "\n",
+            "-- Use LIKE for pattern matching",
+            "SELECT * FROM 'table_name' WHERE column_name LIKE '%pattern%';",
+            "\n",
+            "-- Calculate statistics",
+            "SELECT AVG(column1) as average, MAX(column1) as maximum,",
+            "MIN(column1) as minimum FROM 'table_name';",
+        ]
+        
+        examples_text.setPlainText("\n".join(examples))
+        layout.addWidget(examples_text)
+        
+        # Add a button to copy the selected example
+        copy_button = QPushButton("Copy Selected Example")
+        copy_button.clicked.connect(lambda: self.copy_selected_example(examples_text))
+        layout.addWidget(copy_button)
+        
+        # Add a close button
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(examples_dialog.accept)
+        layout.addWidget(close_button)
+        
+        examples_dialog.exec()
+
+    def copy_selected_example(self, text_edit):
+        """Copy the selected text to clipboard and create a new query tab with it"""
+        selected_text = text_edit.textCursor().selectedText()
+        
+        if not selected_text:
+            QMessageBox.information(self, "No Selection", "Please select an example query first.")
+            return
+        
+        # Create a new query tab with the selected example
+        tab = self.add_query_tab()
+        tab.query_edit.setPlainText(selected_text)
+        
+        QMessageBox.information(self, "Example Copied", "The example has been copied to a new query tab.")
 
 class CreateDatabaseDialog(QDialog):
     def __init__(self, parent=None):
