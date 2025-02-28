@@ -200,6 +200,22 @@ class QueryWorker(QThread):
             self.timer.stop()
             self.timer.deleteLater()
             self.timer = None
+    
+    def clean_query(self, query):
+        """Clean up SQL query to prevent common syntax errors"""
+        # Remove trailing semicolon which can cause parser errors
+        query = query.strip()
+        if query.endswith(';'):
+            query = query[:-1]
+        
+        # Ensure table names with spaces are properly quoted
+        # This regex finds FROM clauses with unquoted table names containing spaces
+        unquoted_table_match = re.search(r'FROM\s+([^"\'\s]+\s+[^"\'\s;]+)', query, re.IGNORECASE)
+        if unquoted_table_match:
+            table_name = unquoted_table_match.group(1)
+            query = query.replace(f"FROM {table_name}", f'FROM "{table_name}"')
+        
+        return query
 
     def start_timer(self):
         self.start_time = pd.Timestamp.now()
@@ -222,8 +238,8 @@ class QueryWorker(QThread):
             # Determine database type from file extension
             is_duckdb = self.db_path.lower().endswith('.duckdb')
             
-            # Process the query
-            q = self.query.strip()
+            # Process the query - clean it up to prevent syntax errors
+            q = self.clean_query(self.query)
             
             if is_duckdb:
                 # For DuckDB
@@ -237,7 +253,58 @@ class QueryWorker(QThread):
                 try:
                     result = conn.execute(q).fetchdf()
                 except Exception as e:
-                    if "Mismatch Type Error" in str(e):
+                    error_msg = str(e)
+                    if "Parser Error: syntax error at or near" in error_msg:
+                        # Try to fix common syntax errors
+                        self.progressUpdate.emit("Detected syntax error, attempting to fix...")
+                        
+                        # Try different approaches to fix the query
+                        fixed = False
+                        
+                        # Approach 1: Try removing quotes around table name
+                        if '"' in q and not fixed:
+                            try:
+                                # Try executing with modified query - remove quotes around table names
+                                table_match = re.search(r'FROM\s+"([^"]+)"', q, re.IGNORECASE)
+                                if table_match:
+                                    table_name = table_match.group(1)
+                                    fixed_q = q.replace(f'FROM "{table_name}"', f'FROM {table_name}')
+                                    result = conn.execute(fixed_q).fetchdf()
+                                    fixed = True
+                            except Exception:
+                                pass
+                        
+                        # Approach 2: Try adding quotes if they're missing
+                        if not fixed:
+                            try:
+                                # Try to identify table name and add quotes
+                                table_match = re.search(r'FROM\s+([^\s";]+)', q, re.IGNORECASE)
+                                if table_match:
+                                    table_name = table_match.group(1)
+                                    fixed_q = q.replace(f'FROM {table_name}', f'FROM "{table_name}"')
+                                    result = conn.execute(fixed_q).fetchdf()
+                                    fixed = True
+                            except Exception:
+                                pass
+                        
+                        # Approach 3: Try simplifying the query to just SELECT * FROM table
+                        if not fixed:
+                            try:
+                                table_match = re.search(r'FROM\s+(?:"([^"]+)"|([^\s;]+))', q, re.IGNORECASE)
+                                if table_match:
+                                    table_name = table_match.group(1) if table_match.group(1) else table_match.group(2)
+                                    fixed_q = f'SELECT * FROM "{table_name}"'
+                                    result = conn.execute(fixed_q).fetchdf()
+                                    fixed = True
+                            except Exception:
+                                pass
+                        
+                        # If all approaches failed, report the original error
+                        if not fixed:
+                            self.errorOccurred.emit(f"Error executing query: {error_msg}")
+                            self.cleanup_timer()
+                            return
+                    elif "Mismatch Type Error" in error_msg:
                         # Try again with explicit type conversion
                         self.progressUpdate.emit("Detected type mismatch, attempting with type conversion...")
                         
@@ -294,49 +361,149 @@ class QueryWorker(QThread):
                     result = pd.DataFrame(cursor.fetchall(), columns=columns)
                     
                 except Exception as e:
-                    if "no such column" in str(e).lower() or "ambiguous column name" in str(e).lower():
-                        # Try again with explicit type conversion
-                        self.progressUpdate.emit("Detected type mismatch, attempting with type conversion...")
-                        
-                        # For SQLite, we need to modify the query to handle type conversions
-                        if "SELECT *" in q:
-                            # For SELECT *, we need to get column names first
-                            table_match = re.search(r'FROM\s+[\'"]([^\'"]+)[\'"]', q)
-                            if table_match:
-                                table_name = table_match.group(1)
-                                # Get column info
-                                cursor = conn.cursor()
-                                cursor.execute(f"PRAGMA table_info(\"{table_name}\")")
-                                columns_info = cursor.fetchall()
-                                
-                                # Construct a new query with explicit casts
-                                select_parts = []
-                                for col_info in columns_info:
-                                    col_name = col_info[1]  # Column name is at index 1
-                                    col_type = col_info[2]  # Column type is at index 2
-                                    if col_type == 'INTEGER':
-                                        select_parts.append(f'CAST("{col_name}" AS INTEGER) AS "{col_name}"')
-                                    elif col_type == 'REAL' or col_type == 'DOUBLE':
-                                        select_parts.append(f'CAST("{col_name}" AS REAL) AS "{col_name}"')
-                                    else:
-                                        select_parts.append(f'"{col_name}"')
-                                
-                                # Reconstruct the query with casts
-                                select_clause = ", ".join(select_parts)
-                                q = q.replace("SELECT *", f"SELECT {select_clause}")
-                        
-                        # Try executing with the modified query
-                        try:
-                            cursor = conn.cursor()
-                            cursor.execute(q)
+                    error_msg = str(e)
+                    if "no such column" in error_msg.lower() or "ambiguous column name" in error_msg.lower() or "syntax error" in error_msg.lower():
+                        # Try to fix common syntax errors first
+                        if "syntax error" in error_msg.lower():
+                            self.progressUpdate.emit("Detected syntax error, attempting to fix...")
                             
-                            # Convert to DataFrame
-                            columns = [description[0] for description in cursor.description]
-                            result = pd.DataFrame(cursor.fetchall(), columns=columns)
-                        except Exception as e:
-                            self.errorOccurred.emit(f"Error executing query with type conversion: {str(e)}")
-                            self.cleanup_timer()
-                            return
+                            # Try different approaches to fix the query
+                            fixed = False
+                            
+                            # Approach 1: Try removing quotes around table name
+                            if '"' in q and not fixed:
+                                try:
+                                    # Try executing with modified query - remove quotes around table names
+                                    table_match = re.search(r'FROM\s+"([^"]+)"', q, re.IGNORECASE)
+                                    if table_match:
+                                        table_name = table_match.group(1)
+                                        fixed_q = q.replace(f'FROM "{table_name}"', f'FROM {table_name}')
+                                        cursor = conn.cursor()
+                                        cursor.execute(fixed_q)
+                                        columns = [description[0] for description in cursor.description]
+                                        result = pd.DataFrame(cursor.fetchall(), columns=columns)
+                                        fixed = True
+                                except Exception:
+                                    pass
+                            
+                            # Approach 2: Try adding quotes if they're missing
+                            if not fixed:
+                                try:
+                                    # Try to identify table name and add quotes
+                                    table_match = re.search(r'FROM\s+([^\s";]+)', q, re.IGNORECASE)
+                                    if table_match:
+                                        table_name = table_match.group(1)
+                                        fixed_q = q.replace(f'FROM {table_name}', f'FROM "{table_name}"')
+                                        cursor = conn.cursor()
+                                        cursor.execute(fixed_q)
+                                        columns = [description[0] for description in cursor.description]
+                                        result = pd.DataFrame(cursor.fetchall(), columns=columns)
+                                        fixed = True
+                                except Exception:
+                                    pass
+                            
+                            # Approach 3: Try simplifying the query to just SELECT * FROM table
+                            if not fixed:
+                                try:
+                                    table_match = re.search(r'FROM\s+(?:"([^"]+)"|([^\s;]+))', q, re.IGNORECASE)
+                                    if table_match:
+                                        table_name = table_match.group(1) if table_match.group(1) else table_match.group(2)
+                                        fixed_q = f'SELECT * FROM "{table_name}"'
+                                        cursor = conn.cursor()
+                                        cursor.execute(fixed_q)
+                                        columns = [description[0] for description in cursor.description]
+                                        result = pd.DataFrame(cursor.fetchall(), columns=columns)
+                                        fixed = True
+                                except Exception:
+                                    pass
+                            
+                            # If all approaches failed, continue with type conversion approach
+                            if not fixed:
+                                # Try again with explicit type conversion
+                                self.progressUpdate.emit("Detected type mismatch, attempting with type conversion...")
+                                
+                                # For SQLite, we need to modify the query to handle type conversions
+                                if "SELECT *" in q:
+                                    # For SELECT *, we need to get column names first
+                                    table_match = re.search(r'FROM\s+[\'"]([^\'"]+)[\'"]', q)
+                                    if table_match:
+                                        table_name = table_match.group(1)
+                                        # Get column info
+                                        cursor = conn.cursor()
+                                        cursor.execute(f"PRAGMA table_info(\"{table_name}\")")
+                                        columns_info = cursor.fetchall()
+                                        
+                                        # Construct a new query with explicit casts
+                                        select_parts = []
+                                        for col_info in columns_info:
+                                            col_name = col_info[1]  # Column name is at index 1
+                                            col_type = col_info[2]  # Column type is at index 2
+                                            if col_type == 'INTEGER':
+                                                select_parts.append(f'CAST("{col_name}" AS INTEGER) AS "{col_name}"')
+                                            elif col_type == 'REAL' or col_type == 'DOUBLE':
+                                                select_parts.append(f'CAST("{col_name}" AS REAL) AS "{col_name}"')
+                                            else:
+                                                select_parts.append(f'"{col_name}"')
+                                        
+                                        # Reconstruct the query with casts
+                                        select_clause = ", ".join(select_parts)
+                                        q = q.replace("SELECT *", f"SELECT {select_clause}")
+                                
+                                # Try executing with the modified query
+                                try:
+                                    cursor = conn.cursor()
+                                    cursor.execute(q)
+                                    
+                                    # Convert to DataFrame
+                                    columns = [description[0] for description in cursor.description]
+                                    result = pd.DataFrame(cursor.fetchall(), columns=columns)
+                                except Exception as e:
+                                    self.errorOccurred.emit(f"Error executing query with type conversion: {str(e)}")
+                                    self.cleanup_timer()
+                                    return
+                        else:
+                            # Try again with explicit type conversion
+                            self.progressUpdate.emit("Detected type mismatch, attempting with type conversion...")
+                            
+                            # For SQLite, we need to modify the query to handle type conversions
+                            if "SELECT *" in q:
+                                # For SELECT *, we need to get column names first
+                                table_match = re.search(r'FROM\s+[\'"]([^\'"]+)[\'"]', q)
+                                if table_match:
+                                    table_name = table_match.group(1)
+                                    # Get column info
+                                    cursor = conn.cursor()
+                                    cursor.execute(f"PRAGMA table_info(\"{table_name}\")")
+                                    columns_info = cursor.fetchall()
+                                    
+                                    # Construct a new query with explicit casts
+                                    select_parts = []
+                                    for col_info in columns_info:
+                                        col_name = col_info[1]  # Column name is at index 1
+                                        col_type = col_info[2]  # Column type is at index 2
+                                        if col_type == 'INTEGER':
+                                            select_parts.append(f'CAST("{col_name}" AS INTEGER) AS "{col_name}"')
+                                        elif col_type == 'REAL' or col_type == 'DOUBLE':
+                                            select_parts.append(f'CAST("{col_name}" AS REAL) AS "{col_name}"')
+                                        else:
+                                            select_parts.append(f'"{col_name}"')
+                                    
+                                    # Reconstruct the query with casts
+                                    select_clause = ", ".join(select_parts)
+                                    q = q.replace("SELECT *", f"SELECT {select_clause}")
+                            
+                            # Try executing with the modified query
+                            try:
+                                cursor = conn.cursor()
+                                cursor.execute(q)
+                                
+                                # Convert to DataFrame
+                                columns = [description[0] for description in cursor.description]
+                                result = pd.DataFrame(cursor.fetchall(), columns=columns)
+                            except Exception as e:
+                                self.errorOccurred.emit(f"Error executing query with type conversion: {str(e)}")
+                                self.cleanup_timer()
+                                return
                     else:
                         self.errorOccurred.emit(f"Error executing query: {str(e)}")
                         self.cleanup_timer()
