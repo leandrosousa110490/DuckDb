@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QListWidget, QSplitter, QTabWidget, QProgressDialog, QStyle, QComboBox, QMenuBar, QDialog, QDialogButtonBox,
                              QComboBox, QFormLayout, QMenu, QCheckBox, QRadioButton, QButtonGroup)
 from PyQt6.QtCore import QAbstractTableModel, Qt, QThread, pyqtSignal, QRegularExpression, QTimer, QObject
-from PyQt6.QtGui import QTextCursor, QSyntaxHighlighter, QTextCharFormat, QAction
+from PyQt6.QtGui import QTextCursor, QSyntaxHighlighter, QTextCharFormat, QAction, QFont, QFontMetrics
 
 
 SQL_KEYWORDS = [
@@ -102,7 +102,20 @@ class SQLHighlighter(QSyntaxHighlighter):
 class CodeEditor(QPlainTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
+        
+        # Set font to a monospaced font
+        font = QFont("Consolas" if sys.platform == "win32" else "Courier")
+        font.setPointSize(10)
+        self.setFont(font)
+        
+        # Set tab width
+        metrics = QFontMetrics(font)
+        self.setTabStopDistance(4 * metrics.horizontalAdvance(' '))
+        
+        # Create and set the highlighter
         self.highlighter = SQLHighlighter(self.document())
+        
+        # Set styling
         self.setStyleSheet("""
             QPlainTextEdit {
                 font-family: Consolas, Monaco, 'Courier New', monospace;
@@ -114,11 +127,76 @@ class CodeEditor(QPlainTextEdit):
                 padding: 8px;
             }
         """)
-
+        
+        # Auto-indentation and auto-closing quotes
+        self.auto_close_chars = {
+            "'": "'",
+            '"': '"',
+            '(': ')',
+            '[': ']',
+            '{': '}'
+        }
+    
     def keyPressEvent(self, event):
+        # Handle auto-closing quotes and brackets
+        if event.text() in self.auto_close_chars:
+            cursor = self.textCursor()
+            # Get the opening character
+            opening_char = event.text()
+            # Get the corresponding closing character
+            closing_char = self.auto_close_chars[opening_char]
+            
+            # Insert both characters and position cursor between them
+            cursor.insertText(opening_char + closing_char)
+            cursor.movePosition(QTextCursor.MoveOperation.Left, QTextCursor.MoveMode.MoveAnchor, 1)
+            self.setTextCursor(cursor)
+            return
+        # Handle auto-indentation for Enter key
+        elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+            # Get the current line
+            cursor = self.textCursor()
+            block = cursor.block()
+            text = block.text()
+            
+            # Find the indentation level
+            indentation = ""
+            for char in text:
+                if char.isspace():
+                    indentation += char
+                else:
+                    break
+            
+            # Call the parent implementation to insert a new line
+            super().keyPressEvent(event)
+            
+            # Insert the indentation
+            if indentation:
+                self.textCursor().insertText(indentation)
+            return
+        # Handle backspace to delete matching closing character
+        elif event.key() == Qt.Key.Key_Backspace:
+            cursor = self.textCursor()
+            if not cursor.hasSelection():
+                cursor_pos = cursor.position()
+                if cursor_pos > 0:
+                    # Check if we're between an opening and closing character
+                    cursor.movePosition(QTextCursor.MoveOperation.Left, QTextCursor.MoveMode.KeepAnchor, 1)
+                    opening_char = cursor.selectedText()
+                    cursor.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.MoveAnchor, 1)
+                    
+                    if opening_char in self.auto_close_chars:
+                        cursor.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor, 1)
+                        closing_char = cursor.selectedText()
+                        
+                        if closing_char == self.auto_close_chars[opening_char]:
+                            # Delete both characters
+                            cursor.movePosition(QTextCursor.MoveOperation.Left, QTextCursor.MoveMode.MoveAnchor, 1)
+                            cursor.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor, 2)
+                            cursor.removeSelectedText()
+                            return
+        
+        # For all other keys, use the default behavior
         super().keyPressEvent(event)
-        # Trigger rehighlighting after each keypress
-        self.highlighter.rehighlight()
 
 class PandasModel(QAbstractTableModel):
     CHUNK_SIZE = 1000  # Number of rows to load at a time
