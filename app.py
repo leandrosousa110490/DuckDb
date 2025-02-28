@@ -668,7 +668,7 @@ class MergeFilesWorker(QObject):
         new_columns = []
         column_types = self.analyze_column_types(sample_df)
         
-        # Create a mapping of lowercase co
+        # Create a mapping of lowercase column names to actual column names to check for case-insensitive duplicates
         existing_columns_lower = {col.lower(): col for col in existing_columns}
         
         for col in sample_df.columns:
@@ -681,26 +681,44 @@ class MergeFilesWorker(QObject):
             
         self.progress.emit(f"Adding {len(new_columns)} new columns to the table...")
         
-        try:
-            for col_name, col_type in new_columns:
+        for col_name, col_type in new_columns:
+            added = False
+            errors = []
+            
+            # Try different quoting styles for column names
+            quoting_styles = [
+                f'"{col_name}"',  # Double quotes
+                f'[{col_name}]',  # Square brackets
+                f'`{col_name}`',  # Backticks
+                col_name          # No quotes
+            ]
+            
+            for quoted_col in quoting_styles:
+                if added:
+                    break
+                    
                 try:
                     if self.is_duckdb:
-                        conn.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN \"{col_name}\" {col_type}")
+                        conn.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN {quoted_col} {col_type}")
+                        added = True
                     else:
                         cursor = conn.cursor()
-                        cursor.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN \"{col_name}\" {col_type}")
+                        cursor.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN {quoted_col} {col_type}")
                         conn.commit()
+                        added = True
                 except Exception as e:
                     # If column already exists with a different case, skip it
                     if "duplicate column name" in str(e).lower():
                         self.progress.emit(f"Column \"{col_name}\" already exists with a different case, skipping...")
-                        continue
+                        added = True  # Consider it added since it exists
+                        break
                     else:
-                        raise e
-                    
-            self.progress.emit(f"Added {len(new_columns)} new columns to the table.")
-        except Exception as e:
-            self.error.emit(f"Error adding new columns: {str(e)}")
+                        errors.append(f"Error with {quoted_col}: {str(e)}")
+            
+            if not added:
+                self.progress.emit(f"Could not add column {col_name}. Errors: {'; '.join(errors)}")
+                
+        self.progress.emit(f"Added new columns to the table.")
     
     def create_table_if_not_exists(self, conn, sample_df):
         """Create table with appropriate column types if it doesn't exist"""
@@ -719,68 +737,147 @@ class MergeFilesWorker(QObject):
             conn.commit()
     
     def read_file_in_chunks(self, file_path):
-        """Read a file in chunks to handle large files efficiently"""
-        file_ext = file_path.suffix.lower()
+        """Read file in chunks to avoid memory issues"""
+        # Convert Path object to string if needed
+        file_path_str = str(file_path)
+        file_ext = file_path.suffix.lower() if hasattr(file_path, 'suffix') else os.path.splitext(file_path_str)[1].lower()
         
-        if file_ext == '.csv':
-            # For CSV, use chunked reading
-            for chunk in pd.read_csv(file_path, chunksize=self.CHUNK_SIZE):
-                if self.is_cancelled:
-                    return
-                # Clean column names
-                chunk.columns = self.clean_column_names(chunk.columns)
-                yield chunk
+        try:
+            if file_ext == '.csv':
+                # Try with default settings first
+                try:
+                    for chunk in pd.read_csv(file_path_str, chunksize=self.CHUNK_SIZE):
+                        # Clean column names
+                        chunk.columns = self.clean_column_names(chunk.columns)
+                        yield chunk
+                except Exception as e:
+                    self.progress.emit(f"Error reading CSV with default settings, trying more flexible settings: {str(e)}")
+                    # Try with more flexible settings
+                    for chunk in pd.read_csv(file_path_str, chunksize=self.CHUNK_SIZE, 
+                                           encoding='latin1', on_bad_lines='skip', 
+                                           low_memory=False, dtype=str):
+                        # Clean column names
+                        chunk.columns = self.clean_column_names(chunk.columns)
+                        yield chunk
+                        
+            elif file_ext in ['.xlsx', '.xls']:
+                # For Excel, we need to read the entire file at once
+                # but we can process it in chunks
+                try:
+                    df = pd.read_excel(file_path_str, engine='openpyxl')
+                except Exception as e1:
+                    self.progress.emit(f"Error reading Excel with openpyxl, trying xlrd: {str(e1)}")
+                    try:
+                        df = pd.read_excel(file_path_str, engine='xlrd')
+                    except Exception as e2:
+                        self.progress.emit(f"Error reading Excel with xlrd: {str(e2)}")
+                        raise Exception(f"Could not read Excel file with any available engine: {str(e1)} | {str(e2)}")
                 
-        elif file_ext in ['.xlsx', '.xls']:
-            # For Excel, we need to read it all at once, but we can process it in chunks
-            df = pd.read_excel(file_path)
-            # Clean column names
-            df.columns = self.clean_column_names(df.columns)
-            total_rows = len(df)
-            
-            for i in range(0, total_rows, self.CHUNK_SIZE):
-                if self.is_cancelled:
-                    return
-                end_idx = min(i + self.CHUNK_SIZE, total_rows)
-                yield df.iloc[i:end_idx]
-                
-        elif file_ext == '.parquet':
-            # For Parquet, use chunked reading if available
-            try:
-                # Try using pyarrow for chunked reading
-                import pyarrow.parquet as pq
-                table = pq.read_table(file_path)
-                total_rows = table.num_rows
-                
-                for i in range(0, total_rows, self.CHUNK_SIZE):
-                    if self.is_cancelled:
-                        return
-                    end_idx = min(i + self.CHUNK_SIZE, total_rows)
-                    chunk = table.slice(i, end_idx - i).to_pandas()
-                    # Clean column names
-                    chunk.columns = self.clean_column_names(chunk.columns)
-                    yield chunk
-            except ImportError:
-                # Fall back to pandas if pyarrow is not available
-                df = pd.read_parquet(file_path)
                 # Clean column names
                 df.columns = self.clean_column_names(df.columns)
-                total_rows = len(df)
                 
+                # Process in chunks
+                total_rows = len(df)
                 for i in range(0, total_rows, self.CHUNK_SIZE):
-                    if self.is_cancelled:
-                        return
-                    end_idx = min(i + self.CHUNK_SIZE, total_rows)
-                    yield df.iloc[i:end_idx]
+                    end = min(i + self.CHUNK_SIZE, total_rows)
+                    yield df.iloc[i:end]
+                    
+            elif file_ext == '.parquet':
+                # Try using pyarrow for chunked reading
+                try:
+                    import pyarrow.parquet as pq
+                    
+                    # Open the file
+                    parquet_file = pq.ParquetFile(file_path_str)
+                    
+                    # Get total number of row groups
+                    num_row_groups = parquet_file.num_row_groups
+                    
+                    # Process each row group
+                    for i in range(num_row_groups):
+                        # Read row group
+                        table = parquet_file.read_row_group(i)
+                        
+                        # Convert to pandas DataFrame
+                        chunk = table.to_pandas()
+                        
+                        # Clean column names
+                        chunk.columns = self.clean_column_names(chunk.columns)
+                        
+                        yield chunk
+                        
+                except ImportError:
+                    # Fall back to pandas if pyarrow is not available
+                    self.progress.emit("PyArrow not available, falling back to pandas for Parquet reading")
+                    df = pd.read_parquet(file_path_str)
+                    
+                    # Clean column names
+                    df.columns = self.clean_column_names(df.columns)
+                    
+                    # Process in chunks
+                    total_rows = len(df)
+                    for i in range(0, total_rows, self.CHUNK_SIZE):
+                        end = min(i + self.CHUNK_SIZE, total_rows)
+                        yield df.iloc[i:end]
+            else:
+                self.progress.emit(f"Unsupported file format: {file_ext}")
+                raise ValueError(f"Unsupported file format: {file_ext}")
+                
+        except Exception as e:
+            self.error.emit(f"Error reading file {file_path.name}: {str(e)}")
+            return None
     
     def insert_data(self, conn, df):
         """Insert data into the database"""
+        if df is None:
+            # This is the case when using DuckDB and the DataFrame is already registered
+            if self.is_duckdb:
+                conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
+            return
+            
+        # Get existing columns to ensure proper column alignment
+        existing_columns = self.get_existing_columns(conn)
+        self.insert_data_with_column_matching(conn, df, existing_columns)
+    
+    def insert_data_with_column_matching(self, conn, df, existing_columns):
+        """Insert data with column matching to handle different column sets"""
+        self.progress.emit(f"Aligning columns with existing table structure...")
+        
+        # Create sets for easier comparison
+        df_columns = set(df.columns)
+        table_columns = set(existing_columns)
+        
+        # Find columns in DataFrame that aren't in the table
+        # (This shouldn't happen as we've already added missing columns, but just in case)
+        missing_in_table = df_columns - table_columns
+        if missing_in_table:
+            self.progress.emit(f"Found {len(missing_in_table)} columns in data that aren't in the table. Adding them...")
+            self.add_missing_columns(conn, df[list(missing_in_table)], existing_columns)
+            # Update existing columns
+            existing_columns = self.get_existing_columns(conn)
+            table_columns = set(existing_columns)
+        
+        # Find columns in the table that aren't in the DataFrame
+        missing_in_df = table_columns - df_columns
+        if missing_in_df:
+            self.progress.emit(f"Found {len(missing_in_df)} columns in table that aren't in the data. Will fill with NULL values.")
+            # Add missing columns to DataFrame with NULL values
+            for col in missing_in_df:
+                df[col] = None
+        
+        # Ensure DataFrame columns are in the same order as the table
+        ordered_df = df[existing_columns]
+        
+        # Now insert the data
         if self.is_duckdb:
-            # For DuckDB, we can use the append method
-            conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
+            # For DuckDB, register the aligned DataFrame
+            conn.register('aligned_df', ordered_df)
+            conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM aligned_df")
         else:
-            # For SQLite, we need to use the pandas to_sql method
-            df.to_sql(self.table_name, conn, if_exists='append', index=False)
+            # For SQLite, use pandas to_sql
+            ordered_df.to_sql(self.table_name, conn, if_exists='append', index=False)
+        
+        self.progress.emit(f"Inserted {len(df)} rows with column alignment.")
     
     # Make run a slot that can be connected to QThread.started signal
     def run(self):
@@ -857,7 +954,7 @@ class MergeFilesWorker(QObject):
                         if self.is_duckdb:
                             # Register the DataFrame as a view
                             conn.register('df', chunk)
-                            self.insert_data(conn, None)
+                            self.insert_data(conn, None)  # Pass None to indicate df is already registered
                         else:
                             self.insert_data(conn, chunk)
                         
@@ -2382,6 +2479,383 @@ class ImportFileWorker(QObject):
         self.is_duckdb = db_path.lower().endswith('.duckdb')
         self.chunk_size = 50000  # Chunk size for better memory management
     
+    def insert_data_with_column_matching(self, conn, df, existing_columns):
+        """Insert data with column matching to handle different column sets"""
+        self.progress.emit(f"Aligning columns with existing table structure...")
+        
+        # Create sets for easier comparison
+        df_columns = set(df.columns)
+        table_columns = set(existing_columns)
+        
+        # Find columns in DataFrame that aren't in the table
+        # (This shouldn't happen as we've already added missing columns, but just in case)
+        missing_in_table = df_columns - table_columns
+        if missing_in_table:
+            self.progress.emit(f"Found {len(missing_in_table)} columns in data that aren't in the table. Adding them...")
+            self.add_missing_columns(conn, df[list(missing_in_table)], existing_columns)
+            # Update existing columns
+            existing_columns = self.get_existing_columns(conn)
+            table_columns = set(existing_columns)
+        
+        # Find columns in the table that aren't in the DataFrame
+        missing_in_df = table_columns - df_columns
+        if missing_in_df:
+            self.progress.emit(f"Found {len(missing_in_df)} columns in table that aren't in the data. Will fill with NULL values.")
+            # Add missing columns to DataFrame with NULL values
+            for col in missing_in_df:
+                df[col] = None
+        
+        # Ensure DataFrame columns are in the same order as the table
+        ordered_df = df[existing_columns]
+        
+        # Now insert the data
+        if self.is_duckdb:
+            # For DuckDB, register the aligned DataFrame
+            conn.register('aligned_df', ordered_df)
+            conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM aligned_df")
+        else:
+            # For SQLite, use pandas to_sql
+            ordered_df.to_sql(self.table_name, conn, if_exists='append', index=False)
+        
+        self.progress.emit(f"Inserted {len(df)} rows with column alignment.")
+    
+    def run(self):
+        try:
+            self.progress.emit(f"Reading file: {self.file_path}")
+            
+            # Read the file
+            df_chunks = self.read_file()
+            if df_chunks is None or self.is_cancelled:
+                self.finished.emit()
+                return
+            
+            # Connect to the database
+            if self.is_duckdb:
+                conn = duckdb.connect(self.db_path)
+            else:
+                import sqlite3
+                conn = sqlite3.connect(self.db_path)
+            
+            # Process the first chunk to set up the table
+            try:
+                # Get the first chunk to analyze schema
+                first_chunk = next(df_chunks) if hasattr(df_chunks, '__next__') else df_chunks[0]
+                
+                # Clean column names for the first chunk
+                first_chunk.columns = self.clean_column_names(first_chunk.columns)
+                
+                self.progress.emit(f"File read successfully. Processing data...")
+                
+                # Check if we're using an existing table
+                if self.use_existing_table:
+                    # Get existing columns
+                    existing_columns = self.get_existing_columns(conn)
+                    
+                    # Add any missing columns
+                    self.add_missing_columns(conn, first_chunk, existing_columns)
+                    
+                    # Get updated list of columns after adding new ones
+                    existing_columns = self.get_existing_columns(conn)
+                    
+                    # Insert data with column matching
+                    self.insert_data_with_column_matching(conn, first_chunk, existing_columns)
+                else:
+                    # Create the table if it doesn't exist
+                    self.create_table_if_not_exists(conn, first_chunk)
+                    
+                    # For a new table, we can insert directly
+                    if self.is_duckdb:
+                        # For DuckDB, we can use the append method
+                        conn.register('df', first_chunk)
+                        conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
+                    else:
+                        # For SQLite, we need to use the pandas to_sql method
+                        first_chunk.to_sql(self.table_name, conn, if_exists='append', index=False)
+                
+                # Process remaining chunks if any
+                rows_imported = len(first_chunk)
+                chunk_count = 1
+                
+                # If df_chunks is a generator or list with more chunks
+                if hasattr(df_chunks, '__next__'):
+                    # Process remaining chunks from generator
+                    for chunk in df_chunks:
+                        if self.is_cancelled:
+                            break
+                        
+                        # Clean column names
+                        chunk.columns = self.clean_column_names(chunk.columns)
+                        
+                        # Check for and add any new columns that might be in this chunk
+                        existing_columns = self.get_existing_columns(conn)
+                        self.add_missing_columns(conn, chunk, existing_columns)
+                        
+                        # Get updated columns after potentially adding new ones
+                        existing_columns = self.get_existing_columns(conn)
+                        
+                        # Insert data with column matching
+                        self.insert_data_with_column_matching(conn, chunk, existing_columns)
+                        
+                        # Update progress
+                        rows_imported += len(chunk)
+                        chunk_count += 1
+                        self.progress.emit(f"Imported chunk {chunk_count}: {rows_imported} rows total...")
+                
+                elif isinstance(df_chunks, list) and len(df_chunks) > 1:
+                    # Process remaining chunks from list
+                    for i in range(1, len(df_chunks)):
+                        if self.is_cancelled:
+                            break
+                        
+                        chunk = df_chunks[i]
+                        
+                        # Clean column names
+                        chunk.columns = self.clean_column_names(chunk.columns)
+                        
+                        # Check for and add any new columns that might be in this chunk
+                        existing_columns = self.get_existing_columns(conn)
+                        self.add_missing_columns(conn, chunk, existing_columns)
+                        
+                        # Get updated columns after potentially adding new ones
+                        existing_columns = self.get_existing_columns(conn)
+                        
+                        # Insert data with column matching
+                        self.insert_data_with_column_matching(conn, chunk, existing_columns)
+                        
+                        # Update progress
+                        rows_imported += len(chunk)
+                        self.progress.emit(f"Imported chunk {i+1}: {rows_imported} rows total...")
+                
+            except StopIteration:
+                # No data in the file
+                self.error.emit("No data found in the file or file is empty.")
+                if self.is_duckdb:
+                    conn.close()
+                else:
+                    conn.close()
+                self.finished.emit()
+                return
+            
+            # Close the database connection
+            if self.is_duckdb:
+                conn.close()
+            else:
+                conn.commit()
+                conn.close()
+            
+            if not self.is_cancelled:
+                self.success.emit(f"Successfully imported {rows_imported} rows into {self.db_path}")
+                # Emit signal that table was created/updated
+                self.table_created.emit(self.db_path, self.table_name)
+            
+            self.finished.emit()
+            
+        except Exception as e:
+            self.error.emit(f"Error importing file: {str(e)}")
+            self.finished.emit()
+    
+    def cancel(self):
+        self.is_cancelled = True
+        self.progress.emit("Cancelling operation...")
+
+    def clean_column_names(self, columns):
+        """Clean and deduplicate column names"""
+        # Convert columns to list of strings
+        cols = [str(col) if col is not None else f"Column_{i+1}" for i, col in enumerate(columns)]
+        
+        # Replace empty strings with placeholder names
+        for i in range(len(cols)):
+            if cols[i].strip() == '':
+                cols[i] = f"Column_{i+1}"
+        
+        # Handle duplicate column names
+        seen = {}
+        for i in range(len(cols)):
+            col = cols[i]
+            if col in seen:
+                seen[col] += 1
+                cols[i] = f"{col}_{seen[col]}"
+            else:
+                seen[col] = 0
+                
+        return cols
+    
+    def get_existing_columns(self, conn):
+        """Get existing columns from the table"""
+        try:
+            if self.is_duckdb:
+                result = conn.execute(f"PRAGMA table_info('{self.table_name}')").fetchall()
+                return [row[1] for row in result]  # Column name is at index 1
+            else:
+                import sqlite3
+                cursor = conn.cursor()
+                result = cursor.execute(f"PRAGMA table_info('{self.table_name}')").fetchall()
+                return [row[1] for row in result]  # Column name is at index 1
+        except Exception as e:
+            self.progress.emit(f"Error getting existing columns: {str(e)}")
+            return []
+    
+    def add_missing_columns(self, conn, df, existing_columns):
+        """Add missing columns to the existing table"""
+        new_columns = []
+        column_types = self.analyze_column_types(df)
+        
+        # Create a mapping of lowercase column names to actual column names to check for case-insensitive duplicates
+        existing_columns_lower = {col.lower(): col for col in existing_columns}
+        
+        for col in df.columns:
+            # Check if column already exists (case-insensitive)
+            if col.lower() not in existing_columns_lower:
+                new_columns.append((col, column_types[col]))
+        
+        if not new_columns:
+            return
+            
+        self.progress.emit(f"Adding {len(new_columns)} new columns to the table...")
+        
+        for col_name, col_type in new_columns:
+            added = False
+            errors = []
+            
+            # Try different quoting styles for column names
+            quoting_styles = [
+                f'"{col_name}"',  # Double quotes
+                f'[{col_name}]',  # Square brackets
+                f'`{col_name}`',  # Backticks
+                col_name          # No quotes
+            ]
+            
+            for quoted_col in quoting_styles:
+                if added:
+                    break
+                    
+                try:
+                    if self.is_duckdb:
+                        conn.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN {quoted_col} {col_type}")
+                        added = True
+                    else:
+                        cursor = conn.cursor()
+                        cursor.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN {quoted_col} {col_type}")
+                        conn.commit()
+                        added = True
+                except Exception as e:
+                    # If column already exists with a different case, skip it
+                    if "duplicate column name" in str(e).lower():
+                        self.progress.emit(f"Column \"{col_name}\" already exists with a different case, skipping...")
+                        added = True  # Consider it added since it exists
+                        break
+                    else:
+                        errors.append(f"Error with {quoted_col}: {str(e)}")
+            
+            if not added:
+                self.progress.emit(f"Could not add column {col_name}. Errors: {'; '.join(errors)}")
+                
+        self.progress.emit(f"Added new columns to the table.")
+    
+    def create_table_if_not_exists(self, conn, df):
+        """Create table with appropriate column types if it doesn't exist"""
+        column_types = self.analyze_column_types(df)
+        
+        # Build CREATE TABLE statement
+        columns_sql = ', '.join([f'"{col}" {dtype}' for col, dtype in column_types.items()])
+        create_table_sql = f"CREATE TABLE IF NOT EXISTS \"{self.table_name}\" ({columns_sql})"
+        
+        # Execute the statement
+        if self.is_duckdb:
+            conn.execute(create_table_sql)
+        else:
+            cursor = conn.cursor()
+            cursor.execute(create_table_sql)
+            conn.commit()
+    
+    def read_file(self):
+        """Read file in chunks to avoid memory issues"""
+        # Get file extension from string path
+        file_path_str = str(self.file_path)
+        file_ext = os.path.splitext(file_path_str)[1].lower()
+        
+        try:
+            if file_ext == '.csv':
+                # Try with default settings first
+                try:
+                    for chunk in pd.read_csv(file_path_str, chunksize=self.chunk_size):
+                        # Clean column names
+                        chunk.columns = self.clean_column_names(chunk.columns)
+                        yield chunk
+                except Exception as e:
+                    self.progress.emit(f"Error reading CSV with default settings, trying more flexible settings: {str(e)}")
+                    # Try with more flexible settings
+                    for chunk in pd.read_csv(file_path_str, chunksize=self.chunk_size, 
+                                           encoding='latin1', on_bad_lines='skip', 
+                                           low_memory=False, dtype=str):
+                        # Clean column names
+                        chunk.columns = self.clean_column_names(chunk.columns)
+                        yield chunk
+                        
+            elif file_ext in ['.xlsx', '.xls']:
+                # For Excel, we need to read the entire file at once
+                # but we can process it in chunks
+                try:
+                    df = pd.read_excel(file_path_str, engine='openpyxl')
+                except Exception as e1:
+                    self.progress.emit(f"Error reading Excel with openpyxl, trying xlrd: {str(e1)}")
+                    try:
+                        df = pd.read_excel(file_path_str, engine='xlrd')
+                    except Exception as e2:
+                        self.progress.emit(f"Error reading Excel with xlrd: {str(e2)}")
+                        raise Exception(f"Could not read Excel file with any available engine: {str(e1)} | {str(e2)}")
+                
+                # Clean column names
+                df.columns = self.clean_column_names(df.columns)
+                
+                # Process in chunks
+                total_rows = len(df)
+                for i in range(0, total_rows, self.chunk_size):
+                    end = min(i + self.chunk_size, total_rows)
+                    yield df.iloc[i:end]
+                    
+            elif file_ext == '.parquet':
+                self.progress.emit("Reading Parquet file...")
+                try:
+                    # Try using pyarrow for better performance with chunking
+                    import pyarrow.parquet as pq
+                    
+                    # Open the parquet file
+                    parquet_file = pq.ParquetFile(file_path_str)
+                    
+                    # Create a generator to yield chunks
+                    def parquet_chunk_generator():
+                        for i in range(0, parquet_file.metadata.num_row_groups, self.chunk_size):
+                            if self.is_cancelled:
+                                break
+                                
+                            # Calculate how many row groups to read
+                            end_group = min(i + self.chunk_size, parquet_file.metadata.num_row_groups)
+                            row_groups = list(range(i, end_group))
+                            
+                            # Read the chunk
+                            table = parquet_file.read_row_groups(row_groups)
+                            df_chunk = table.to_pandas()
+                            
+                            # Update progress
+                            self.progress.emit(f"Read chunk {i//self.chunk_size + 1} from Parquet file...")
+                            
+                            yield df_chunk
+                    
+                    # Return the generator
+                    return parquet_chunk_generator()
+                    
+                except (ImportError, AttributeError):
+                    # Fall back to pandas
+                    self.progress.emit("PyArrow not available, using pandas for Parquet...")
+                    return [pd.read_parquet(file_path_str)]
+            else:
+                raise ValueError(f"Unsupported file format: {file_ext}")
+            
+        except Exception as e:
+            self.error.emit(f"Error reading file: {str(e)}")
+            return None
+    
     def analyze_column_types(self, df):
         """Analyze column types to ensure proper database insertion"""
         column_types = {}
@@ -2438,26 +2912,44 @@ class ImportFileWorker(QObject):
             
         self.progress.emit(f"Adding {len(new_columns)} new columns to the table...")
         
-        try:
-            for col_name, col_type in new_columns:
+        for col_name, col_type in new_columns:
+            added = False
+            errors = []
+            
+            # Try different quoting styles for column names
+            quoting_styles = [
+                f'"{col_name}"',  # Double quotes
+                f'[{col_name}]',  # Square brackets
+                f'`{col_name}`',  # Backticks
+                col_name          # No quotes
+            ]
+            
+            for quoted_col in quoting_styles:
+                if added:
+                    break
+                    
                 try:
                     if self.is_duckdb:
-                        conn.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN \"{col_name}\" {col_type}")
+                        conn.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN {quoted_col} {col_type}")
+                        added = True
                     else:
                         cursor = conn.cursor()
-                        cursor.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN \"{col_name}\" {col_type}")
+                        cursor.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN {quoted_col} {col_type}")
                         conn.commit()
+                        added = True
                 except Exception as e:
                     # If column already exists with a different case, skip it
                     if "duplicate column name" in str(e).lower():
                         self.progress.emit(f"Column \"{col_name}\" already exists with a different case, skipping...")
-                        continue
+                        added = True  # Consider it added since it exists
+                        break
                     else:
-                        raise e
-                    
-            self.progress.emit(f"Added {len(new_columns)} new columns to the table.")
-        except Exception as e:
-            self.error.emit(f"Error adding new columns: {str(e)}")
+                        errors.append(f"Error with {quoted_col}: {str(e)}")
+            
+            if not added:
+                self.progress.emit(f"Could not add column {col_name}. Errors: {'; '.join(errors)}")
+                
+        self.progress.emit(f"Added new columns to the table.")
     
     def create_table_if_not_exists(self, conn, df):
         """Create table with appropriate column types if it doesn't exist"""
@@ -2476,122 +2968,59 @@ class ImportFileWorker(QObject):
             conn.commit()
     
     def read_file(self):
-        """Read the file based on its type and options"""
-        file_ext = self.file_path.lower()
+        """Read file in chunks to avoid memory issues"""
+        # Get file extension from string path
+        file_path_str = str(self.file_path)
+        file_ext = os.path.splitext(file_path_str)[1].lower()
         
         try:
-            if file_ext.endswith('.csv'):
-                # Get CSV options
-                header = 0 if self.import_options.get('header', True) else None
-                delimiter = self.import_options.get('delimiter', ',')
-                
-                self.progress.emit(f"Reading CSV file with delimiter '{delimiter}'...")
-                # Read CSV in chunks to avoid memory issues
-                return pd.read_csv(self.file_path, header=header, delimiter=delimiter, chunksize=self.chunk_size)
-                
-            elif file_ext.endswith(('.xlsx', '.xls')):
-                # Get Excel options
-                header = 0 if self.import_options.get('header', True) else None
-                sheet_name = self.import_options.get('sheet_name', 0)
-                
-                self.progress.emit(f"Reading Excel file, sheet: {sheet_name}...")
-                
-                # For Excel files, we need a different approach since pandas doesn't support chunksize for Excel
-                # First, check the file size to determine if we need special handling
-                file_size = os.path.getsize(self.file_path) / (1024 * 1024)  # Size in MB
-                
-                if file_size > 10:  # If file is larger than 10MB
-                    self.progress.emit(f"Large Excel file detected ({file_size:.1f} MB). Using optimized loading...")
-                    
-                    # Use openpyxl with read_only mode for better performance
-                    import openpyxl
-                    wb = openpyxl.load_workbook(self.file_path, read_only=True, data_only=True)
-                    
-                    # Get the requested sheet
-                    if isinstance(sheet_name, int):
-                        sheet = wb.worksheets[sheet_name]
-                    else:
-                        sheet = wb[sheet_name]
-                    
-                    # Get headers if needed
-                    headers = None
-                    if header == 0:
-                        # Get first row as headers
-                        header_row = next(sheet.rows)
-                        headers = [cell.value for cell in header_row]
+            if file_ext == '.csv':
+                # Try with default settings first
+                try:
+                    for chunk in pd.read_csv(file_path_str, chunksize=self.chunk_size):
+                        # Clean column names
+                        chunk.columns = self.clean_column_names(chunk.columns)
+                        yield chunk
+                except Exception as e:
+                    self.progress.emit(f"Error reading CSV with default settings, trying more flexible settings: {str(e)}")
+                    # Try with more flexible settings
+                    for chunk in pd.read_csv(file_path_str, chunksize=self.chunk_size, 
+                                           encoding='latin1', on_bad_lines='skip', 
+                                           low_memory=False, dtype=str):
+                        # Clean column names
+                        chunk.columns = self.clean_column_names(chunk.columns)
+                        yield chunk
                         
-                        # Clean and deduplicate headers
-                        if headers:
-                            # Replace None or empty headers with placeholder names
-                            for i in range(len(headers)):
-                                if headers[i] is None or str(headers[i]).strip() == '':
-                                    headers[i] = f"Column_{i+1}"
-                            
-                            # Handle duplicate headers by adding a suffix
-                            seen_headers = {}
-                            for i in range(len(headers)):
-                                header = str(headers[i])
-                                if header in seen_headers:
-                                    seen_headers[header] += 1
-                                    headers[i] = f"{header}_{seen_headers[header]}"
-                                else:
-                                    seen_headers[header] = 0
-                    
-                    # Create a generator to yield chunks of data
-                    def excel_chunk_generator():
-                        chunk = []
-                        rows_processed = 0
-                        
-                        # Skip header row if needed
-                        row_iter = sheet.rows
-                        if header == 0:
-                            next(row_iter)  # Skip header row
-                        
-                        for row in row_iter:
-                            if self.is_cancelled:
-                                break
-                                
-                            # Convert row to list of values
-                            row_data = [cell.value for cell in row]
-                            chunk.append(row_data)
-                            rows_processed += 1
-                            
-                            # Yield chunk when it reaches chunk_size
-                            if len(chunk) >= self.chunk_size:
-                                # Convert chunk to DataFrame
-                                df_chunk = pd.DataFrame(chunk, columns=headers)
-                                yield df_chunk
-                                
-                                # Update progress
-                                self.progress.emit(f"Processed {rows_processed} rows from Excel file...")
-                                
-                                # Reset chunk
-                                chunk = []
-                        
-                        # Yield remaining rows
-                        if chunk and not self.is_cancelled:
-                            df_chunk = pd.DataFrame(chunk, columns=headers)
-                            yield df_chunk
-                    
-                    # Return the generator
-                    return excel_chunk_generator()
-                else:
-                    # For smaller files, use pandas directly
-                    df = pd.read_excel(self.file_path, sheet_name=sheet_name, header=header)
-                    
-                    # Clean and deduplicate column names
-                    df.columns = self.clean_column_names(df.columns)
-                    
-                    return [df]
+            elif file_ext in ['.xlsx', '.xls']:
+                # For Excel, we need to read the entire file at once
+                # but we can process it in chunks
+                try:
+                    df = pd.read_excel(file_path_str, engine='openpyxl')
+                except Exception as e1:
+                    self.progress.emit(f"Error reading Excel with openpyxl, trying xlrd: {str(e1)}")
+                    try:
+                        df = pd.read_excel(file_path_str, engine='xlrd')
+                    except Exception as e2:
+                        self.progress.emit(f"Error reading Excel with xlrd: {str(e2)}")
+                        raise Exception(f"Could not read Excel file with any available engine: {str(e1)} | {str(e2)}")
                 
-            elif file_ext.endswith('.parquet'):
+                # Clean column names
+                df.columns = self.clean_column_names(df.columns)
+                
+                # Process in chunks
+                total_rows = len(df)
+                for i in range(0, total_rows, self.chunk_size):
+                    end = min(i + self.chunk_size, total_rows)
+                    yield df.iloc[i:end]
+                    
+            elif file_ext == '.parquet':
                 self.progress.emit("Reading Parquet file...")
                 try:
                     # Try using pyarrow for better performance with chunking
                     import pyarrow.parquet as pq
                     
                     # Open the parquet file
-                    parquet_file = pq.ParquetFile(self.file_path)
+                    parquet_file = pq.ParquetFile(file_path_str)
                     
                     # Create a generator to yield chunks
                     def parquet_chunk_generator():
@@ -2618,7 +3047,7 @@ class ImportFileWorker(QObject):
                 except (ImportError, AttributeError):
                     # Fall back to pandas
                     self.progress.emit("PyArrow not available, using pandas for Parquet...")
-                    return [pd.read_parquet(self.file_path)]
+                    return [pd.read_parquet(file_path_str)]
             else:
                 raise ValueError(f"Unsupported file format: {file_ext}")
             
@@ -2682,20 +3111,24 @@ class ImportFileWorker(QObject):
                     
                     # Add any missing columns
                     self.add_missing_columns(conn, first_chunk, existing_columns)
+                    
+                    # Get updated list of columns after adding new ones
+                    existing_columns = self.get_existing_columns(conn)
+                    
+                    # Insert data with column matching
+                    self.insert_data_with_column_matching(conn, first_chunk, existing_columns)
                 else:
                     # Create the table if it doesn't exist
                     self.create_table_if_not_exists(conn, first_chunk)
-                
-                # Insert the first chunk
-                self.progress.emit(f"Importing data into table \"{self.table_name}\"...")
-                
-                if self.is_duckdb:
-                    # For DuckDB, we can use the append method
-                    conn.register('df', first_chunk)
-                    conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
-                else:
-                    # For SQLite, we need to use the pandas to_sql method
-                    first_chunk.to_sql(self.table_name, conn, if_exists='append', index=False)
+                    
+                    # For a new table, we can insert directly
+                    if self.is_duckdb:
+                        # For DuckDB, we can use the append method
+                        conn.register('df', first_chunk)
+                        conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
+                    else:
+                        # For SQLite, we need to use the pandas to_sql method
+                        first_chunk.to_sql(self.table_name, conn, if_exists='append', index=False)
                 
                 # Process remaining chunks if any
                 rows_imported = len(first_chunk)
@@ -2715,12 +3148,11 @@ class ImportFileWorker(QObject):
                         existing_columns = self.get_existing_columns(conn)
                         self.add_missing_columns(conn, chunk, existing_columns)
                         
-                        # Insert the chunk
-                        if self.is_duckdb:
-                            conn.register('df', chunk)
-                            conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
-                        else:
-                            chunk.to_sql(self.table_name, conn, if_exists='append', index=False)
+                        # Get updated columns after potentially adding new ones
+                        existing_columns = self.get_existing_columns(conn)
+                        
+                        # Insert data with column matching
+                        self.insert_data_with_column_matching(conn, chunk, existing_columns)
                         
                         # Update progress
                         rows_imported += len(chunk)
@@ -2742,12 +3174,11 @@ class ImportFileWorker(QObject):
                         existing_columns = self.get_existing_columns(conn)
                         self.add_missing_columns(conn, chunk, existing_columns)
                         
-                        # Insert the chunk
-                        if self.is_duckdb:
-                            conn.register('df', chunk)
-                            conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
-                        else:
-                            chunk.to_sql(self.table_name, conn, if_exists='append', index=False)
+                        # Get updated columns after potentially adding new ones
+                        existing_columns = self.get_existing_columns(conn)
+                        
+                        # Insert data with column matching
+                        self.insert_data_with_column_matching(conn, chunk, existing_columns)
                         
                         # Update progress
                         rows_imported += len(chunk)
