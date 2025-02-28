@@ -268,6 +268,26 @@ class QueryWorker(QThread):
                 # Enable SQLite extension functions for compatibility
                 conn.execute("PRAGMA sqlite_extension_functions.enable=TRUE")
                 
+                # First, check if we're dealing with a simple SELECT * FROM query
+                simple_query_match = re.match(r'^\s*SELECT\s+\*\s+FROM\s+(?:"([^"]+)"|([^\s;]+))\s*$', q, re.IGNORECASE)
+                if simple_query_match:
+                    # Extract the table name (either quoted or unquoted)
+                    table_name = simple_query_match.group(1) if simple_query_match.group(1) else simple_query_match.group(2)
+                    
+                    # Check if the table exists
+                    try:
+                        # Try to get table info to verify it exists
+                        tables = conn.execute("SHOW TABLES").fetchall()
+                        table_exists = any(table[0].lower() == table_name.lower() for table in tables)
+                        
+                        if table_exists:
+                            # If table exists, use a simplified query without quotes
+                            q = f"SELECT * FROM {table_name}"
+                            self.progressUpdate.emit(f"Table '{table_name}' found, using simplified query")
+                    except Exception:
+                        # If there's an error checking tables, continue with original query
+                        pass
+                
                 # Execute the query with error handling for type mismatches
                 try:
                     result = conn.execute(q).fetchdf()
