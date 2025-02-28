@@ -6,6 +6,7 @@ import os
 import tempfile
 import shutil
 from pathlib import Path
+import time
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QFileDialog, QTableView, QMessageBox, QLabel, QPlainTextEdit, QCompleter,
@@ -211,50 +212,25 @@ class QueryWorker(QThread):
 
     def run(self):
         try:
-            # Start the timer
-            self.start_timer()
+            start_time = time.time()
+            self.timer = QTimer()
+            self.timer.timeout.connect(self.update_elapsed_time)
+            self.timer.start(1000)  # Update every second
             
-            # Connect to the database
-            if self.db_path.lower().endswith('.duckdb'):
-                conn = duckdb.connect(self.db_path)
+            self.progressUpdate.emit("Executing query...")
+            
+            # Determine database type from file extension
+            is_duckdb = self.db_path.lower().endswith('.duckdb')
+            
+            # Process the query
+            q = self.query.strip()
+            
+            if is_duckdb:
+                # For DuckDB
+                import duckdb
+                conn = duckdb.connect(database=self.db_path, read_only=False)
                 
-                # Set options to handle type conversions more gracefully
-                conn.execute("SET sql_standard_conforming_strings=1")
-                conn.execute("SET enable_external_access=true")
-                conn.execute("SET enable_object_cache=true")
-                
-                # Process the query
-                q = self.query.strip()
-                
-                # Special case for "Loan Data" table which seems to cause issues
-                if "FROM Loan Data" in q:
-                    q = q.replace("FROM Loan Data", "FROM 'Loan Data'")
-                
-                # Check if the query is already properly formatted with quotes
-                # This regex checks if there's a properly quoted table name after FROM
-                already_quoted = re.search(r'(?i)from\s+\'[^\']+\'', q) is not None
-                
-                if already_quoted:
-                    # Query is already properly formatted, no need to modify
-                    pass
-                else:
-                    # Improved regex to better handle quoted table names and LIMIT clauses
-                    m = re.search(r'(?i)^select\s+(.*?)\s+from\s+(\'[^\']+\'|[^\s;]+(?:\s+[^\s;]+)*)((?:\s+where|\s+group by|\s+order by|\s+limit|\s*;).*?)?$', q, flags=re.DOTALL)
-                    
-                    if m:
-                        # Extract parts of the query
-                        select_part = m.group(1).strip()
-                        from_part = m.group(2).strip()
-                        where_part = m.group(3) if m.group(3) else ""
-                        
-                        # Add quotes around the table name if not already quoted
-                        if not (from_part.startswith("'") and from_part.endswith("'")):
-                            from_part = f"'{from_part}'"
-                            
-                        # Reconstruct the query
-                        q = f"SELECT {select_part} FROM {from_part}{where_part}"
-                
-                # Add a PRAGMA to handle type conversions more gracefully
+                # Enable SQLite extension functions for compatibility
                 conn.execute("PRAGMA sqlite_extension_functions.enable=TRUE")
                 
                 # Execute the query with error handling for type mismatches
@@ -272,7 +248,7 @@ class QueryWorker(QThread):
                             if table_match:
                                 table_name = table_match.group(1)
                                 # Get column info
-                                columns_info = conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+                                columns_info = conn.execute(f"PRAGMA table_info(\"{table_name}\")").fetchall()
                                 # Construct a new query with explicit casts
                                 select_parts = []
                                 for col_info in columns_info:
@@ -290,60 +266,35 @@ class QueryWorker(QThread):
                                 q = q.replace("SELECT *", f"SELECT {select_clause}")
                         
                         # Try executing with the modified query
-                        result = conn.execute(q).fetchdf()
+                        try:
+                            result = conn.execute(q).fetchdf()
+                        except Exception as e:
+                            self.errorOccurred.emit(f"Error executing query with type conversion: {str(e)}")
+                            self.cleanup_timer()
+                            return
                     else:
-                        # If it's not a type mismatch error, re-raise
-                        raise
+                        self.errorOccurred.emit(f"Error executing query: {str(e)}")
+                        self.cleanup_timer()
+                        return
             else:
+                # For SQLite
                 import sqlite3
                 conn = sqlite3.connect(self.db_path)
                 
-                # Process the query
-                q = self.query.strip()
-                
-                # Special case for "Loan Data" table which seems to cause issues
-                if "FROM Loan Data" in q:
-                    q = q.replace("FROM Loan Data", "FROM 'Loan Data'")
-                
-                # Check if the query is already properly formatted with quotes
-                # This regex checks if there's a properly quoted table name after FROM
-                already_quoted = re.search(r'(?i)from\s+\'[^\']+\'', q) is not None
-                
-                if already_quoted:
-                    # Query is already properly formatted, no need to modify
-                    pass
-                else:
-                    # Improved regex to better handle quoted table names and LIMIT clauses
-                    m = re.search(r'(?i)^select\s+(.*?)\s+from\s+(\'[^\']+\'|[^\s;]+(?:\s+[^\s;]+)*)((?:\s+where|\s+group by|\s+order by|\s+limit|\s*;).*?)?$', q, flags=re.DOTALL)
-                    
-                    if m:
-                        # Extract parts of the query
-                        select_part = m.group(1).strip()
-                        from_part = m.group(2).strip()
-                        where_part = m.group(3) if m.group(3) else ""
-                        
-                        # Add quotes around the table name if not already quoted
-                        if not (from_part.startswith("'") and from_part.endswith("'")):
-                            from_part = f"'{from_part}'"
-                            
-                        # Reconstruct the query
-                        q = f"SELECT {select_part} FROM {from_part}{where_part}"
+                # Enable pandas integration
+                conn.row_factory = sqlite3.Row
                 
                 # Execute the query with error handling for type mismatches
                 try:
                     cursor = conn.cursor()
                     cursor.execute(q)
                     
-                    # Get column names
+                    # Convert to DataFrame
                     columns = [description[0] for description in cursor.description]
+                    result = pd.DataFrame(cursor.fetchall(), columns=columns)
                     
-                    # Fetch all rows
-                    rows = cursor.fetchall()
-                    
-                    # Create DataFrame
-                    result = pd.DataFrame(rows, columns=columns)
-                except sqlite3.OperationalError as e:
-                    if "datatype mismatch" in str(e).lower():
+                except Exception as e:
+                    if "no such column" in str(e).lower() or "ambiguous column name" in str(e).lower():
                         # Try again with explicit type conversion
                         self.progressUpdate.emit("Detected type mismatch, attempting with type conversion...")
                         
@@ -355,7 +306,7 @@ class QueryWorker(QThread):
                                 table_name = table_match.group(1)
                                 # Get column info
                                 cursor = conn.cursor()
-                                cursor.execute(f"PRAGMA table_info('{table_name}')")
+                                cursor.execute(f"PRAGMA table_info(\"{table_name}\")")
                                 columns_info = cursor.fetchall()
                                 
                                 # Construct a new query with explicit casts
@@ -375,33 +326,51 @@ class QueryWorker(QThread):
                                 q = q.replace("SELECT *", f"SELECT {select_clause}")
                         
                         # Try executing with the modified query
-                        cursor = conn.cursor()
-                        cursor.execute(q)
-                        
-                        # Get column names
-                        columns = [description[0] for description in cursor.description]
-                        
-                        # Fetch all rows
-                        rows = cursor.fetchall()
-                        
-                        # Create DataFrame
-                        result = pd.DataFrame(rows, columns=columns)
+                        try:
+                            cursor = conn.cursor()
+                            cursor.execute(q)
+                            
+                            # Convert to DataFrame
+                            columns = [description[0] for description in cursor.description]
+                            result = pd.DataFrame(cursor.fetchall(), columns=columns)
+                        except Exception as e:
+                            self.errorOccurred.emit(f"Error executing query with type conversion: {str(e)}")
+                            self.cleanup_timer()
+                            return
                     else:
-                        # If it's not a type mismatch error, re-raise
-                        raise
+                        self.errorOccurred.emit(f"Error executing query: {str(e)}")
+                        self.cleanup_timer()
+                        return
             
             # Process the result
-            self.resultReady.emit(self.process_chunk(result))
+            if result is not None and not result.empty:
+                # Process the result in chunks if it's large
+                if len(result) > 10000:
+                    self.progressUpdate.emit(f"Processing large result set ({len(result)} rows)...")
+                    # Process in chunks of 10,000 rows
+                    for i in range(0, len(result), 10000):
+                        chunk = result.iloc[i:i+10000]
+                        self.process_chunk(chunk)
+                else:
+                    self.resultReady.emit(result)
+            else:
+                self.progressUpdate.emit("Query executed successfully, but returned no results.")
+                # Emit an empty DataFrame so the UI can update
+                self.resultReady.emit(pd.DataFrame())
             
-            # Clean up the timer
+            # Close the connection
+            conn.close()
+            
+            # Calculate execution time
+            execution_time = time.time() - start_time
+            self.progressUpdate.emit(f"Query executed in {execution_time:.2f} seconds.")
+            
+            # Clean up timer
             self.cleanup_timer()
             
         except Exception as e:
-            # Clean up the timer
-            self.cleanup_timer()
-            
-            # Emit the error
             self.errorOccurred.emit(str(e))
+            self.cleanup_timer()
 
 class ExportWorker(QObject):
     finished = pyqtSignal(str)  # Signal to emit when export is complete
@@ -576,12 +545,12 @@ class MergeFilesWorker(QObject):
         """Get existing columns from the table"""
         try:
             if self.is_duckdb:
-                result = conn.execute(f"PRAGMA table_info('{self.table_name}')").fetchall()
+                result = conn.execute(f"PRAGMA table_info(\"{self.table_name}\")").fetchall()
                 return [row[1] for row in result]  # Column name is at index 1
             else:
                 import sqlite3
                 cursor = conn.cursor()
-                result = cursor.execute(f"PRAGMA table_info('{self.table_name}')").fetchall()
+                result = cursor.execute(f"PRAGMA table_info(\"{self.table_name}\")").fetchall()
                 return [row[1] for row in result]  # Column name is at index 1
         except Exception as e:
             self.progress.emit(f"Error getting existing columns: {str(e)}")
@@ -592,7 +561,7 @@ class MergeFilesWorker(QObject):
         new_columns = []
         column_types = self.analyze_column_types(sample_df)
         
-        # Create a mapping of lowercase column names to actual column names to check for case-insensitive duplicates
+        # Create a mapping of lowercase co
         existing_columns_lower = {col.lower(): col for col in existing_columns}
         
         for col in sample_df.columns:
@@ -609,15 +578,15 @@ class MergeFilesWorker(QObject):
             for col_name, col_type in new_columns:
                 try:
                     if self.is_duckdb:
-                        conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col_name}" {col_type}')
+                        conn.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN \"{col_name}\" {col_type}")
                     else:
                         cursor = conn.cursor()
-                        cursor.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col_name}" {col_type}')
+                        cursor.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN \"{col_name}\" {col_type}")
                         conn.commit()
                 except Exception as e:
                     # If column already exists with a different case, skip it
                     if "duplicate column name" in str(e).lower():
-                        self.progress.emit(f"Column '{col_name}' already exists with a different case, skipping...")
+                        self.progress.emit(f"Column \"{col_name}\" already exists with a different case, skipping...")
                         continue
                     else:
                         raise e
@@ -632,7 +601,7 @@ class MergeFilesWorker(QObject):
         
         # Build CREATE TABLE statement
         columns_sql = ', '.join([f'"{col}" {dtype}' for col, dtype in column_types.items()])
-        create_table_sql = f'CREATE TABLE IF NOT EXISTS "{self.table_name}" ({columns_sql})'
+        create_table_sql = f"CREATE TABLE IF NOT EXISTS \"{self.table_name}\" ({columns_sql})"
         
         # Execute the statement
         if self.is_duckdb:
@@ -701,7 +670,7 @@ class MergeFilesWorker(QObject):
         """Insert data into the database"""
         if self.is_duckdb:
             # For DuckDB, we can use the append method
-            conn.execute(f"INSERT INTO {self.table_name} SELECT * FROM df")
+            conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
         else:
             # For SQLite, we need to use the pandas to_sql method
             df.to_sql(self.table_name, conn, if_exists='append', index=False)
@@ -773,10 +742,9 @@ class MergeFilesWorker(QObject):
                         chunk_count += 1
                         rows_processed += len(chunk)
                         
-                        # Before inserting, check if we need to add any new columns
-                        if i > 1 or chunk_count > 1:  # Skip first chunk of first file as we already processed it
-                            existing_columns = self.get_existing_columns(conn)
-                            self.add_missing_columns(conn, chunk, existing_columns)
+                        # Always check for and add any new columns for each chunk
+                        existing_columns = self.get_existing_columns(conn)
+                        self.add_missing_columns(conn, chunk, existing_columns)
                         
                         # Insert the chunk into the database
                         if self.is_duckdb:
@@ -2281,15 +2249,15 @@ class ImportFileWorker(QObject):
             for col_name, col_type in new_columns:
                 try:
                     if self.is_duckdb:
-                        conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col_name}" {col_type}')
+                        conn.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN \"{col_name}\" {col_type}")
                     else:
                         cursor = conn.cursor()
-                        cursor.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col_name}" {col_type}')
+                        cursor.execute(f"ALTER TABLE \"{self.table_name}\" ADD COLUMN \"{col_name}\" {col_type}")
                         conn.commit()
                 except Exception as e:
                     # If column already exists with a different case, skip it
                     if "duplicate column name" in str(e).lower():
-                        self.progress.emit(f"Column '{col_name}' already exists with a different case, skipping...")
+                        self.progress.emit(f"Column \"{col_name}\" already exists with a different case, skipping...")
                         continue
                     else:
                         raise e
@@ -2304,7 +2272,7 @@ class ImportFileWorker(QObject):
         
         # Build CREATE TABLE statement
         columns_sql = ', '.join([f'"{col}" {dtype}' for col, dtype in column_types.items()])
-        create_table_sql = f'CREATE TABLE IF NOT EXISTS "{self.table_name}" ({columns_sql})'
+        create_table_sql = f"CREATE TABLE IF NOT EXISTS \"{self.table_name}\" ({columns_sql})"
         
         # Execute the statement
         if self.is_duckdb:
@@ -2526,7 +2494,7 @@ class ImportFileWorker(QObject):
                     self.create_table_if_not_exists(conn, first_chunk)
                 
                 # Insert the first chunk
-                self.progress.emit(f"Importing data into table '{self.table_name}'...")
+                self.progress.emit(f"Importing data into table \"{self.table_name}\"...")
                 
                 if self.is_duckdb:
                     # For DuckDB, we can use the append method
@@ -2550,6 +2518,10 @@ class ImportFileWorker(QObject):
                         # Clean column names
                         chunk.columns = self.clean_column_names(chunk.columns)
                         
+                        # Check for and add any new columns that might be in this chunk
+                        existing_columns = self.get_existing_columns(conn)
+                        self.add_missing_columns(conn, chunk, existing_columns)
+                        
                         # Insert the chunk
                         if self.is_duckdb:
                             conn.register('df', chunk)
@@ -2572,6 +2544,10 @@ class ImportFileWorker(QObject):
                         
                         # Clean column names
                         chunk.columns = self.clean_column_names(chunk.columns)
+                        
+                        # Check for and add any new columns that might be in this chunk
+                        existing_columns = self.get_existing_columns(conn)
+                        self.add_missing_columns(conn, chunk, existing_columns)
                         
                         # Insert the chunk
                         if self.is_duckdb:
