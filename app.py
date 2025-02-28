@@ -263,135 +263,52 @@ class QueryWorker(QThread):
             if is_duckdb:
                 # For DuckDB
                 import duckdb
-                conn = duckdb.connect(database=self.db_path, read_only=False)
                 
-                # Enable SQLite extension functions for compatibility
-                conn.execute("PRAGMA sqlite_extension_functions.enable=TRUE")
-                
-                # First, check if we're dealing with a simple SELECT * FROM query
+                # DIRECT FIX: Use a completely different approach for simple SELECT queries
+                # This bypasses DuckDB's SQL parser entirely for simple queries
                 simple_query_match = re.match(r'^\s*SELECT\s+\*\s+FROM\s+(?:"([^"]+)"|([^\s;]+))\s*$', q, re.IGNORECASE)
                 if simple_query_match:
                     # Extract the table name (either quoted or unquoted)
                     table_name = simple_query_match.group(1) if simple_query_match.group(1) else simple_query_match.group(2)
                     
-                    # Check if the table exists
                     try:
-                        # Try to get table info to verify it exists
+                        # Use a direct approach that doesn't rely on SQL parsing
+                        self.progressUpdate.emit(f"Using direct table access for '{table_name}'...")
+                        
+                        # Connect to the database
+                        conn = duckdb.connect(database=self.db_path, read_only=False)
+                        
+                        # First check if the table exists
                         tables = conn.execute("SHOW TABLES").fetchall()
-                        table_exists = any(table[0].lower() == table_name.lower() for table in tables)
+                        table_exists = False
+                        actual_table_name = ""
+                        
+                        # Case-insensitive table name matching
+                        for t in tables:
+                            if t[0].lower() == table_name.lower():
+                                table_exists = True
+                                actual_table_name = t[0]  # Use the actual case of the table name
+                                break
                         
                         if table_exists:
-                            # If table exists, use a simplified query without quotes
-                            q = f"SELECT * FROM {table_name}"
-                            self.progressUpdate.emit(f"Table '{table_name}' found, using simplified query")
-                    except Exception:
-                        # If there's an error checking tables, continue with original query
-                        pass
-                
-                # Execute the query with error handling for type mismatches
-                try:
-                    result = conn.execute(q).fetchdf()
-                except Exception as e:
-                    error_msg = str(e)
-                    if "Parser Error: syntax error at or near" in error_msg:
-                        # Try to fix common syntax errors
-                        self.progressUpdate.emit("Detected syntax error, attempting to fix...")
-                        
-                        # Try different approaches to fix the query
-                        fixed = False
-                        
-                        # Approach 1: Try removing quotes around table name
-                        if '"' in q and not fixed:
-                            try:
-                                # Try executing with modified query - remove quotes around table names
-                                table_match = re.search(r'FROM\s+"([^"]+)"', q, re.IGNORECASE)
-                                if table_match:
-                                    table_name = table_match.group(1)
-                                    fixed_q = q.replace(f'FROM "{table_name}"', f'FROM {table_name}')
-                                    result = conn.execute(fixed_q).fetchdf()
-                                    fixed = True
-                                    self.progressUpdate.emit("Fixed query by removing quotes around table name")
-                            except Exception:
-                                pass
-                        
-                        # Approach 2: Try simplifying to a basic query
-                        if not fixed:
-                            try:
-                                # Try to identify table name and simplify query
-                                table_match = re.search(r'FROM\s+(?:"([^"]+)"|([^\s;]+))', q, re.IGNORECASE)
-                                if table_match:
-                                    table_name = table_match.group(1) if table_match.group(1) else table_match.group(2)
-                                    fixed_q = f'SELECT * FROM {table_name}'
-                                    result = conn.execute(fixed_q).fetchdf()
-                                    fixed = True
-                                    self.progressUpdate.emit("Fixed query by simplifying to basic SELECT")
-                            except Exception:
-                                pass
-                        
-                        # Approach 3: Try with backticks instead of double quotes
-                        if not fixed:
-                            try:
-                                fixed_q = q.replace('"', '`')
-                                result = conn.execute(fixed_q).fetchdf()
-                                fixed = True
-                                self.progressUpdate.emit("Fixed query by using backticks instead of double quotes")
-                            except Exception:
-                                pass
-                        
-                        # Approach 4: Try with single quotes
-                        if not fixed:
-                            try:
-                                fixed_q = q.replace('"', "'")
-                                result = conn.execute(fixed_q).fetchdf()
-                                fixed = True
-                                self.progressUpdate.emit("Fixed query by using single quotes")
-                            except Exception:
-                                pass
-                        
-                        # If all approaches failed, report the original error
-                        if not fixed:
-                            self.errorOccurred.emit(f"Error executing query: {error_msg}")
-                            self.cleanup_timer()
-                            return
-                    elif "Mismatch Type Error" in error_msg:
-                        # Try again with explicit type conversion
-                        self.progressUpdate.emit("Detected type mismatch, attempting with type conversion...")
-                        
-                        # Add a TRY_CAST to handle type conversions
-                        if "SELECT *" in q:
-                            # For SELECT *, we need to get column names first
-                            table_match = re.search(r'FROM\s+[\'"]([^\'"]+)[\'"]', q)
-                            if table_match:
-                                table_name = table_match.group(1)
-                                # Get column info
-                                columns_info = conn.execute(f"PRAGMA table_info(\"{table_name}\")").fetchall()
-                                # Construct a new query with explicit casts
-                                select_parts = []
-                                for col_info in columns_info:
-                                    col_name = col_info[1]  # Column name is at index 1
-                                    col_type = col_info[2]  # Column type is at index 2
-                                    if col_type == 'INTEGER':
-                                        select_parts.append(f'CAST("{col_name}" AS INTEGER) AS "{col_name}"')
-                                    elif col_type == 'DOUBLE':
-                                        select_parts.append(f'CAST("{col_name}" AS DOUBLE) AS "{col_name}"')
-                                    else:
-                                        select_parts.append(f'"{col_name}"')
-                                
-                                # Reconstruct the query with casts
-                                select_clause = ", ".join(select_parts)
-                                q = q.replace("SELECT *", f"SELECT {select_clause}")
-                        
-                        # Try executing with the modified query
-                        try:
+                            # Use the actual table name with the correct case
+                            result = conn.execute(f"SELECT * FROM {actual_table_name}").fetchdf()
+                        else:
+                            # If table doesn't exist, try the original query as a fallback
+                            conn = duckdb.connect(database=self.db_path, read_only=False)
+                            conn.execute("PRAGMA sqlite_extension_functions.enable=TRUE")
                             result = conn.execute(q).fetchdf()
-                        except Exception as e:
-                            self.errorOccurred.emit(f"Error executing query with type conversion: {str(e)}")
-                            self.cleanup_timer()
-                            return
-                    else:
-                        self.errorOccurred.emit(f"Error executing query: {str(e)}")
-                        self.cleanup_timer()
-                        return
+                    except Exception as e:
+                        # If direct approach fails, fall back to normal execution
+                        self.progressUpdate.emit("Direct approach failed, trying standard query execution...")
+                        conn = duckdb.connect(database=self.db_path, read_only=False)
+                        conn.execute("PRAGMA sqlite_extension_functions.enable=TRUE")
+                        result = conn.execute(q).fetchdf()
+                else:
+                    # For complex queries, use the standard approach
+                    conn = duckdb.connect(database=self.db_path, read_only=False)
+                    conn.execute("PRAGMA sqlite_extension_functions.enable=TRUE")
+                    result = conn.execute(q).fetchdf()
             else:
                 # For SQLite
                 import sqlite3
@@ -1351,20 +1268,38 @@ class QueryTab(QWidget):
         if not query:
             QMessageBox.warning(self, "Error", "Please enter a query.")
             return
-            
-        # Special handling for problematic queries
-        if query.lower() == 'select * from "merged";' or query.lower() == 'select * from "merged"':
-            # Try a simplified version without quotes
-            query = "SELECT * FROM merged"
-            tab.status_label.setText("Using simplified query format...")
-        else:
-            # General handling for simple SELECT * FROM "table" queries
+        
+        # DIRECT FIX: For DuckDB databases, handle simple SELECT queries differently
+        if self.current_db_path.lower().endswith('.duckdb'):
+            # Check if this is a simple SELECT * FROM query with a quoted table name
             simple_query_match = re.match(r'^\s*SELECT\s+\*\s+FROM\s+"([^"]+)"\s*;?\s*$', query, re.IGNORECASE)
             if simple_query_match:
                 table_name = simple_query_match.group(1)
-                # For simple queries, use the table name without quotes
-                query = f"SELECT * FROM {table_name}"
-                tab.status_label.setText("Using simplified query format...")
+                
+                try:
+                    # Try to directly access the table to verify it exists
+                    import duckdb
+                    conn = duckdb.connect(database=self.current_db_path, read_only=False)
+                    tables = conn.execute("SHOW TABLES").fetchall()
+                    
+                    # Case-insensitive table name matching
+                    for t in tables:
+                        if t[0].lower() == table_name.lower():
+                            # Use the actual table name with the correct case
+                            query = f"SELECT * FROM {t[0]}"
+                            tab.status_label.setText(f"Using direct table access for '{t[0]}'")
+                            break
+                    
+                    conn.close()
+                except Exception:
+                    # If there's an error, fall back to the simplified query
+                    query = f"SELECT * FROM {table_name}"
+                    tab.status_label.setText("Using simplified query format...")
+            
+            # Special case for the problematic "merged" table
+            elif query.lower() == 'select * from "merged";' or query.lower() == 'select * from "merged"':
+                query = "SELECT * FROM merged"
+                tab.status_label.setText("Using simplified query format for 'merged' table...")
 
         tab.status_label.setText("Executing query...")
         
@@ -1383,6 +1318,41 @@ class QueryTab(QWidget):
 
     def handle_query_error(self, tab, error):
         tab.status_label.setText("Error executing query")
+        
+        # Check if this is the specific parser error we're trying to fix
+        if "Parser error" in str(error) and "syntax error at or near" in str(error):
+            # Get the original query
+            query = tab.query_edit.toPlainText().strip()
+            
+            # Try to extract the table name
+            table_match = re.search(r'FROM\s+"([^"]+)"', query, re.IGNORECASE)
+            if table_match:
+                table_name = table_match.group(1)
+                
+                # Create a simplified query without quotes
+                simplified_query = f"SELECT * FROM {table_name}"
+                
+                # Show a message to the user
+                reply = QMessageBox.question(
+                    self, 
+                    "Query Error - Automatic Fix Available",
+                    f"The query failed with a parser error. This is likely due to how table names are quoted.\n\n"
+                    f"Would you like to try this simplified version instead?\n\n"
+                    f"{simplified_query}\n\n"
+                    f"Click Yes to run the simplified query, or No to keep the current query.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    # Update the query editor with the simplified query
+                    tab.query_edit.setPlainText(simplified_query)
+                    
+                    # Run the simplified query
+                    self.run_query(tab)
+                    return
+        
+        # If we couldn't fix it automatically or it's a different error, show the error message
         QMessageBox.critical(self, "Error", f"Failed to execute query: {str(error)}")
 
     def add_query_tab(self):
