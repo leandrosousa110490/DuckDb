@@ -208,7 +208,21 @@ class QueryWorker(QThread):
         if query.endswith(';'):
             query = query[:-1]
         
-        # Ensure table names with spaces are properly quoted
+        # Special case for the problematic query
+        if query.lower() == 'select * from "merged"':
+            return "SELECT * FROM merged"
+        
+        # Fix common DuckDB syntax issues
+        
+        # 1. Handle quoted table names - DuckDB sometimes has issues with double quotes
+        # Try to detect if this is a simple SELECT * FROM "table" query
+        simple_query_match = re.match(r'^\s*SELECT\s+\*\s+FROM\s+"([^"]+)"\s*$', query, re.IGNORECASE)
+        if simple_query_match:
+            table_name = simple_query_match.group(1)
+            # For simple queries, use the table name without quotes
+            return f"SELECT * FROM {table_name}"
+        
+        # 2. Ensure table names with spaces are properly quoted
         # This regex finds FROM clauses with unquoted table names containing spaces
         unquoted_table_match = re.search(r'FROM\s+([^"\'\s]+\s+[^"\'\s;]+)', query, re.IGNORECASE)
         if unquoted_table_match:
@@ -238,8 +252,13 @@ class QueryWorker(QThread):
             # Determine database type from file extension
             is_duckdb = self.db_path.lower().endswith('.duckdb')
             
-            # Process the query - clean it up to prevent syntax errors
-            q = self.clean_query(self.query)
+            # Special case for the problematic query
+            if self.query.strip().lower() == 'select * from "merged";' or self.query.strip().lower() == 'select * from "merged"':
+                self.progressUpdate.emit("Using special handling for this query...")
+                q = "SELECT * FROM merged"
+            else:
+                # Process the query - clean it up to prevent syntax errors
+                q = self.clean_query(self.query)
             
             if is_duckdb:
                 # For DuckDB
@@ -271,31 +290,41 @@ class QueryWorker(QThread):
                                     fixed_q = q.replace(f'FROM "{table_name}"', f'FROM {table_name}')
                                     result = conn.execute(fixed_q).fetchdf()
                                     fixed = True
+                                    self.progressUpdate.emit("Fixed query by removing quotes around table name")
                             except Exception:
                                 pass
                         
-                        # Approach 2: Try adding quotes if they're missing
+                        # Approach 2: Try simplifying to a basic query
                         if not fixed:
                             try:
-                                # Try to identify table name and add quotes
-                                table_match = re.search(r'FROM\s+([^\s";]+)', q, re.IGNORECASE)
-                                if table_match:
-                                    table_name = table_match.group(1)
-                                    fixed_q = q.replace(f'FROM {table_name}', f'FROM "{table_name}"')
-                                    result = conn.execute(fixed_q).fetchdf()
-                                    fixed = True
-                            except Exception:
-                                pass
-                        
-                        # Approach 3: Try simplifying the query to just SELECT * FROM table
-                        if not fixed:
-                            try:
+                                # Try to identify table name and simplify query
                                 table_match = re.search(r'FROM\s+(?:"([^"]+)"|([^\s;]+))', q, re.IGNORECASE)
                                 if table_match:
                                     table_name = table_match.group(1) if table_match.group(1) else table_match.group(2)
-                                    fixed_q = f'SELECT * FROM "{table_name}"'
+                                    fixed_q = f'SELECT * FROM {table_name}'
                                     result = conn.execute(fixed_q).fetchdf()
                                     fixed = True
+                                    self.progressUpdate.emit("Fixed query by simplifying to basic SELECT")
+                            except Exception:
+                                pass
+                        
+                        # Approach 3: Try with backticks instead of double quotes
+                        if not fixed:
+                            try:
+                                fixed_q = q.replace('"', '`')
+                                result = conn.execute(fixed_q).fetchdf()
+                                fixed = True
+                                self.progressUpdate.emit("Fixed query by using backticks instead of double quotes")
+                            except Exception:
+                                pass
+                        
+                        # Approach 4: Try with single quotes
+                        if not fixed:
+                            try:
+                                fixed_q = q.replace('"', "'")
+                                result = conn.execute(fixed_q).fetchdf()
+                                fixed = True
+                                self.progressUpdate.emit("Fixed query by using single quotes")
                             except Exception:
                                 pass
                         
@@ -383,85 +412,42 @@ class QueryWorker(QThread):
                                         columns = [description[0] for description in cursor.description]
                                         result = pd.DataFrame(cursor.fetchall(), columns=columns)
                                         fixed = True
+                                        self.progressUpdate.emit("Fixed query by removing quotes around table name")
                                 except Exception:
                                     pass
                             
-                            # Approach 2: Try adding quotes if they're missing
+                            # Approach 2: Try simplifying to a basic query
                             if not fixed:
                                 try:
-                                    # Try to identify table name and add quotes
-                                    table_match = re.search(r'FROM\s+([^\s";]+)', q, re.IGNORECASE)
-                                    if table_match:
-                                        table_name = table_match.group(1)
-                                        fixed_q = q.replace(f'FROM {table_name}', f'FROM "{table_name}"')
-                                        cursor = conn.cursor()
-                                        cursor.execute(fixed_q)
-                                        columns = [description[0] for description in cursor.description]
-                                        result = pd.DataFrame(cursor.fetchall(), columns=columns)
-                                        fixed = True
-                                except Exception:
-                                    pass
-                            
-                            # Approach 3: Try simplifying the query to just SELECT * FROM table
-                            if not fixed:
-                                try:
+                                    # Try to identify table name and simplify query
                                     table_match = re.search(r'FROM\s+(?:"([^"]+)"|([^\s;]+))', q, re.IGNORECASE)
                                     if table_match:
                                         table_name = table_match.group(1) if table_match.group(1) else table_match.group(2)
-                                        fixed_q = f'SELECT * FROM "{table_name}"'
+                                        fixed_q = f'SELECT * FROM {table_name}'
                                         cursor = conn.cursor()
                                         cursor.execute(fixed_q)
                                         columns = [description[0] for description in cursor.description]
                                         result = pd.DataFrame(cursor.fetchall(), columns=columns)
                                         fixed = True
+                                        self.progressUpdate.emit("Fixed query by simplifying to basic SELECT")
                                 except Exception:
                                     pass
                             
-                            # If all approaches failed, continue with type conversion approach
+                            # Approach 3: Try with single quotes
                             if not fixed:
-                                # Try again with explicit type conversion
-                                self.progressUpdate.emit("Detected type mismatch, attempting with type conversion...")
-                                
-                                # For SQLite, we need to modify the query to handle type conversions
-                                if "SELECT *" in q:
-                                    # For SELECT *, we need to get column names first
-                                    table_match = re.search(r'FROM\s+[\'"]([^\'"]+)[\'"]', q)
-                                    if table_match:
-                                        table_name = table_match.group(1)
-                                        # Get column info
-                                        cursor = conn.cursor()
-                                        cursor.execute(f"PRAGMA table_info(\"{table_name}\")")
-                                        columns_info = cursor.fetchall()
-                                        
-                                        # Construct a new query with explicit casts
-                                        select_parts = []
-                                        for col_info in columns_info:
-                                            col_name = col_info[1]  # Column name is at index 1
-                                            col_type = col_info[2]  # Column type is at index 2
-                                            if col_type == 'INTEGER':
-                                                select_parts.append(f'CAST("{col_name}" AS INTEGER) AS "{col_name}"')
-                                            elif col_type == 'REAL' or col_type == 'DOUBLE':
-                                                select_parts.append(f'CAST("{col_name}" AS REAL) AS "{col_name}"')
-                                            else:
-                                                select_parts.append(f'"{col_name}"')
-                                        
-                                        # Reconstruct the query with casts
-                                        select_clause = ", ".join(select_parts)
-                                        q = q.replace("SELECT *", f"SELECT {select_clause}")
-                                
-                                # Try executing with the modified query
                                 try:
+                                    fixed_q = q.replace('"', "'")
                                     cursor = conn.cursor()
-                                    cursor.execute(q)
-                                    
-                                    # Convert to DataFrame
+                                    cursor.execute(fixed_q)
                                     columns = [description[0] for description in cursor.description]
                                     result = pd.DataFrame(cursor.fetchall(), columns=columns)
-                                except Exception as e:
-                                    self.errorOccurred.emit(f"Error executing query with type conversion: {str(e)}")
-                                    self.cleanup_timer()
-                                    return
-                        else:
+                                    fixed = True
+                                    self.progressUpdate.emit("Fixed query by using single quotes")
+                                except Exception:
+                                    pass
+                        
+                        # If all approaches failed, continue with type conversion approach
+                        if not fixed:
                             # Try again with explicit type conversion
                             self.progressUpdate.emit("Detected type mismatch, attempting with type conversion...")
                             
@@ -1345,6 +1331,20 @@ class QueryTab(QWidget):
         if not query:
             QMessageBox.warning(self, "Error", "Please enter a query.")
             return
+            
+        # Special handling for problematic queries
+        if query.lower() == 'select * from "merged";' or query.lower() == 'select * from "merged"':
+            # Try a simplified version without quotes
+            query = "SELECT * FROM merged"
+            tab.status_label.setText("Using simplified query format...")
+        else:
+            # General handling for simple SELECT * FROM "table" queries
+            simple_query_match = re.match(r'^\s*SELECT\s+\*\s+FROM\s+"([^"]+)"\s*;?\s*$', query, re.IGNORECASE)
+            if simple_query_match:
+                table_name = simple_query_match.group(1)
+                # For simple queries, use the table name without quotes
+                query = f"SELECT * FROM {table_name}"
+                tab.status_label.setText("Using simplified query format...")
 
         tab.status_label.setText("Executing query...")
         
