@@ -716,10 +716,236 @@ class MergeFilesWorker(QObject):
                         errors.append(f"Error with {quoted_col}: {str(e)}")
             
             if not added:
+                # Just log the error but don't stop processing
                 self.progress.emit(f"Could not add column {col_name}. Errors: {'; '.join(errors)}")
                 
         self.progress.emit(f"Added new columns to the table.")
+        
+    def insert_data(self, conn, df):
+        """Insert data into the database"""
+        try:
+            if df is None:
+                # This is the case when using DuckDB and the DataFrame is already registered
+                if self.is_duckdb:
+                    try:
+                        # Try with double quotes first
+                        conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
+                    except Exception as e:
+                        if "Parser Error" in str(e):
+                            # Try without quotes
+                            conn.execute(f"INSERT INTO {self.table_name} SELECT * FROM df")
+                return
+                
+            # Get existing columns to ensure proper column alignment
+            existing_columns = self.get_existing_columns(conn)
+            self.insert_data_with_column_matching(conn, df, existing_columns)
+        except Exception as e:
+            self.progress.emit(f"Error inserting data: {str(e)}. Will try to continue with next chunk.")
+            # Don't re-raise the exception so processing can continue
     
+    def insert_data_with_column_matching(self, conn, df, existing_columns):
+        """Insert data with column matching to handle different column sets"""
+        try:
+            self.progress.emit(f"Aligning columns with existing table structure...")
+            
+            # Create sets for easier comparison
+            df_columns = set(df.columns)
+            table_columns = set(existing_columns)
+            
+            # Find columns in DataFrame that aren't in the table
+            # (This shouldn't happen as we've already added missing columns, but just in case)
+            missing_in_table = df_columns - table_columns
+            if missing_in_table:
+                self.progress.emit(f"Found {len(missing_in_table)} columns in data that aren't in the table. Adding them...")
+                self.add_missing_columns(conn, df[list(missing_in_table)], existing_columns)
+                # Update existing columns
+                existing_columns = self.get_existing_columns(conn)
+                table_columns = set(existing_columns)
+            
+            # Find columns in the table that aren't in the DataFrame
+            missing_in_df = table_columns - df_columns
+            if missing_in_df:
+                self.progress.emit(f"Found {len(missing_in_df)} columns in table that aren't in the data. Will fill with NULL values.")
+                # Add missing columns to DataFrame with NULL values
+                for col in missing_in_df:
+                    df[col] = None
+            
+            # Ensure DataFrame columns are in the same order as the table
+            # Only include columns that exist in both the DataFrame and the table
+            common_columns = [col for col in existing_columns if col in df.columns]
+            if len(common_columns) < len(existing_columns):
+                self.progress.emit(f"Warning: Some columns in the table were not found in the data. Using only common columns.")
+            
+            ordered_df = df[common_columns]
+            
+            # Now insert the data
+            if self.is_duckdb:
+                # For DuckDB, register the aligned DataFrame
+                conn.register('aligned_df', ordered_df)
+                try:
+                    # Try with double quotes first
+                    conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM aligned_df")
+                except Exception as e:
+                    if "Parser Error" in str(e):
+                        # Try without quotes
+                        conn.execute(f"INSERT INTO {self.table_name} SELECT * FROM aligned_df")
+            else:
+                # For SQLite, use pandas to_sql
+                try:
+                    ordered_df.to_sql(self.table_name, conn, if_exists='append', index=False)
+                except Exception as e:
+                    # If there's an error, try to get the actual columns from the database
+                    # and filter the DataFrame to only include those columns
+                    self.progress.emit(f"Error inserting data: {str(e)}. Trying with exact column matching...")
+                    cursor = conn.cursor()
+                    cursor.execute(f"PRAGMA table_info('{self.table_name}')")
+                    db_columns = [row[1] for row in cursor.fetchall()]
+                    
+                    # Filter DataFrame to only include columns that match the database
+                    matching_columns = [col for col in db_columns if col in ordered_df.columns]
+                    if matching_columns:
+                        ordered_df[matching_columns].to_sql(self.table_name, conn, if_exists='append', index=False)
+                    else:
+                        raise Exception("No matching columns found between DataFrame and database table")
+            
+            self.progress.emit(f"Inserted {len(df)} rows with column alignment.")
+        except Exception as e:
+            self.progress.emit(f"Error in column matching: {str(e)}. Will try to continue with next chunk.")
+            # Don't re-raise the exception so processing can continue
+    
+    def run(self):
+        try:
+            files = self.get_file_list()
+            
+            if not files:
+                self.error.emit("No supported files found in the selected folder.")
+                self.finished.emit()
+                return
+                
+            self.progress.emit(f"Found {len(files)} files to process.")
+            
+            # Connect to the database
+            if self.is_duckdb:
+                conn = duckdb.connect(self.db_path)
+            else:
+                import sqlite3
+                conn = sqlite3.connect(self.db_path)
+            
+            # Process the first file to get the schema
+            first_file = files[0]
+            self.progress.emit(f"Analyzing schema from {first_file.name}...")
+            
+            # Read a small sample to determine schema
+            try:
+                if first_file.suffix.lower() == '.csv':
+                    sample_df = pd.read_csv(first_file, nrows=1000)
+                elif first_file.suffix.lower() in ['.xlsx', '.xls']:
+                    sample_df = pd.read_excel(first_file, nrows=1000)
+                else:  # parquet
+                    sample_df = pd.read_parquet(first_file)
+                    if len(sample_df) > 1000:
+                        sample_df = sample_df.iloc[:1000]
+                
+                # Clean column names
+                sample_df.columns = self.clean_column_names(sample_df.columns)
+                
+                # Check if we're using an existing table
+                if self.use_existing_table:
+                    # Get existing columns
+                    existing_columns = self.get_existing_columns(conn)
+                    
+                    # Add any missing columns
+                    self.add_missing_columns(conn, sample_df, existing_columns)
+                else:
+                    # Create the table if it doesn't exist
+                    self.create_table_if_not_exists(conn, sample_df)
+            except Exception as e:
+                self.error.emit(f"Error analyzing first file {first_file.name}: {str(e)}")
+                self.finished.emit()
+                return
+            
+            # Process all files
+            total_files = len(files)
+            files_processed = 0
+            files_with_errors = 0
+            
+            for i, file_path in enumerate(files, 1):
+                if self.is_cancelled:
+                    break
+                    
+                self.progress.emit(f"Processing file {i}/{total_files}: {file_path.name}")
+                
+                # Process the file in chunks
+                chunk_count = 0
+                rows_processed = 0
+                file_error = False
+                
+                try:
+                    for chunk in self.read_file_in_chunks(file_path):
+                        if self.is_cancelled:
+                            break
+                            
+                        chunk_count += 1
+                        rows_processed += len(chunk)
+                        
+                        try:
+                            # Always check for and add any new columns for each chunk
+                            existing_columns = self.get_existing_columns(conn)
+                            self.add_missing_columns(conn, chunk, existing_columns)
+                            
+                            # Insert the chunk into the database
+                            if self.is_duckdb:
+                                # Register the DataFrame as a view
+                                conn.register('df', chunk)
+                                self.insert_data(conn, None)  # Pass None to indicate df is already registered
+                            else:
+                                self.insert_data(conn, chunk)
+                            
+                            self.progress.emit(f"Processed {rows_processed} rows from {file_path.name} (chunk {chunk_count})")
+                        except Exception as e:
+                            self.error.emit(f"Error processing chunk {chunk_count} from file {file_path.name}: {str(e)}")
+                            file_error = True
+                            # Continue with next chunk
+                            continue
+                except Exception as e:
+                    self.error.emit(f"Error reading file {file_path.name}: {str(e)}")
+                    file_error = True
+                    # Continue with next file
+                    continue
+                finally:
+                    if file_error:
+                        files_with_errors += 1
+                    else:
+                        files_processed += 1
+                    
+                    self.progress.emit(f"Completed file {i}/{total_files}: {file_path.name}" + 
+                                      (" with errors" if file_error else ""))
+            
+            # Close the database connection
+            if self.is_duckdb:
+                conn.close()
+            else:
+                conn.commit()
+                conn.close()
+            
+            if not self.is_cancelled:
+                if files_with_errors > 0:
+                    self.success.emit(f"Merged {files_processed} files into {self.db_path}. {files_with_errors} files had errors but were partially processed.")
+                else:
+                    self.success.emit(f"Successfully merged {files_processed} files into {self.db_path}")
+                # Emit signal that table was created/updated
+                self.table_created.emit(self.db_path, self.table_name)
+            
+            self.finished.emit()
+            
+        except Exception as e:
+            self.error.emit(f"Error merging files: {str(e)}")
+            self.finished.emit()
+    
+    def cancel(self):
+        self.is_cancelled = True
+        self.progress.emit("Cancelling operation...")
+
     def create_table_if_not_exists(self, conn, sample_df):
         """Create table with appropriate column types if it doesn't exist"""
         column_types = self.analyze_column_types(sample_df)
@@ -825,168 +1051,7 @@ class MergeFilesWorker(QObject):
                 
         except Exception as e:
             self.error.emit(f"Error reading file {file_path.name}: {str(e)}")
-            return None
-    
-    def insert_data(self, conn, df):
-        """Insert data into the database"""
-        if df is None:
-            # This is the case when using DuckDB and the DataFrame is already registered
-            if self.is_duckdb:
-                conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
-            return
-            
-        # Get existing columns to ensure proper column alignment
-        existing_columns = self.get_existing_columns(conn)
-        self.insert_data_with_column_matching(conn, df, existing_columns)
-    
-    def insert_data_with_column_matching(self, conn, df, existing_columns):
-        """Insert data with column matching to handle different column sets"""
-        self.progress.emit(f"Aligning columns with existing table structure...")
-        
-        # Create sets for easier comparison
-        df_columns = set(df.columns)
-        table_columns = set(existing_columns)
-        
-        # Find columns in DataFrame that aren't in the table
-        # (This shouldn't happen as we've already added missing columns, but just in case)
-        missing_in_table = df_columns - table_columns
-        if missing_in_table:
-            self.progress.emit(f"Found {len(missing_in_table)} columns in data that aren't in the table. Adding them...")
-            self.add_missing_columns(conn, df[list(missing_in_table)], existing_columns)
-            # Update existing columns
-            existing_columns = self.get_existing_columns(conn)
-            table_columns = set(existing_columns)
-        
-        # Find columns in the table that aren't in the DataFrame
-        missing_in_df = table_columns - df_columns
-        if missing_in_df:
-            self.progress.emit(f"Found {len(missing_in_df)} columns in table that aren't in the data. Will fill with NULL values.")
-            # Add missing columns to DataFrame with NULL values
-            for col in missing_in_df:
-                df[col] = None
-        
-        # Ensure DataFrame columns are in the same order as the table
-        ordered_df = df[existing_columns]
-        
-        # Now insert the data
-        if self.is_duckdb:
-            # For DuckDB, register the aligned DataFrame
-            conn.register('aligned_df', ordered_df)
-            conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM aligned_df")
-        else:
-            # For SQLite, use pandas to_sql
-            ordered_df.to_sql(self.table_name, conn, if_exists='append', index=False)
-        
-        self.progress.emit(f"Inserted {len(df)} rows with column alignment.")
-    
-    # Make run a slot that can be connected to QThread.started signal
-    def run(self):
-        try:
-            files = self.get_file_list()
-            
-            if not files:
-                self.error.emit("No supported files found in the selected folder.")
-                self.finished.emit()
-                return
-                
-            self.progress.emit(f"Found {len(files)} files to process.")
-            
-            # Connect to the database
-            if self.is_duckdb:
-                conn = duckdb.connect(self.db_path)
-            else:
-                import sqlite3
-                conn = sqlite3.connect(self.db_path)
-            
-            # Process the first file to get the schema
-            first_file = files[0]
-            self.progress.emit(f"Analyzing schema from {first_file.name}...")
-            
-            # Read a small sample to determine schema
-            if first_file.suffix.lower() == '.csv':
-                sample_df = pd.read_csv(first_file, nrows=1000)
-            elif first_file.suffix.lower() in ['.xlsx', '.xls']:
-                sample_df = pd.read_excel(first_file, nrows=1000)
-            else:  # parquet
-                sample_df = pd.read_parquet(first_file)
-                if len(sample_df) > 1000:
-                    sample_df = sample_df.iloc[:1000]
-            
-            # Clean column names
-            sample_df.columns = self.clean_column_names(sample_df.columns)
-            
-            # Check if we're using an existing table
-            if self.use_existing_table:
-                # Get existing columns
-                existing_columns = self.get_existing_columns(conn)
-                
-                # Add any missing columns
-                self.add_missing_columns(conn, sample_df, existing_columns)
-            else:
-                # Create the table if it doesn't exist
-                self.create_table_if_not_exists(conn, sample_df)
-            
-            # Process all files
-            total_files = len(files)
-            for i, file_path in enumerate(files, 1):
-                if self.is_cancelled:
-                    break
-                    
-                self.progress.emit(f"Processing file {i}/{total_files}: {file_path.name}")
-                
-                # Process the file in chunks
-                chunk_count = 0
-                rows_processed = 0
-                
-                try:
-                    for chunk in self.read_file_in_chunks(file_path):
-                        if self.is_cancelled:
-                            break
-                            
-                        chunk_count += 1
-                        rows_processed += len(chunk)
-                        
-                        # Always check for and add any new columns for each chunk
-                        existing_columns = self.get_existing_columns(conn)
-                        self.add_missing_columns(conn, chunk, existing_columns)
-                        
-                        # Insert the chunk into the database
-                        if self.is_duckdb:
-                            # Register the DataFrame as a view
-                            conn.register('df', chunk)
-                            self.insert_data(conn, None)  # Pass None to indicate df is already registered
-                        else:
-                            self.insert_data(conn, chunk)
-                        
-                        self.progress.emit(f"Processed {rows_processed} rows from {file_path.name} (chunk {chunk_count})")
-                except Exception as e:
-                    self.error.emit(f"Error processing file {file_path.name}: {str(e)}")
-                    # Continue with next file
-                    continue
-                
-                self.progress.emit(f"Completed file {i}/{total_files}: {file_path.name}")
-            
-            # Close the database connection
-            if self.is_duckdb:
-                conn.close()
-            else:
-                conn.commit()
-                conn.close()
-            
-            if not self.is_cancelled:
-                self.success.emit(f"Successfully merged {len(files)} files into {self.db_path}")
-                # Emit signal that table was created/updated
-                self.table_created.emit(self.db_path, self.table_name)
-            
-            self.finished.emit()
-            
-        except Exception as e:
-            self.error.emit(f"Error merging files: {str(e)}")
-            self.finished.emit()
-    
-    def cancel(self):
-        self.is_cancelled = True
-        self.progress.emit("Cancelling operation...")
+            raise  # Re-raise to be caught by the calling function
 
 class QueryTab(QWidget):
     database_loaded = pyqtSignal(str)  # Signal when database is loaded
@@ -2748,6 +2813,7 @@ class ImportFileWorker(QObject):
                         errors.append(f"Error with {quoted_col}: {str(e)}")
             
             if not added:
+                # Just log the error but don't stop processing
                 self.progress.emit(f"Could not add column {col_name}. Errors: {'; '.join(errors)}")
                 
         self.progress.emit(f"Added new columns to the table.")
@@ -2947,6 +3013,7 @@ class ImportFileWorker(QObject):
                         errors.append(f"Error with {quoted_col}: {str(e)}")
             
             if not added:
+                # Just log the error but don't stop processing
                 self.progress.emit(f"Could not add column {col_name}. Errors: {'; '.join(errors)}")
                 
         self.progress.emit(f"Added new columns to the table.")
