@@ -1755,13 +1755,13 @@ class QueryTab(QWidget):
             # Connect to the database
             if self.current_db_path.lower().endswith('.duckdb'):
                 conn = duckdb.connect(self.current_db_path)
-                conn.execute(f"DROP TABLE IF EXISTS '{table_name}'")
+                conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
                 conn.close()
             else:
                 import sqlite3
                 conn = sqlite3.connect(self.current_db_path)
                 cursor = conn.cursor()
-                cursor.execute(f"DROP TABLE IF EXISTS '{table_name}'")
+                cursor.execute(f'DROP TABLE IF EXISTS "{table_name}"')
                 conn.commit()
                 conn.close()
                 
