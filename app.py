@@ -7,11 +7,13 @@ import tempfile
 import shutil
 from pathlib import Path
 import time
+import datetime
+import traceback
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QFileDialog, QTableView, QMessageBox, QLabel, QPlainTextEdit, QCompleter,
                              QListWidget, QSplitter, QTabWidget, QProgressDialog, QStyle, QComboBox, QMenuBar, QDialog, QDialogButtonBox,
-                             QComboBox, QFormLayout, QMenu, QCheckBox, QRadioButton, QButtonGroup)
+                             QComboBox, QFormLayout, QMenu, QCheckBox, QRadioButton, QButtonGroup, QInputDialog)
 from PyQt6.QtCore import QAbstractTableModel, Qt, QThread, pyqtSignal, QRegularExpression, QTimer, QObject
 from PyQt6.QtGui import QTextCursor, QSyntaxHighlighter, QTextCharFormat, QAction, QFont, QFontMetrics
 
@@ -584,12 +586,13 @@ class MergeFilesWorker(QObject):
     
     CHUNK_SIZE = 100000  # Chunk size for better memory management
     
-    def __init__(self, folder_path, db_path, table_name=None, use_existing_table=False):
+    def __init__(self, folder_path, db_path, table_name=None, use_existing_table=False, replace_table=False):
         super().__init__()
         self.folder_path = folder_path
         self.db_path = db_path
         self.table_name = table_name or "merged_data"
         self.use_existing_table = use_existing_table
+        self.replace_table = replace_table
         self.is_cancelled = False
         self.is_duckdb = db_path.lower().endswith('.duckdb')
     
@@ -857,6 +860,16 @@ class MergeFilesWorker(QObject):
                     # Add any missing columns
                     self.add_missing_columns(conn, sample_df, existing_columns)
                 else:
+                    # If replacing, drop the existing table first
+                    if self.replace_table:
+                        self.progress.emit(f"Replacing existing table '{self.table_name}'...")
+                        try:
+                            conn.execute(f"DROP TABLE IF EXISTS \"{self.table_name}\"")
+                        except Exception as e:
+                            self.error.emit(f"Error dropping existing table: {str(e)}")
+                            self.finished.emit()
+                            return
+                    
                     # Create the table if it doesn't exist
                     self.create_table_if_not_exists(conn, sample_df)
             except Exception as e:
@@ -1623,6 +1636,11 @@ class QueryTab(QWidget):
         # Add separator
         context_menu.addSeparator()
         
+        # Add rename action
+        rename_action = QAction(f"Rename table '{selected_table}'", self)
+        rename_action.triggered.connect(lambda: self.rename_table(selected_table))
+        context_menu.addAction(rename_action)
+        
         # Add delete action
         delete_action = QAction(f"Delete table '{selected_table}'", self)
         delete_action.triggered.connect(lambda: self.delete_table(selected_table))
@@ -1859,6 +1877,83 @@ class QueryTab(QWidget):
         
         QMessageBox.information(self, "Example Copied", "The example has been copied to a new query tab.")
 
+    def rename_table(self, table_name):
+        """Rename a table in the database"""
+        if not self.current_db_path:
+            return
+            
+        # Prompt for new table name
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Rename Table",
+            f"Enter new name for table '{table_name}':",
+            QLineEdit.EchoMode.Normal,
+            table_name
+        )
+        
+        if not ok or not new_name or new_name == table_name:
+            return
+            
+        # Validate the new name (basic validation)
+        if not re.match(r'^[a-zA-Z0-9_]+$', new_name):
+            QMessageBox.warning(
+                self,
+                "Invalid Name",
+                "Table name can only contain letters, numbers, and underscores."
+            )
+            return
+            
+        # Check if the new name already exists
+        try:
+            # Connect to the database
+            if self.current_db_path.lower().endswith('.duckdb'):
+                conn = duckdb.connect(self.current_db_path)
+                tables = conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").fetchall()
+            else:
+                import sqlite3
+                conn = sqlite3.connect(self.current_db_path)
+                cursor = conn.cursor()
+                tables = cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                
+            existing_tables = [t[0] for t in tables]
+            
+            if new_name in existing_tables:
+                QMessageBox.warning(
+                    self,
+                    "Table Exists",
+                    f"A table named '{new_name}' already exists. Please choose a different name."
+                )
+                conn.close()
+                return
+                
+            # Rename the table
+            if self.current_db_path.lower().endswith('.duckdb'):
+                # For DuckDB
+                conn.execute(f'ALTER TABLE "{table_name}" RENAME TO "{new_name}"')
+            else:
+                # For SQLite
+                cursor.execute(f'ALTER TABLE "{table_name}" RENAME TO "{new_name}"')
+                conn.commit()
+                
+            conn.close()
+            
+            # Update the table list
+            self.update_table_list()
+            
+            # Show success message
+            QMessageBox.information(
+                self,
+                "Success",
+                f"Table '{table_name}' has been renamed to '{new_name}'."
+            )
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to rename table: {str(e)}"
+            )
+
 class CreateDatabaseDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2009,6 +2104,9 @@ class MergeFilesDialog(QDialog):
         self.existing_table_radio = QRadioButton("Use existing table")
         self.table_button_group.addButton(self.existing_table_radio)
         
+        self.replace_table_radio = QRadioButton("Replace existing table")
+        self.table_button_group.addButton(self.replace_table_radio)
+        
         # Connect signals
         self.table_button_group.buttonClicked.connect(self.toggle_table_options)
         
@@ -2016,6 +2114,7 @@ class MergeFilesDialog(QDialog):
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.new_table_radio)
         button_layout.addWidget(self.existing_table_radio)
+        button_layout.addWidget(self.replace_table_radio)
         button_layout.addStretch()
         
         self.table_option_layout.addLayout(button_layout)
@@ -2149,12 +2248,21 @@ class MergeFilesDialog(QDialog):
                 self.status_label.setText("Table name cannot be empty.")
                 return
             self.use_existing_table = False
-        else:
+            self.replace_table = False
+        elif self.existing_table_radio.isChecked():
             if self.table_combo.count() == 0:
                 self.status_label.setText("No tables available. Please create a new table.")
                 return
             table_name = self.table_combo.currentText()
             self.use_existing_table = True
+            self.replace_table = False
+        else:  # replace_table_radio is checked
+            if self.table_combo.count() == 0:
+                self.status_label.setText("No tables available to replace. Please create a new table.")
+                return
+            table_name = self.table_combo.currentText()
+            self.use_existing_table = False
+            self.replace_table = True
         
         # If user selected "Create new database...", open the create database dialog
         if selected_db == "Create new database...":
@@ -2233,6 +2341,9 @@ class ImportFileDialog(QDialog):
         self.existing_table_radio = QRadioButton("Use existing table")
         self.table_button_group.addButton(self.existing_table_radio)
         
+        self.replace_table_radio = QRadioButton("Replace existing table")
+        self.table_button_group.addButton(self.replace_table_radio)
+        
         # Connect signals
         self.table_button_group.buttonClicked.connect(self.toggle_table_options)
         
@@ -2240,6 +2351,7 @@ class ImportFileDialog(QDialog):
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.new_table_radio)
         button_layout.addWidget(self.existing_table_radio)
+        button_layout.addWidget(self.replace_table_radio)
         button_layout.addStretch()
         
         self.table_option_layout.addLayout(button_layout)
@@ -2486,12 +2598,21 @@ class ImportFileDialog(QDialog):
                 self.status_label.setText("Table name cannot be empty.")
                 return
             self.use_existing_table = False
-        else:
+            self.replace_table = False
+        elif self.existing_table_radio.isChecked():
             if self.table_combo.count() == 0:
                 self.status_label.setText("No tables available. Please create a new table.")
                 return
             table_name = self.table_combo.currentText()
             self.use_existing_table = True
+            self.replace_table = False
+        else:  # replace_table_radio is checked
+            if self.table_combo.count() == 0:
+                self.status_label.setText("No tables available to replace. Please create a new table.")
+                return
+            table_name = self.table_combo.currentText()
+            self.use_existing_table = False
+            self.replace_table = True
         
         # If user selected "Create new database...", open the create database dialog
         if selected_db == "Create new database...":
@@ -2533,12 +2654,13 @@ class ImportFileWorker(QObject):
     finished = pyqtSignal()     # Signal to emit when process is complete
     table_created = pyqtSignal(str, str)  # Signal to emit when a table is created (db_path, table_name)
     
-    def __init__(self, file_path, db_path, table_name, use_existing_table=False, import_options=None):
+    def __init__(self, file_path, db_path, table_name, use_existing_table=False, replace_table=False, import_options=None):
         super().__init__()
         self.file_path = file_path
         self.db_path = db_path
         self.table_name = table_name
         self.use_existing_table = use_existing_table
+        self.replace_table = replace_table
         self.import_options = import_options or {}
         self.is_cancelled = False
         self.is_duckdb = db_path.lower().endswith('.duckdb')
@@ -2625,6 +2747,16 @@ class ImportFileWorker(QObject):
                     # Insert data with column matching
                     self.insert_data_with_column_matching(conn, first_chunk, existing_columns)
                 else:
+                    # If replacing, drop the existing table first
+                    if self.replace_table:
+                        self.progress.emit(f"Replacing existing table '{self.table_name}'...")
+                        try:
+                            conn.execute(f"DROP TABLE IF EXISTS \"{self.table_name}\"")
+                        except Exception as e:
+                            self.error.emit(f"Error dropping existing table: {str(e)}")
+                            self.finished.emit()
+                            return
+                    
                     # Create the table if it doesn't exist
                     self.create_table_if_not_exists(conn, first_chunk)
                     
@@ -3185,6 +3317,16 @@ class ImportFileWorker(QObject):
                     # Insert data with column matching
                     self.insert_data_with_column_matching(conn, first_chunk, existing_columns)
                 else:
+                    # If replacing, drop the existing table first
+                    if self.replace_table:
+                        self.progress.emit(f"Replacing existing table '{self.table_name}'...")
+                        try:
+                            conn.execute(f"DROP TABLE IF EXISTS \"{self.table_name}\"")
+                        except Exception as e:
+                            self.error.emit(f"Error dropping existing table: {str(e)}")
+                            self.finished.emit()
+                            return
+                    
                     # Create the table if it doesn't exist
                     self.create_table_if_not_exists(conn, first_chunk)
                     
@@ -3414,6 +3556,7 @@ class MainWindow(QMainWindow):
             db_path = dialog.db_path
             table_name = dialog.table_name
             use_existing_table = dialog.use_existing_table
+            replace_table = dialog.replace_table
             
             # Create a progress dialog
             progress_dialog = QProgressDialog("Merging files...", "Cancel", 0, 0, self)
@@ -3424,7 +3567,7 @@ class MainWindow(QMainWindow):
             progress_dialog.setAutoReset(False)
             
             # Create the worker
-            self.merge_worker = MergeFilesWorker(folder_path, db_path, table_name, use_existing_table)
+            self.merge_worker = MergeFilesWorker(folder_path, db_path, table_name, use_existing_table, replace_table)
             
             # Create a thread to run the worker
             self.merge_thread = QThread()
@@ -3493,6 +3636,7 @@ class MainWindow(QMainWindow):
             db_path = dialog.db_path
             table_name = dialog.table_name
             use_existing_table = dialog.use_existing_table
+            replace_table = dialog.replace_table
             
             # Create a progress dialog
             progress_dialog = QProgressDialog("Importing file...", "Cancel", 0, 0, self)
@@ -3503,7 +3647,7 @@ class MainWindow(QMainWindow):
             progress_dialog.setAutoReset(False)
             
             # Create the worker
-            self.import_worker = ImportFileWorker(file_path, db_path, table_name, use_existing_table)
+            self.import_worker = ImportFileWorker(file_path, db_path, table_name, use_existing_table, replace_table, dialog.import_options)
             
             # Create a thread to run the worker
             self.import_thread = QThread()
