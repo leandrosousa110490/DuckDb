@@ -584,7 +584,7 @@ class MergeFilesWorker(QObject):
     finished = pyqtSignal()     # Signal to emit when process is complete
     table_created = pyqtSignal(str, str)  # Signal to emit when a table is created (db_path, table_name)
     
-    CHUNK_SIZE = 100000  # Chunk size for better memory management
+    CHUNK_SIZE = 50000  # Reduced chunk size for better memory management
     
     def __init__(self, folder_path, db_path, table_name=None, use_existing_table=False, replace_table=False):
         super().__init__()
@@ -595,6 +595,7 @@ class MergeFilesWorker(QObject):
         self.replace_table = replace_table
         self.is_cancelled = False
         self.is_duckdb = db_path.lower().endswith('.duckdb')
+        self.total_rows_processed = 0
     
     def clean_column_names(self, columns):
         """Clean and deduplicate column names"""
@@ -771,15 +772,20 @@ class MergeFilesWorker(QObject):
                 self.progress.emit(f"Found {len(missing_in_df)} columns in table that aren't in the data. Will fill with NULL values.")
                 # Add missing columns to DataFrame with NULL values
                 for col in missing_in_df:
-                    df[col] = None
+                    df.loc[:, col] = None
             
-            # Ensure DataFrame columns are in the same order as the table
-            # Only include columns that exist in both the DataFrame and the table
-            common_columns = [col for col in existing_columns if col in df.columns]
-            if len(common_columns) < len(existing_columns):
-                self.progress.emit(f"Warning: Some columns in the table were not found in the data. Using only common columns.")
+            # Create a new DataFrame that contains all columns from the table
+            # This ensures we maintain column order and include all columns
+            ordered_df = pd.DataFrame()
+            for col in existing_columns:
+                if col in df.columns:
+                    ordered_df.loc[:, col] = df[col]
+                else:
+                    ordered_df.loc[:, col] = None
             
-            ordered_df = df[common_columns]
+            if len(ordered_df.columns) == 0:
+                self.progress.emit("Warning: No valid columns found for insertion. Skipping this chunk.")
+                return
             
             # Now insert the data
             if self.is_duckdb:
@@ -804,10 +810,17 @@ class MergeFilesWorker(QObject):
                     cursor.execute(f"PRAGMA table_info('{self.table_name}')")
                     db_columns = [row[1] for row in cursor.fetchall()]
                     
-                    # Filter DataFrame to only include columns that match the database
-                    matching_columns = [col for col in db_columns if col in ordered_df.columns]
-                    if matching_columns:
-                        ordered_df[matching_columns].to_sql(self.table_name, conn, if_exists='append', index=False)
+                    # Create a new DataFrame with exactly the columns from the database
+                    final_df = pd.DataFrame()
+                    for col in db_columns:
+                        if col in ordered_df.columns:
+                            final_df.loc[:, col] = ordered_df[col]
+                        else:
+                            final_df.loc[:, col] = None
+                    
+                    # Try to insert the precisely matched DataFrame
+                    if len(final_df.columns) > 0:
+                        final_df.to_sql(self.table_name, conn, if_exists='append', index=False)
                     else:
                         raise Exception("No matching columns found between DataFrame and database table")
             
@@ -830,28 +843,79 @@ class MergeFilesWorker(QObject):
             # Connect to the database
             if self.is_duckdb:
                 conn = duckdb.connect(self.db_path)
+                # Increase memory limit for DuckDB
+                try:
+                    conn.execute("SET memory_limit='8GB'")
+                    conn.execute("PRAGMA threads=4")  # Use multiple threads for better performance
+                except Exception as e:
+                    self.progress.emit(f"Notice: Could not set memory limits: {str(e)}")
             else:
                 import sqlite3
-                conn = sqlite3.connect(self.db_path)
+                conn = sqlite3.connect(self.db_path, timeout=300)  # Increase timeout to 5 minutes
+                conn.execute("PRAGMA journal_mode=WAL")  # Use WAL mode for better performance
+                conn.execute("PRAGMA synchronous=NORMAL")  # Reduce synchronous mode for better performance
+            
+            # First collect schema information from all files to create a comprehensive schema
+            self.progress.emit("Analyzing schemas from all files to create a unified structure...")
+            all_columns = set()
+            all_column_types = {}
+            sample_df = None
+            
+            # Sample up to 5 files to get a comprehensive schema
+            sample_files = files[:min(5, len(files))]
+            for file in sample_files:
+                try:
+                    # Read a small sample to determine schema
+                    if file.suffix.lower() == '.csv':
+                        temp_df = pd.read_csv(file, nrows=100)
+                    elif file.suffix.lower() in ['.xlsx', '.xls']:
+                        temp_df = pd.read_excel(file, nrows=100)
+                    else:  # parquet
+                        temp_df = pd.read_parquet(file)
+                        if len(temp_df) > 100:
+                            temp_df = temp_df.iloc[:100]
+                    
+                    # Clean column names
+                    temp_df.columns = self.clean_column_names(temp_df.columns)
+                    
+                    # Update column info
+                    all_columns.update(temp_df.columns)
+                    
+                    # Remember one sample for table creation
+                    if sample_df is None:
+                        sample_df = temp_df
+                    
+                    # Get column types
+                    file_types = self.analyze_column_types(temp_df)
+                    for col, col_type in file_types.items():
+                        # Update column type if needed - prefer more general types
+                        if col not in all_column_types:
+                            all_column_types[col] = col_type
+                        elif all_column_types[col] != col_type:
+                            # If we have different types for the same column, use TEXT as a fallback
+                            all_column_types[col] = 'TEXT'
+                except Exception as e:
+                    self.progress.emit(f"Warning: Could not analyze schema from {file.name}: {str(e)}")
+            
+            if sample_df is None:
+                self.error.emit("Could not read any data from the files to determine schema.")
+                self.finished.emit()
+                conn.close()
+                return
+            
+            # Create a comprehensive sample_df with all found columns
+            for col in all_columns:
+                if col not in sample_df.columns:
+                    sample_df.loc[:, col] = None
             
             # Process the first file to get the schema
-            first_file = files[0]
-            self.progress.emit(f"Analyzing schema from {first_file.name}...")
+            self.progress.emit(f"Setting up table structure with all detected columns...")
             
-            # Read a small sample to determine schema
+            # Store for later use
+            table_name = self.table_name
+            db_path = self.db_path
+            
             try:
-                if first_file.suffix.lower() == '.csv':
-                    sample_df = pd.read_csv(first_file, nrows=1000)
-                elif first_file.suffix.lower() in ['.xlsx', '.xls']:
-                    sample_df = pd.read_excel(first_file, nrows=1000)
-                else:  # parquet
-                    sample_df = pd.read_parquet(first_file)
-                    if len(sample_df) > 1000:
-                        sample_df = sample_df.iloc[:1000]
-                
-                # Clean column names
-                sample_df.columns = self.clean_column_names(sample_df.columns)
-                
                 # Check if we're using an existing table
                 if self.use_existing_table:
                     # Get existing columns
@@ -868,20 +932,29 @@ class MergeFilesWorker(QObject):
                         except Exception as e:
                             self.error.emit(f"Error dropping existing table: {str(e)}")
                             self.finished.emit()
+                            conn.close()  # Close connection on error
                             return
                     
-                    # Create the table if it doesn't exist
-                    self.create_table_if_not_exists(conn, sample_df)
+                    # Create the table if it doesn't exist with all detected columns
+                    self.progress.emit(f"Creating table '{self.table_name}' with {len(all_columns)} columns")
+                    # Modify the sample_df to include all columns with proper types
+                    self.create_table_with_schema(conn, sample_df, all_column_types)
             except Exception as e:
-                self.error.emit(f"Error analyzing first file {first_file.name}: {str(e)}")
+                self.error.emit(f"Error setting up table structure: {str(e)}")
                 self.finished.emit()
+                conn.close()  # Close connection on error
                 return
             
             # Process all files
             total_files = len(files)
             files_processed = 0
             files_with_errors = 0
+            self.total_rows_processed = 0
             
+            # Start a transaction for better performance
+            if not self.is_duckdb:
+                conn.execute("BEGIN TRANSACTION")
+                
             for i, file_path in enumerate(files, 1):
                 if self.is_cancelled:
                     break
@@ -900,28 +973,34 @@ class MergeFilesWorker(QObject):
                             
                         chunk_count += 1
                         rows_processed += len(chunk)
+                        self.total_rows_processed += len(chunk)
                         
                         try:
                             # Always check for and add any new columns for each chunk
                             existing_columns = self.get_existing_columns(conn)
                             self.add_missing_columns(conn, chunk, existing_columns)
                             
-                            # Insert the chunk into the database
-                            if self.is_duckdb:
-                                # Register the DataFrame as a view
-                                conn.register('df', chunk)
-                                self.insert_data(conn, None)  # Pass None to indicate df is already registered
-                            else:
-                                self.insert_data(conn, chunk)
+                            # Get updated list of columns
+                            existing_columns = self.get_existing_columns(conn)
                             
-                            self.progress.emit(f"Processed {rows_processed} rows from {file_path.name} (chunk {chunk_count})")
+                            # Insert the data with proper column matching
+                            self.insert_data_with_column_matching(conn, chunk, existing_columns)
+                            
+                            self.progress.emit(f"Processed {rows_processed} rows from {file_path.name} (chunk {chunk_count}, total rows: {self.total_rows_processed})")
+                            
+                            # Commit intermediate transaction every 10 chunks for SQLite
+                            if not self.is_duckdb and chunk_count % 10 == 0:
+                                conn.commit()
+                                conn.execute("BEGIN TRANSACTION")
+                                self.progress.emit("Intermediate commit completed")
+                                
                         except Exception as e:
                             self.error.emit(f"Error processing chunk {chunk_count} from file {file_path.name}: {str(e)}")
                             file_error = True
                             # Continue with next chunk
                             continue
                 except Exception as e:
-                    self.error.emit(f"Error reading file {file_path.name}: {str(e)}")
+                    self.error.emit(f"Error reading file {file_path}: {str(e)}")
                     file_error = True
                     # Continue with next file
                     continue
@@ -934,38 +1013,47 @@ class MergeFilesWorker(QObject):
                     self.progress.emit(f"Completed file {i}/{total_files}: {file_path.name}" + 
                                       (" with errors" if file_error else ""))
             
+            # Commit the final transaction for SQLite
+            if not self.is_duckdb and not self.is_cancelled:
+                try:
+                    conn.commit()
+                    self.progress.emit("Final commit completed")
+                except Exception as e:
+                    self.error.emit(f"Error committing final transaction: {str(e)}")
+                    conn.rollback()
+                    
             # Close the database connection
-            if self.is_duckdb:
-                conn.close()
-            else:
-                conn.commit()
-                conn.close()
+            conn.close()
+            self.progress.emit("Database connection closed")
             
             if not self.is_cancelled:
                 if files_with_errors > 0:
-                    self.success.emit(f"Merged {files_processed} files into {self.db_path}. {files_with_errors} files had errors but were partially processed.")
+                    self.success.emit(f"Merged {files_processed} files into {self.db_path}. {files_with_errors} files had errors but were partially processed. Total rows processed: {self.total_rows_processed}")
                 else:
-                    self.success.emit(f"Successfully merged {files_processed} files into {self.db_path}")
-                # Emit signal that table was created/updated
-                self.table_created.emit(self.db_path, self.table_name)
-            
+                    self.success.emit(f"Successfully merged {files_processed} files into {self.db_path}. Total rows processed: {self.total_rows_processed}")
+                    
+                # Give the connection some time to fully close before emitting table_created
+                QThread.msleep(200)  # Brief delay to ensure connection is fully closed
+                # Emit signal that table was created/updated - after connection is closed
+                self.table_created.emit(db_path, table_name)
+                
             self.finished.emit()
             
         except Exception as e:
             self.error.emit(f"Error merging files: {str(e)}")
             self.finished.emit()
-    
-    def cancel(self):
-        self.is_cancelled = True
-        self.progress.emit("Cancelling operation...")
-
-    def create_table_if_not_exists(self, conn, sample_df):
-        """Create table with appropriate column types if it doesn't exist"""
-        column_types = self.analyze_column_types(sample_df)
-        
+            
+    def create_table_with_schema(self, conn, sample_df, column_types):
+        """Create table with comprehensive schema from all files"""
         # Build CREATE TABLE statement
-        columns_sql = ', '.join([f'"{col}" {dtype}' for col, dtype in column_types.items()])
-        create_table_sql = f"CREATE TABLE IF NOT EXISTS \"{self.table_name}\" ({columns_sql})"
+        columns_sql = []
+        
+        # Use column types from our analysis
+        for col in sample_df.columns:
+            col_type = column_types.get(col, 'TEXT')  # Default to TEXT if no type info
+            columns_sql.append(f'"{col}" {col_type}')
+            
+        create_table_sql = f"CREATE TABLE IF NOT EXISTS \"{self.table_name}\" ({', '.join(columns_sql)})"
         
         # Execute the statement
         if self.is_duckdb:
@@ -974,6 +1062,10 @@ class MergeFilesWorker(QObject):
             cursor = conn.cursor()
             cursor.execute(create_table_sql)
             conn.commit()
+            
+    def cancel(self):
+        self.is_cancelled = True
+        self.progress.emit("Cancelling operation...")
     
     def read_file_in_chunks(self, file_path):
         """Read file in chunks to avoid memory issues"""
@@ -985,38 +1077,93 @@ class MergeFilesWorker(QObject):
             if file_ext == '.csv':
                 # Try with default settings first
                 try:
+                    # Try to count total lines for progress reporting
+                    try:
+                        with open(file_path_str, 'r') as f:
+                            total_lines = sum(1 for _ in f)
+                        self.progress.emit(f"CSV file has approximately {total_lines} lines")
+                    except Exception:
+                        pass  # Ignore if we can't count lines
+                        
+                    # Process with reasonable chunk size
                     for chunk in pd.read_csv(file_path_str, chunksize=self.CHUNK_SIZE):
                         # Clean column names
                         chunk.columns = self.clean_column_names(chunk.columns)
+                        # Remove rows with all NaN values
+                        chunk = chunk.dropna(how='all')
                         yield chunk
                 except Exception as e:
                     self.progress.emit(f"Error reading CSV with default settings, trying more flexible settings: {str(e)}")
                     # Try with more flexible settings
                     for chunk in pd.read_csv(file_path_str, chunksize=self.CHUNK_SIZE, 
-                                           encoding='latin1', on_bad_lines='skip', 
-                                           low_memory=False, dtype=str):
+                                          encoding='latin1', on_bad_lines='skip', 
+                                          low_memory=False, dtype=str):
                         # Clean column names
                         chunk.columns = self.clean_column_names(chunk.columns)
+                        # Remove rows with all NaN values
+                        chunk = chunk.dropna(how='all')
                         yield chunk
                         
             elif file_ext in ['.xlsx', '.xls']:
                 # For Excel, we need to read the entire file at once
                 # but we can process it in chunks
-                try:
-                    df = pd.read_excel(file_path_str, engine='openpyxl')
-                except Exception as e1:
-                    self.progress.emit(f"Error reading Excel with openpyxl, trying xlrd: {str(e1)}")
+                
+                # First, check if the file is actually a valid file and exists
+                if not os.path.exists(file_path_str):
+                    raise FileNotFoundError(f"Excel file not found: {file_path_str}")
+                
+                # Check file size - if it's too small it's probably corrupt or empty
+                file_size = os.path.getsize(file_path_str)
+                if file_size < 100:  # Extremely small for an Excel file
+                    raise ValueError(f"Excel file is likely corrupt or empty (size: {file_size} bytes)")
+                
+                # Try multiple engines with proper error handling
+                df = None
+                success = False
+                error_messages = []
+                
+                # Try with openpyxl first for .xlsx
+                if file_ext == '.xlsx':
                     try:
+                        self.progress.emit(f"Trying to read Excel file with openpyxl...")
+                        df = pd.read_excel(file_path_str, engine='openpyxl')
+                        success = True
+                    except Exception as e:
+                        error_messages.append(f"openpyxl error: {str(e)}")
+                        self.progress.emit(f"Error with openpyxl: {str(e)}")
+                
+                # If .xls or openpyxl failed, try xlrd
+                if not success:
+                    try:
+                        self.progress.emit(f"Trying to read Excel file with xlrd...")
                         df = pd.read_excel(file_path_str, engine='xlrd')
-                    except Exception as e2:
-                        self.progress.emit(f"Error reading Excel with xlrd: {str(e2)}")
-                        raise Exception(f"Could not read Excel file with any available engine: {str(e1)} | {str(e2)}")
+                        success = True
+                    except Exception as e:
+                        error_messages.append(f"xlrd error: {str(e)}")
+                        self.progress.emit(f"Error with xlrd: {str(e)}")
+                
+                # If still no success, try as CSV as a last resort
+                if not success:
+                    try:
+                        self.progress.emit("Trying to read file as CSV instead...")
+                        df = pd.read_csv(file_path_str)
+                        success = True
+                    except Exception as e:
+                        error_messages.append(f"CSV fallback error: {str(e)}")
+                        self.progress.emit(f"CSV fallback failed: {str(e)}")
+                
+                if not success:
+                    raise Exception(f"Could not read Excel file with any available engine: {' | '.join(error_messages)}")
                 
                 # Clean column names
                 df.columns = self.clean_column_names(df.columns)
                 
+                # Remove rows with all NaN values
+                df = df.dropna(how='all')
+                
                 # Process in chunks
                 total_rows = len(df)
+                self.progress.emit(f"Successfully read Excel file with {total_rows} rows. Processing in chunks...")
                 for i in range(0, total_rows, self.CHUNK_SIZE):
                     end = min(i + self.CHUNK_SIZE, total_rows)
                     yield df.iloc[i:end]
@@ -1029,8 +1176,11 @@ class MergeFilesWorker(QObject):
                     # Open the file
                     parquet_file = pq.ParquetFile(file_path_str)
                     
-                    # Get total number of row groups
+                    # Get metadata
+                    total_rows = parquet_file.metadata.num_rows
                     num_row_groups = parquet_file.num_row_groups
+                    
+                    self.progress.emit(f"Parquet file has {total_rows} rows in {num_row_groups} row groups")
                     
                     # Process each row group
                     for i in range(num_row_groups):
@@ -1043,7 +1193,15 @@ class MergeFilesWorker(QObject):
                         # Clean column names
                         chunk.columns = self.clean_column_names(chunk.columns)
                         
-                        yield chunk
+                        # Remove rows with all NaN values
+                        chunk = chunk.dropna(how='all')
+                        
+                        # Further split if the row group is larger than chunk size
+                        total_group_rows = len(chunk)
+                        
+                        for j in range(0, total_group_rows, self.CHUNK_SIZE):
+                            end = min(j + self.CHUNK_SIZE, total_group_rows)
+                            yield chunk.iloc[j:end]
                         
                 except ImportError:
                     # Fall back to pandas if pyarrow is not available
@@ -1052,6 +1210,9 @@ class MergeFilesWorker(QObject):
                     
                     # Clean column names
                     df.columns = self.clean_column_names(df.columns)
+                    
+                    # Remove rows with all NaN values
+                    df = df.dropna(how='all')
                     
                     # Process in chunks
                     total_rows = len(df)
@@ -1063,7 +1224,7 @@ class MergeFilesWorker(QObject):
                 raise ValueError(f"Unsupported file format: {file_ext}")
                 
         except Exception as e:
-            self.error.emit(f"Error reading file {file_path.name}: {str(e)}")
+            self.error.emit(f"Error reading file {file_path}: {str(e)}")
             raise  # Re-raise to be caught by the calling function
 
 class QueryTab(QWidget):
@@ -1340,17 +1501,30 @@ class QueryTab(QWidget):
             
             if not self.current_db_path:
                 return
+            
+            # Add a small delay to allow any existing connection to be fully closed
+            QApplication.processEvents()
                 
             # Connect to the database and get table list
             if self.current_db_path.lower().endswith('.duckdb'):
-                conn = duckdb.connect(database=self.current_db_path, read_only=True)
-                tables = conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").fetchall()
+                # Use a more consistent connection approach for DuckDB
+                try:
+                    # Create a new connection with standard settings
+                    conn = duckdb.connect(database=self.current_db_path, read_only=True)
+                    tables = conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").fetchall()
+                except Exception as e:
+                    # If that fails, try without specific settings
+                    QMessageBox.warning(self, "Connection Warning", 
+                                     f"Retrying connection with default settings: {str(e)}")
+                    conn = duckdb.connect(self.current_db_path)
+                    tables = conn.execute("SHOW TABLES").fetchall()
             else:
                 import sqlite3
                 conn = sqlite3.connect(self.current_db_path)
                 cursor = conn.cursor()
                 tables = cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-                
+            
+            # Make sure to close the connection
             conn.close()
             
             # Add tables to the list widget
@@ -1362,6 +1536,8 @@ class QueryTab(QWidget):
             
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to update table list: {str(e)}")
+            # Reset the connection status
+            self.table_list.setEnabled(False)
 
     def new_query(self):
         # Create a new tab with query editor and result view
@@ -1417,12 +1593,30 @@ class QueryTab(QWidget):
         if db_path == self.current_db_path:
             return
 
-        try:
-            # Connect to the new database without closing the current one
-            conn = duckdb.connect(database=db_path, read_only=False)
-            tables = conn.execute("SHOW TABLES").fetchall()
-            conn.close()
+        # Close current database connection first if needed
+        if self.current_db_path:
+            # We don't have a direct connection object to close, but this will help 
+            # mark the current database as closed in our UI state
+            self.current_db_path = None
+            # Add a small delay to allow any existing connection to be fully closed
+            QApplication.processEvents()
 
+        try:
+            # Connect to the new database with careful error handling
+            try:
+                # First try with standard connection settings
+                conn = duckdb.connect(database=db_path, read_only=False)
+                tables = conn.execute("SHOW TABLES").fetchall()
+            except Exception as e1:
+                # If that fails, try with minimal settings
+                QMessageBox.warning(self, "Connection Warning", 
+                                 f"Retrying with minimal connection settings: {str(e1)}")
+                conn = duckdb.connect(db_path)
+                tables = conn.execute("SHOW TABLES").fetchall()
+                
+            # Properly close the connection when done
+            conn.close()
+            
             # Update UI
             self.table_list.clear()
             self.table_list.addItems([table[0] for table in tables])
@@ -1431,7 +1625,10 @@ class QueryTab(QWidget):
             self.database_loaded.emit(db_path)
 
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to switch database: {str(e)}")
+            QMessageBox.critical(self, "Database Error", f"Failed to switch database: {str(e)}")
+            self.table_list.clear()
+            self.table_list.setEnabled(False)
+            self.current_db_path = None
             self.database_closed.emit()
 
     def close_database(self):
@@ -2654,6 +2851,8 @@ class ImportFileWorker(QObject):
     finished = pyqtSignal()     # Signal to emit when process is complete
     table_created = pyqtSignal(str, str)  # Signal to emit when a table is created (db_path, table_name)
     
+    CHUNK_SIZE = 50000  # Chunk size for better memory management
+    
     def __init__(self, file_path, db_path, table_name, use_existing_table=False, replace_table=False, import_options=None):
         super().__init__()
         self.file_path = file_path
@@ -2664,47 +2863,90 @@ class ImportFileWorker(QObject):
         self.import_options = import_options or {}
         self.is_cancelled = False
         self.is_duckdb = db_path.lower().endswith('.duckdb')
-        self.chunk_size = 50000  # Chunk size for better memory management
+        self.chunk_size = self.CHUNK_SIZE  # Use the class variable
+        self.total_rows_processed = 0
     
     def insert_data_with_column_matching(self, conn, df, existing_columns):
         """Insert data with column matching to handle different column sets"""
-        self.progress.emit(f"Aligning columns with existing table structure...")
-        
-        # Create sets for easier comparison
-        df_columns = set(df.columns)
-        table_columns = set(existing_columns)
-        
-        # Find columns in DataFrame that aren't in the table
-        # (This shouldn't happen as we've already added missing columns, but just in case)
-        missing_in_table = df_columns - table_columns
-        if missing_in_table:
-            self.progress.emit(f"Found {len(missing_in_table)} columns in data that aren't in the table. Adding them...")
-            self.add_missing_columns(conn, df[list(missing_in_table)], existing_columns)
-            # Update existing columns
-            existing_columns = self.get_existing_columns(conn)
+        try:
+            self.progress.emit(f"Aligning columns with existing table structure...")
+            
+            # Create sets for easier comparison
+            df_columns = set(df.columns)
             table_columns = set(existing_columns)
-        
-        # Find columns in the table that aren't in the DataFrame
-        missing_in_df = table_columns - df_columns
-        if missing_in_df:
-            self.progress.emit(f"Found {len(missing_in_df)} columns in table that aren't in the data. Will fill with NULL values.")
-            # Add missing columns to DataFrame with NULL values
-            for col in missing_in_df:
-                df[col] = None
-        
-        # Ensure DataFrame columns are in the same order as the table
-        ordered_df = df[existing_columns]
-        
-        # Now insert the data
-        if self.is_duckdb:
-            # For DuckDB, register the aligned DataFrame
-            conn.register('aligned_df', ordered_df)
-            conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM aligned_df")
-        else:
-            # For SQLite, use pandas to_sql
-            ordered_df.to_sql(self.table_name, conn, if_exists='append', index=False)
-        
-        self.progress.emit(f"Inserted {len(df)} rows with column alignment.")
+            
+            # Find columns in DataFrame that aren't in the table
+            # (This shouldn't happen as we've already added missing columns, but just in case)
+            missing_in_table = df_columns - table_columns
+            if missing_in_table:
+                self.progress.emit(f"Found {len(missing_in_table)} columns in data that aren't in the table. Adding them...")
+                self.add_missing_columns(conn, df[list(missing_in_table)], existing_columns)
+                # Update existing columns
+                existing_columns = self.get_existing_columns(conn)
+                table_columns = set(existing_columns)
+            
+            # Find columns in the table that aren't in the DataFrame
+            missing_in_df = table_columns - df_columns
+            if missing_in_df:
+                self.progress.emit(f"Found {len(missing_in_df)} columns in table that aren't in the data. Will fill with NULL values.")
+                # Add missing columns to DataFrame with NULL values
+                for col in missing_in_df:
+                    df.loc[:, col] = None
+            
+            # Create a new DataFrame that contains all columns from the table
+            # This ensures we maintain column order and include all columns
+            ordered_df = pd.DataFrame()
+            for col in existing_columns:
+                if col in df.columns:
+                    ordered_df.loc[:, col] = df[col]
+                else:
+                    ordered_df.loc[:, col] = None
+            
+            if len(ordered_df.columns) == 0:
+                self.progress.emit("Warning: No valid columns found for insertion. Skipping this chunk.")
+                return
+            
+            # Now insert the data
+            if self.is_duckdb:
+                # For DuckDB, register the aligned DataFrame
+                conn.register('aligned_df', ordered_df)
+                try:
+                    # Try with double quotes first
+                    conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM aligned_df")
+                except Exception as e:
+                    if "Parser Error" in str(e):
+                        # Try without quotes
+                        conn.execute(f"INSERT INTO {self.table_name} SELECT * FROM aligned_df")
+            else:
+                # For SQLite, use pandas to_sql
+                try:
+                    ordered_df.to_sql(self.table_name, conn, if_exists='append', index=False)
+                except Exception as e:
+                    # If there's an error, try to get the actual columns from the database
+                    # and filter the DataFrame to only include those columns
+                    self.progress.emit(f"Error inserting data: {str(e)}. Trying with exact column matching...")
+                    cursor = conn.cursor()
+                    cursor.execute(f"PRAGMA table_info('{self.table_name}')")
+                    db_columns = [row[1] for row in cursor.fetchall()]
+                    
+                    # Create a new DataFrame with exactly the columns from the database
+                    final_df = pd.DataFrame()
+                    for col in db_columns:
+                        if col in ordered_df.columns:
+                            final_df.loc[:, col] = ordered_df[col]
+                        else:
+                            final_df.loc[:, col] = None
+                    
+                    # Try to insert the precisely matched DataFrame
+                    if len(final_df.columns) > 0:
+                        final_df.to_sql(self.table_name, conn, if_exists='append', index=False)
+                    else:
+                        raise Exception("No matching columns found between DataFrame and database table")
+            
+            self.progress.emit(f"Inserted {len(df)} rows with column alignment.")
+        except Exception as e:
+            self.progress.emit(f"Error in column matching: {str(e)}. Will try to continue with next chunk.")
+            # Don't re-raise the exception so processing can continue
     
     def run(self):
         try:
@@ -2716,22 +2958,49 @@ class ImportFileWorker(QObject):
                 self.finished.emit()
                 return
             
+            # Check if df_chunks is empty
+            if isinstance(df_chunks, list) and len(df_chunks) == 0:
+                self.error.emit(f"No data found in file: {self.file_path}")
+                self.finished.emit()
+                return
+            
             # Connect to the database
             if self.is_duckdb:
                 conn = duckdb.connect(self.db_path)
+                # Increase memory limit for DuckDB
+                try:
+                    conn.execute("SET memory_limit='8GB'")
+                    conn.execute("PRAGMA threads=4")  # Use multiple threads for better performance
+                except Exception as e:
+                    self.progress.emit(f"Notice: Could not set memory limits: {str(e)}")
             else:
                 import sqlite3
-                conn = sqlite3.connect(self.db_path)
+                conn = sqlite3.connect(self.db_path, timeout=300)  # Increase timeout to 5 minutes
+                conn.execute("PRAGMA journal_mode=WAL")  # Use WAL mode for better performance
+                conn.execute("PRAGMA synchronous=NORMAL")  # Reduce synchronous mode for better performance
             
             # Process the first chunk to set up the table
             try:
                 # Get the first chunk to analyze schema
-                first_chunk = next(df_chunks) if hasattr(df_chunks, '__next__') else df_chunks[0]
+                try:
+                    first_chunk = next(df_chunks) if hasattr(df_chunks, '__next__') else df_chunks[0]
+                except (StopIteration, IndexError):
+                    self.error.emit(f"No data found in file: {self.file_path}")
+                    self.finished.emit()
+                    conn.close()
+                    return
                 
                 # Clean column names for the first chunk
                 first_chunk.columns = self.clean_column_names(first_chunk.columns)
                 
+                # Remove rows with all NaN values
+                first_chunk = first_chunk.dropna(how='all')
+                
                 self.progress.emit(f"File read successfully. Processing data...")
+                
+                # Store table name and db path for later use
+                table_name = self.table_name
+                db_path = self.db_path
                 
                 # Check if we're using an existing table
                 if self.use_existing_table:
@@ -2755,6 +3024,7 @@ class ImportFileWorker(QObject):
                         except Exception as e:
                             self.error.emit(f"Error dropping existing table: {str(e)}")
                             self.finished.emit()
+                            conn.close()  # Close connection on error
                             return
                     
                     # Create the table if it doesn't exist
@@ -2770,8 +3040,13 @@ class ImportFileWorker(QObject):
                         first_chunk.to_sql(self.table_name, conn, if_exists='append', index=False)
                 
                 # Process remaining chunks if any
-                rows_imported = len(first_chunk)
+                self.total_rows_processed = len(first_chunk)
+                rows_imported = self.total_rows_processed
                 chunk_count = 1
+                
+                # Start a transaction for better performance on SQLite
+                if not self.is_duckdb:
+                    conn.execute("BEGIN TRANSACTION")
                 
                 # If df_chunks is a generator or list with more chunks
                 if hasattr(df_chunks, '__next__'):
@@ -2782,6 +3057,9 @@ class ImportFileWorker(QObject):
                         
                         # Clean column names
                         chunk.columns = self.clean_column_names(chunk.columns)
+                        
+                        # Remove rows with all NaN values
+                        chunk = chunk.dropna(how='all')
                         
                         # Check for and add any new columns that might be in this chunk
                         existing_columns = self.get_existing_columns(conn)
@@ -2795,8 +3073,15 @@ class ImportFileWorker(QObject):
                         
                         # Update progress
                         rows_imported += len(chunk)
+                        self.total_rows_processed += len(chunk)
                         chunk_count += 1
                         self.progress.emit(f"Imported chunk {chunk_count}: {rows_imported} rows total...")
+                        
+                        # Commit intermediate transaction every 10 chunks for SQLite
+                        if not self.is_duckdb and chunk_count % 10 == 0:
+                            conn.commit()
+                            conn.execute("BEGIN TRANSACTION")
+                            self.progress.emit("Intermediate commit completed")
                 
                 elif isinstance(df_chunks, list) and len(df_chunks) > 1:
                     # Process remaining chunks from list
@@ -2809,6 +3094,9 @@ class ImportFileWorker(QObject):
                         # Clean column names
                         chunk.columns = self.clean_column_names(chunk.columns)
                         
+                        # Remove rows with all NaN values
+                        chunk = chunk.dropna(how='all')
+                        
                         # Check for and add any new columns that might be in this chunk
                         existing_columns = self.get_existing_columns(conn)
                         self.add_missing_columns(conn, chunk, existing_columns)
@@ -2821,40 +3109,234 @@ class ImportFileWorker(QObject):
                         
                         # Update progress
                         rows_imported += len(chunk)
-                        self.progress.emit(f"Imported chunk {i+1}: {rows_imported} rows total...")
+                        self.total_rows_processed += len(chunk)
+                        chunk_count = i + 1
+                        self.progress.emit(f"Imported chunk {chunk_count}: {rows_imported} rows total...")
+                        
+                        # Commit intermediate transaction every 10 chunks for SQLite
+                        if not self.is_duckdb and chunk_count % 10 == 0:
+                            conn.commit()
+                            conn.execute("BEGIN TRANSACTION")
+                            self.progress.emit("Intermediate commit completed")
                 
-            except StopIteration:
-                # No data in the file
-                self.error.emit("No data found in the file or file is empty.")
-                if self.is_duckdb:
-                    conn.close()
-                else:
-                    conn.close()
-                self.finished.emit()
-                return
-            
-            # Close the database connection
-            if self.is_duckdb:
+                # Commit the final transaction for SQLite
+                if not self.is_duckdb and not self.is_cancelled:
+                    try:
+                        conn.commit()
+                        self.progress.emit("Final commit completed")
+                    except Exception as e:
+                        self.error.emit(f"Error committing final transaction: {str(e)}")
+                        conn.rollback()
+                
+                # Close the database connection
                 conn.close()
-            else:
-                conn.commit()
-                conn.close()
-            
-            if not self.is_cancelled:
-                self.success.emit(f"Successfully imported {rows_imported} rows into {self.db_path}")
-                # Emit signal that table was created/updated
-                self.table_created.emit(self.db_path, self.table_name)
-            
-            self.finished.emit()
-            
-        except Exception as e:
-            self.error.emit(f"Error importing file: {str(e)}")
-            self.finished.emit()
-    
-    def cancel(self):
-        self.is_cancelled = True
-        self.progress.emit("Cancelling operation...")
+                self.progress.emit("Database connection closed")
+                
+                if not self.is_cancelled:
+                    self.success.emit(f"Successfully imported {self.file_path} into table '{table_name}'. Total rows: {self.total_rows_processed}")
+                    
+                    # Give the connection some time to fully close before emitting table_created
+                    QThread.msleep(200)  # Brief delay to ensure connection is fully closed
+                    # Emit signal that table was created/updated - after connection is closed
+                    self.table_created.emit(db_path, table_name)
+                    
+            except Exception as e:
+                self.error.emit(f"Error during import: {str(e)}")
+                conn.close()  # Make sure to close the connection
 
+        except Exception as e:
+            self.error.emit(f"Error reading file: {str(e)}")
+            
+        finally:
+            self.finished.emit()
+            
+    def read_file(self):
+        """Read file in chunks to avoid memory issues"""
+        # Convert Path object to string if needed
+        file_path_str = str(self.file_path)
+        file_ext = self.file_path.suffix.lower() if hasattr(self.file_path, 'suffix') else os.path.splitext(file_path_str)[1].lower()
+        
+        try:
+            if file_ext == '.csv':
+                # Try with default settings first
+                try:
+                    # Try to count total lines for progress reporting
+                    try:
+                        with open(file_path_str, 'r') as f:
+                            total_lines = sum(1 for _ in f)
+                        self.progress.emit(f"CSV file has approximately {total_lines} lines")
+                    except Exception:
+                        pass  # Ignore if we can't count lines
+                        
+                    # Process with reasonable chunk size
+                    for chunk in pd.read_csv(file_path_str, chunksize=self.chunk_size):
+                        # Clean column names
+                        chunk.columns = self.clean_column_names(chunk.columns)
+                        # Remove rows with all NaN values
+                        chunk = chunk.dropna(how='all')
+                        yield chunk
+                except Exception as e:
+                    self.progress.emit(f"Error reading CSV with default settings, trying more flexible settings: {str(e)}")
+                    # Try with more flexible settings
+                    for chunk in pd.read_csv(file_path_str, chunksize=self.chunk_size, 
+                                          encoding='latin1', on_bad_lines='skip', 
+                                          low_memory=False, dtype=str):
+                        # Clean column names
+                        chunk.columns = self.clean_column_names(chunk.columns)
+                        # Remove rows with all NaN values
+                        chunk = chunk.dropna(how='all')
+                        yield chunk
+                        
+            elif file_ext in ['.xlsx', '.xls']:
+                # For Excel, we need to read the entire file at once
+                # but we can process it in chunks
+                
+                # First, check if the file is actually a valid file and exists
+                if not os.path.exists(file_path_str):
+                    raise FileNotFoundError(f"Excel file not found: {file_path_str}")
+                
+                # Check file size - if it's too small it's probably corrupt or empty
+                file_size = os.path.getsize(file_path_str)
+                if file_size < 100:  # Extremely small for an Excel file
+                    raise ValueError(f"Excel file is likely corrupt or empty (size: {file_size} bytes)")
+                
+                # Try multiple engines with proper error handling
+                df = None
+                success = False
+                error_messages = []
+                
+                # Try with openpyxl first for .xlsx
+                if file_ext == '.xlsx':
+                    try:
+                        self.progress.emit(f"Trying to read Excel file with openpyxl...")
+                        df = pd.read_excel(
+                            self.file_path,
+                            sheet_name=self.import_options.get('sheet_name', 0),
+                            header=0 if self.import_options.get('header', True) else None,
+                            engine='openpyxl'
+                        )
+                        success = True
+                    except Exception as e:
+                        error_messages.append(f"openpyxl error: {str(e)}")
+                        self.progress.emit(f"Error with openpyxl: {str(e)}")
+                
+                # If .xls or openpyxl failed, try xlrd
+                if not success:
+                    try:
+                        self.progress.emit(f"Trying to read Excel file with xlrd...")
+                        df = pd.read_excel(
+                            self.file_path,
+                            sheet_name=self.import_options.get('sheet_name', 0),
+                            header=0 if self.import_options.get('header', True) else None,
+                            engine='xlrd'
+                        )
+                        success = True
+                    except Exception as e:
+                        error_messages.append(f"xlrd error: {str(e)}")
+                        self.progress.emit(f"Error with xlrd: {str(e)}")
+                
+                # If still no success, try as CSV as a last resort
+                if not success:
+                    try:
+                        self.progress.emit("Trying to read file as CSV instead...")
+                        df = pd.read_csv(
+                            self.file_path,
+                            header=0 if self.import_options.get('header', True) else None
+                        )
+                        success = True
+                    except Exception as e:
+                        error_messages.append(f"CSV fallback error: {str(e)}")
+                        self.progress.emit(f"CSV fallback failed: {str(e)}")
+                
+                if not success:
+                    raise ValueError(f"Could not read Excel file with any available engine: {' | '.join(error_messages)}")
+                
+                self.progress.emit(f"Successfully read Excel file with {len(df)} rows. Processing in chunks...")
+                
+                # Split into chunks and return as a list
+                chunks = []
+                total_rows = len(df)
+                
+                for i in range(0, total_rows, self.chunk_size):
+                    end = min(i + self.chunk_size, total_rows)
+                    chunks.append(df.iloc[i:end])
+                
+                return chunks
+            
+            # For Parquet files
+            elif file_ext == '.parquet':
+                # Store file_path locally to avoid issues with 'self' reference in nested functions
+                file_path_str = self.file_path
+                chunk_size = self.chunk_size
+                clean_column_names_func = self.clean_column_names
+                progress_emit_func = self.progress.emit
+                
+                # Try using pyarrow for chunked reading
+                try:
+                    import pyarrow.parquet as pq
+                    
+                    # Open the file
+                    parquet_file = pq.ParquetFile(file_path_str)
+                    
+                    # Get metadata
+                    total_rows = parquet_file.metadata.num_rows
+                    num_row_groups = parquet_file.num_row_groups
+                    
+                    progress_emit_func(f"Parquet file has {total_rows} rows in {num_row_groups} row groups")
+                    
+                    # Create a list to store chunks instead of using a generator
+                    all_chunks = []
+                    
+                    # Process each row group
+                    for i in range(num_row_groups):
+                        # Read row group
+                        table = parquet_file.read_row_group(i)
+                        
+                        # Convert to pandas DataFrame
+                        chunk = table.to_pandas()
+                        
+                        # Clean column names
+                        chunk.columns = clean_column_names_func(chunk.columns)
+                        
+                        # Remove rows with all NaN values
+                        chunk = chunk.dropna(how='all')
+                        
+                        # Further split if the row group is larger than chunk size
+                        total_group_rows = len(chunk)
+                        
+                        for j in range(0, total_group_rows, chunk_size):
+                            end = min(j + chunk_size, total_group_rows)
+                            all_chunks.append(chunk.iloc[j:end])
+                    
+                    return all_chunks
+                        
+                except ImportError:
+                    # Fall back to pandas if pyarrow is not available
+                    progress_emit_func("PyArrow not available, falling back to pandas for Parquet reading")
+                    df = pd.read_parquet(file_path_str)
+                    
+                    # Clean column names
+                    df.columns = clean_column_names_func(df.columns)
+                    
+                    # Remove rows with all NaN values
+                    df = df.dropna(how='all')
+                    
+                    # Process in chunks
+                    total_rows = len(df)
+                    chunks = []
+                    for i in range(0, total_rows, chunk_size):
+                        end = min(i + chunk_size, total_rows)
+                        chunks.append(df.iloc[i:end])
+                    
+                    return chunks
+            else:
+                self.progress.emit(f"Unsupported file format: {file_ext}")
+                raise ValueError(f"Unsupported file format: {file_ext}")
+                
+        except Exception as e:
+            self.error.emit(f"Error reading file {self.file_path}: {str(e)}")
+            return None
+    
     def clean_column_names(self, columns):
         """Clean and deduplicate column names"""
         # Convert columns to list of strings
@@ -2965,94 +3447,6 @@ class ImportFileWorker(QObject):
             cursor = conn.cursor()
             cursor.execute(create_table_sql)
             conn.commit()
-    
-    def read_file(self):
-        """Read file in chunks to avoid memory issues"""
-        # Get file extension from string path
-        file_path_str = str(self.file_path)
-        file_ext = os.path.splitext(file_path_str)[1].lower()
-        
-        try:
-            if file_ext == '.csv':
-                # Try with default settings first
-                try:
-                    for chunk in pd.read_csv(file_path_str, chunksize=self.chunk_size):
-                        # Clean column names
-                        chunk.columns = self.clean_column_names(chunk.columns)
-                        yield chunk
-                except Exception as e:
-                    self.progress.emit(f"Error reading CSV with default settings, trying more flexible settings: {str(e)}")
-                    # Try with more flexible settings
-                    for chunk in pd.read_csv(file_path_str, chunksize=self.chunk_size, 
-                                           encoding='latin1', on_bad_lines='skip', 
-                                           low_memory=False, dtype=str):
-                        # Clean column names
-                        chunk.columns = self.clean_column_names(chunk.columns)
-                        yield chunk
-                        
-            elif file_ext in ['.xlsx', '.xls']:
-                # For Excel, we need to read the entire file at once
-                # but we can process it in chunks
-                try:
-                    df = pd.read_excel(file_path_str, engine='openpyxl')
-                except Exception as e1:
-                    self.progress.emit(f"Error reading Excel with openpyxl, trying xlrd: {str(e1)}")
-                    try:
-                        df = pd.read_excel(file_path_str, engine='xlrd')
-                    except Exception as e2:
-                        self.progress.emit(f"Error reading Excel with xlrd: {str(e2)}")
-                        raise Exception(f"Could not read Excel file with any available engine: {str(e1)} | {str(e2)}")
-                
-                # Clean column names
-                df.columns = self.clean_column_names(df.columns)
-                
-                # Process in chunks
-                total_rows = len(df)
-                for i in range(0, total_rows, self.chunk_size):
-                    end = min(i + self.chunk_size, total_rows)
-                    yield df.iloc[i:end]
-                    
-            elif file_ext == '.parquet':
-                self.progress.emit("Reading Parquet file...")
-                try:
-                    # Try using pyarrow for better performance with chunking
-                    import pyarrow.parquet as pq
-                    
-                    # Open the parquet file
-                    parquet_file = pq.ParquetFile(file_path_str)
-                    
-                    # Create a generator to yield chunks
-                    def parquet_chunk_generator():
-                        for i in range(0, parquet_file.metadata.num_row_groups, self.chunk_size):
-                            if self.is_cancelled:
-                                break
-                                
-                            # Calculate how many row groups to read
-                            end_group = min(i + self.chunk_size, parquet_file.metadata.num_row_groups)
-                            row_groups = list(range(i, end_group))
-                            
-                            # Read the chunk
-                            table = parquet_file.read_row_groups(row_groups)
-                            df_chunk = table.to_pandas()
-                            
-                            # Update progress
-                            self.progress.emit(f"Read chunk {i//self.chunk_size + 1} from Parquet file...")
-                            
-                            yield df_chunk
-                    
-                    # Return the generator
-                    return parquet_chunk_generator()
-                    
-                except (ImportError, AttributeError):
-                    # Fall back to pandas
-                    self.progress.emit("PyArrow not available, using pandas for Parquet...")
-                    return [pd.read_parquet(file_path_str)]
-            else:
-                raise ValueError(f"Unsupported file format: {file_ext}")
-            
-        except Exception as e:
-            self.error.emit(f"Error reading file: {str(e)}")
-            return None
     
     def analyze_column_types(self, df):
         """Analyze column types to ensure proper database insertion"""
@@ -3168,258 +3562,162 @@ class ImportFileWorker(QObject):
     
     def read_file(self):
         """Read file in chunks to avoid memory issues"""
-        # Get file extension from string path
+        # Convert Path object to string if needed
         file_path_str = str(self.file_path)
-        file_ext = os.path.splitext(file_path_str)[1].lower()
+        file_ext = self.file_path.suffix.lower() if hasattr(self.file_path, 'suffix') else os.path.splitext(file_path_str)[1].lower()
         
         try:
             if file_ext == '.csv':
                 # Try with default settings first
                 try:
-                    for chunk in pd.read_csv(file_path_str, chunksize=self.chunk_size):
+                    # Try to count total lines for progress reporting
+                    try:
+                        with open(file_path_str, 'r') as f:
+                            total_lines = sum(1 for _ in f)
+                        self.progress.emit(f"CSV file has approximately {total_lines} lines")
+                    except Exception:
+                        pass  # Ignore if we can't count lines
+                        
+                    # Process with reasonable chunk size
+                    for chunk in pd.read_csv(file_path_str, chunksize=self.CHUNK_SIZE):
                         # Clean column names
                         chunk.columns = self.clean_column_names(chunk.columns)
+                        # Remove rows with all NaN values
+                        chunk = chunk.dropna(how='all')
                         yield chunk
                 except Exception as e:
                     self.progress.emit(f"Error reading CSV with default settings, trying more flexible settings: {str(e)}")
                     # Try with more flexible settings
-                    for chunk in pd.read_csv(file_path_str, chunksize=self.chunk_size, 
-                                           encoding='latin1', on_bad_lines='skip', 
-                                           low_memory=False, dtype=str):
+                    for chunk in pd.read_csv(file_path_str, chunksize=self.CHUNK_SIZE, 
+                                          encoding='latin1', on_bad_lines='skip', 
+                                          low_memory=False, dtype=str):
                         # Clean column names
                         chunk.columns = self.clean_column_names(chunk.columns)
+                        # Remove rows with all NaN values
+                        chunk = chunk.dropna(how='all')
                         yield chunk
                         
             elif file_ext in ['.xlsx', '.xls']:
                 # For Excel, we need to read the entire file at once
                 # but we can process it in chunks
-                try:
-                    df = pd.read_excel(file_path_str, engine='openpyxl')
-                except Exception as e1:
-                    self.progress.emit(f"Error reading Excel with openpyxl, trying xlrd: {str(e1)}")
+                
+                # First, check if the file is actually a valid file and exists
+                if not os.path.exists(file_path_str):
+                    raise FileNotFoundError(f"Excel file not found: {file_path_str}")
+                
+                # Check file size - if it's too small it's probably corrupt or empty
+                file_size = os.path.getsize(file_path_str)
+                if file_size < 100:  # Extremely small for an Excel file
+                    raise ValueError(f"Excel file is likely corrupt or empty (size: {file_size} bytes)")
+                
+                # Try multiple engines with proper error handling
+                df = None
+                success = False
+                error_messages = []
+                
+                # Try with openpyxl first for .xlsx
+                if file_ext == '.xlsx':
                     try:
+                        self.progress.emit(f"Trying to read Excel file with openpyxl...")
+                        df = pd.read_excel(file_path_str, engine='openpyxl')
+                        success = True
+                    except Exception as e:
+                        error_messages.append(f"openpyxl error: {str(e)}")
+                        self.progress.emit(f"Error with openpyxl: {str(e)}")
+                
+                # If .xls or openpyxl failed, try xlrd
+                if not success:
+                    try:
+                        self.progress.emit(f"Trying to read Excel file with xlrd...")
                         df = pd.read_excel(file_path_str, engine='xlrd')
-                    except Exception as e2:
-                        self.progress.emit(f"Error reading Excel with xlrd: {str(e2)}")
-                        raise Exception(f"Could not read Excel file with any available engine: {str(e1)} | {str(e2)}")
+                        success = True
+                    except Exception as e:
+                        error_messages.append(f"xlrd error: {str(e)}")
+                        self.progress.emit(f"Error with xlrd: {str(e)}")
+                
+                # If still no success, try as CSV as a last resort
+                if not success:
+                    try:
+                        self.progress.emit("Trying to read file as CSV instead...")
+                        df = pd.read_csv(file_path_str)
+                        success = True
+                    except Exception as e:
+                        error_messages.append(f"CSV fallback error: {str(e)}")
+                        self.progress.emit(f"CSV fallback failed: {str(e)}")
+                
+                if not success:
+                    raise Exception(f"Could not read Excel file with any available engine: {' | '.join(error_messages)}")
                 
                 # Clean column names
                 df.columns = self.clean_column_names(df.columns)
                 
+                # Remove rows with all NaN values
+                df = df.dropna(how='all')
+                
                 # Process in chunks
                 total_rows = len(df)
-                for i in range(0, total_rows, self.chunk_size):
-                    end = min(i + self.chunk_size, total_rows)
+                self.progress.emit(f"Successfully read Excel file with {total_rows} rows. Processing in chunks...")
+                for i in range(0, total_rows, self.CHUNK_SIZE):
+                    end = min(i + self.CHUNK_SIZE, total_rows)
                     yield df.iloc[i:end]
                     
             elif file_ext == '.parquet':
-                self.progress.emit("Reading Parquet file...")
+                # Try using pyarrow for chunked reading
                 try:
-                    # Try using pyarrow for better performance with chunking
                     import pyarrow.parquet as pq
                     
-                    # Open the parquet file
+                    # Open the file
                     parquet_file = pq.ParquetFile(file_path_str)
                     
-                    # Create a generator to yield chunks
-                    def parquet_chunk_generator():
-                        for i in range(0, parquet_file.metadata.num_row_groups, self.chunk_size):
-                            if self.is_cancelled:
-                                break
-                                
-                            # Calculate how many row groups to read
-                            end_group = min(i + self.chunk_size, parquet_file.metadata.num_row_groups)
-                            row_groups = list(range(i, end_group))
-                            
-                            # Read the chunk
-                            table = parquet_file.read_row_groups(row_groups)
-                            df_chunk = table.to_pandas()
-                            
-                            # Update progress
-                            self.progress.emit(f"Read chunk {i//self.chunk_size + 1} from Parquet file...")
-                            
-                            yield df_chunk
+                    # Get metadata
+                    total_rows = parquet_file.metadata.num_rows
+                    num_row_groups = parquet_file.num_row_groups
                     
-                    # Return the generator
-                    return parquet_chunk_generator()
+                    self.progress.emit(f"Parquet file has {total_rows} rows in {num_row_groups} row groups")
                     
-                except (ImportError, AttributeError):
-                    # Fall back to pandas
-                    self.progress.emit("PyArrow not available, using pandas for Parquet...")
-                    return [pd.read_parquet(file_path_str)]
+                    # Process each row group
+                    for i in range(num_row_groups):
+                        # Read row group
+                        table = parquet_file.read_row_group(i)
+                        
+                        # Convert to pandas DataFrame
+                        chunk = table.to_pandas()
+                        
+                        # Clean column names
+                        chunk.columns = self.clean_column_names(chunk.columns)
+                        
+                        # Remove rows with all NaN values
+                        chunk = chunk.dropna(how='all')
+                        
+                        # Further split if the row group is larger than chunk size
+                        total_group_rows = len(chunk)
+                        
+                        for j in range(0, total_group_rows, self.CHUNK_SIZE):
+                            end = min(j + self.CHUNK_SIZE, total_group_rows)
+                            yield chunk.iloc[j:end]
+                        
+                except ImportError:
+                    # Fall back to pandas if pyarrow is not available
+                    self.progress.emit("PyArrow not available, falling back to pandas for Parquet reading")
+                    df = pd.read_parquet(file_path_str)
+                    
+                    # Clean column names
+                    df.columns = self.clean_column_names(df.columns)
+                    
+                    # Remove rows with all NaN values
+                    df = df.dropna(how='all')
+                    
+                    # Process in chunks
+                    total_rows = len(df)
+                    for i in range(0, total_rows, self.CHUNK_SIZE):
+                        end = min(i + self.CHUNK_SIZE, total_rows)
+                        yield df.iloc[i:end]
             else:
                 raise ValueError(f"Unsupported file format: {file_ext}")
             
         except Exception as e:
             self.error.emit(f"Error reading file: {str(e)}")
             return None
-    
-    def clean_column_names(self, columns):
-        """Clean and deduplicate column names"""
-        # Convert columns to list of strings
-        cols = [str(col) if col is not None else f"Column_{i+1}" for i, col in enumerate(columns)]
-        
-        # Replace empty strings with placeholder names
-        for i in range(len(cols)):
-            if cols[i].strip() == '':
-                cols[i] = f"Column_{i+1}"
-        
-        # Handle duplicate column names
-        seen = {}
-        for i in range(len(cols)):
-            col = cols[i]
-            if col in seen:
-                seen[col] += 1
-                cols[i] = f"{col}_{seen[col]}"
-            else:
-                seen[col] = 0
-                
-        return cols
-    
-    def run(self):
-        try:
-            self.progress.emit(f"Reading file: {self.file_path}")
-            
-            # Read the file
-            df_chunks = self.read_file()
-            if df_chunks is None or self.is_cancelled:
-                self.finished.emit()
-                return
-            
-            # Connect to the database
-            if self.is_duckdb:
-                conn = duckdb.connect(self.db_path)
-            else:
-                import sqlite3
-                conn = sqlite3.connect(self.db_path)
-            
-            # Process the first chunk to set up the table
-            try:
-                # Get the first chunk to analyze schema
-                first_chunk = next(df_chunks) if hasattr(df_chunks, '__next__') else df_chunks[0]
-                
-                # Clean column names for the first chunk
-                first_chunk.columns = self.clean_column_names(first_chunk.columns)
-                
-                self.progress.emit(f"File read successfully. Processing data...")
-                
-                # Check if we're using an existing table
-                if self.use_existing_table:
-                    # Get existing columns
-                    existing_columns = self.get_existing_columns(conn)
-                    
-                    # Add any missing columns
-                    self.add_missing_columns(conn, first_chunk, existing_columns)
-                    
-                    # Get updated list of columns after adding new ones
-                    existing_columns = self.get_existing_columns(conn)
-                    
-                    # Insert data with column matching
-                    self.insert_data_with_column_matching(conn, first_chunk, existing_columns)
-                else:
-                    # If replacing, drop the existing table first
-                    if self.replace_table:
-                        self.progress.emit(f"Replacing existing table '{self.table_name}'...")
-                        try:
-                            conn.execute(f"DROP TABLE IF EXISTS \"{self.table_name}\"")
-                        except Exception as e:
-                            self.error.emit(f"Error dropping existing table: {str(e)}")
-                            self.finished.emit()
-                            return
-                    
-                    # Create the table if it doesn't exist
-                    self.create_table_if_not_exists(conn, first_chunk)
-                    
-                    # For a new table, we can insert directly
-                    if self.is_duckdb:
-                        # For DuckDB, we can use the append method
-                        conn.register('df', first_chunk)
-                        conn.execute(f"INSERT INTO \"{self.table_name}\" SELECT * FROM df")
-                    else:
-                        # For SQLite, we need to use the pandas to_sql method
-                        first_chunk.to_sql(self.table_name, conn, if_exists='append', index=False)
-                
-                # Process remaining chunks if any
-                rows_imported = len(first_chunk)
-                chunk_count = 1
-                
-                # If df_chunks is a generator or list with more chunks
-                if hasattr(df_chunks, '__next__'):
-                    # Process remaining chunks from generator
-                    for chunk in df_chunks:
-                        if self.is_cancelled:
-                            break
-                        
-                        # Clean column names
-                        chunk.columns = self.clean_column_names(chunk.columns)
-                        
-                        # Check for and add any new columns that might be in this chunk
-                        existing_columns = self.get_existing_columns(conn)
-                        self.add_missing_columns(conn, chunk, existing_columns)
-                        
-                        # Get updated columns after potentially adding new ones
-                        existing_columns = self.get_existing_columns(conn)
-                        
-                        # Insert data with column matching
-                        self.insert_data_with_column_matching(conn, chunk, existing_columns)
-                        
-                        # Update progress
-                        rows_imported += len(chunk)
-                        chunk_count += 1
-                        self.progress.emit(f"Imported chunk {chunk_count}: {rows_imported} rows total...")
-                
-                elif isinstance(df_chunks, list) and len(df_chunks) > 1:
-                    # Process remaining chunks from list
-                    for i in range(1, len(df_chunks)):
-                        if self.is_cancelled:
-                            break
-                        
-                        chunk = df_chunks[i]
-                        
-                        # Clean column names
-                        chunk.columns = self.clean_column_names(chunk.columns)
-                        
-                        # Check for and add any new columns that might be in this chunk
-                        existing_columns = self.get_existing_columns(conn)
-                        self.add_missing_columns(conn, chunk, existing_columns)
-                        
-                        # Get updated columns after potentially adding new ones
-                        existing_columns = self.get_existing_columns(conn)
-                        
-                        # Insert data with column matching
-                        self.insert_data_with_column_matching(conn, chunk, existing_columns)
-                        
-                        # Update progress
-                        rows_imported += len(chunk)
-                        self.progress.emit(f"Imported chunk {i+1}: {rows_imported} rows total...")
-                
-            except StopIteration:
-                # No data in the file
-                self.error.emit("No data found in the file or file is empty.")
-                if self.is_duckdb:
-                    conn.close()
-                else:
-                    conn.close()
-                self.finished.emit()
-                return
-            
-            # Close the database connection
-            if self.is_duckdb:
-                conn.close()
-            else:
-                conn.commit()
-                conn.close()
-            
-            if not self.is_cancelled:
-                self.success.emit(f"Successfully imported {rows_imported} rows into {self.db_path}")
-                # Emit signal that table was created/updated
-                self.table_created.emit(self.db_path, self.table_name)
-            
-            self.finished.emit()
-            
-        except Exception as e:
-            self.error.emit(f"Error importing file: {str(e)}")
-            self.finished.emit()
     
     def cancel(self):
         self.is_cancelled = True
@@ -3603,19 +3901,23 @@ class MainWindow(QMainWindow):
                 self.query_tab.switch_to_database(db_path)
     
     def on_table_created(self, db_path, table_name):
-        """Handle table created/updated signal"""
-        # Make sure the database is selected
-        if self.db_selector.currentText() != db_path:
-            self.db_selector.setCurrentText(db_path)
-        
-        # Refresh the table list
-        self.query_tab.update_table_list()
-        
-        # Select the table in the list if it exists
-        for i in range(self.query_tab.table_list.count()):
-            if self.query_tab.table_list.item(i).text() == table_name:
-                self.query_tab.table_list.setCurrentRow(i)
-                break
+        """Handle signal when a table is created by import or merge process"""
+        # Update the database tables list
+        try:
+            # First check if we're already connected to this database
+            current_db = self.db_selector.currentText()
+            if current_db == db_path:
+                # Simply refresh the table list without switching databases
+                self.query_tab.update_table_list()
+            else:
+                # Switch to the database where the table was created
+                self.db_selector.setCurrentText(db_path)
+                # This will trigger on_database_selected which updates the table list
+        except Exception as e:
+            QMessageBox.warning(self, "Update Error", f"Failed to update table list: {str(e)}")
+            
+        # Focus the query tab
+        self.query_tab.setFocus()
 
     def import_single_file(self):
         """Open dialog to import a single file into a database"""
