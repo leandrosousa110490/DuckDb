@@ -637,7 +637,7 @@ class MergeFilesWorker(QObject):
             # Check for numeric columns
             if pd.api.types.is_numeric_dtype(sample_df[col]):
                 if pd.api.types.is_integer_dtype(sample_df[col]):
-                    column_types[col] = 'INTEGER'
+                    column_types[col] = 'BIGINT'
                 else:
                     column_types[col] = 'DOUBLE'
             # Check for datetime columns
@@ -3456,7 +3456,7 @@ class ImportFileWorker(QObject):
             # Check for numeric columns
             if pd.api.types.is_numeric_dtype(df[col]):
                 if pd.api.types.is_integer_dtype(df[col]):
-                    column_types[col] = 'INTEGER'
+                    column_types[col] = 'BIGINT'
                 else:
                     column_types[col] = 'DOUBLE'
             # Check for datetime columns
