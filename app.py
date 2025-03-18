@@ -584,7 +584,7 @@ class MergeFilesWorker(QObject):
     finished = pyqtSignal()     # Signal to emit when process is complete
     table_created = pyqtSignal(str, str)  # Signal to emit when a table is created (db_path, table_name)
     
-    CHUNK_SIZE = 50000  # Reduced chunk size for better memory management
+    CHUNK_SIZE = 25000  # Reduced chunk size for better memory management with large files
     
     def __init__(self, folder_path, db_path, table_name=None, use_existing_table=False, replace_table=False):
         super().__init__()
@@ -774,6 +774,11 @@ class MergeFilesWorker(QObject):
                 for col in missing_in_df:
                     df.loc[:, col] = None
             
+            # For tables with large numbers of columns, use a batched approach
+            if len(existing_columns) > 150:
+                self.progress.emit(f"Large number of columns detected ({len(existing_columns)}). Using batched insertion approach.")
+                return self._handle_large_column_count(conn, df, existing_columns)
+            
             # Create a new DataFrame that contains all columns from the table
             # This ensures we maintain column order and include all columns
             ordered_df = pd.DataFrame()
@@ -826,8 +831,149 @@ class MergeFilesWorker(QObject):
             
             self.progress.emit(f"Inserted {len(df)} rows with column alignment.")
         except Exception as e:
-            self.progress.emit(f"Error in column matching: {str(e)}. Will try to continue with next chunk.")
-            # Don't re-raise the exception so processing can continue
+            self.progress.emit(f"Error in data insertion: {str(e)}. Will try to continue with next chunk.")
+    
+    def _handle_large_column_count(self, conn, df, existing_columns):
+        """Handle insertion for tables with large numbers of columns by using column batches"""
+        try:
+            batch_size = 100  # Process columns in batches of 100
+            total_batches = (len(existing_columns) + batch_size - 1) // batch_size
+            num_rows = len(df)
+            
+            self.progress.emit(f"Processing {num_rows} rows with {len(existing_columns)} columns in {total_batches} batches")
+            
+            # Create a table of row IDs to join against if we're using DuckDB
+            if self.is_duckdb:
+                # Create temporary table for batch processing
+                row_ids = pd.DataFrame({'row_id': range(num_rows)})
+                conn.register('row_ids', row_ids)
+                conn.execute(f"CREATE TEMPORARY TABLE temp_row_ids AS SELECT * FROM row_ids")
+                
+                # Process each batch
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min((batch_idx + 1) * batch_size, len(existing_columns))
+                    batch_columns = existing_columns[start_idx:end_idx]
+                    
+                    if not batch_columns:
+                        continue
+                    
+                    # Create a DataFrame with the current batch of columns + row_id
+                    batch_df = pd.DataFrame({'row_id': range(num_rows)})
+                    for col in batch_columns:
+                        if col in df.columns:
+                            batch_df[col] = df[col].values
+                        else:
+                            batch_df[col] = None
+                    
+                    # Register the batch DataFrame
+                    conn.register('batch_df', batch_df)
+                    
+                    # Insert the batch using the row_id to align rows
+                    col_list = ', '.join([f'"{col}"' for col in batch_columns])
+                    
+                    try:
+                        # Update existing rows with this batch of columns
+                        conn.execute(f"""
+                            UPDATE "{self.table_name}" 
+                            SET ({col_list}) = (
+                                SELECT {col_list} 
+                                FROM batch_df 
+                                WHERE batch_df.row_id = {self.table_name}.row_id
+                            )
+                            WHERE EXISTS (
+                                SELECT 1 FROM batch_df WHERE batch_df.row_id = {self.table_name}.row_id
+                            )
+                        """)
+                        
+                        # Insert new rows that don't exist
+                        conn.execute(f"""
+                            INSERT INTO "{self.table_name}" ({col_list})
+                            SELECT {col_list}
+                            FROM batch_df
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM {self.table_name} 
+                                WHERE {self.table_name}.row_id = batch_df.row_id
+                            )
+                        """)
+                    except Exception as e:
+                        self.progress.emit(f"Error with batch {batch_idx+1}/{total_batches}: {str(e)}")
+                        # Try alternative method
+                        try:
+                            conn.execute(f"INSERT INTO \"{self.table_name}\" ({col_list}) SELECT {col_list} FROM batch_df")
+                        except Exception as e2:
+                            self.progress.emit(f"Alternative insertion also failed: {str(e2)}")
+                    
+                    self.progress.emit(f"Processed batch {batch_idx+1}/{total_batches} ({start_idx+1}-{end_idx}/{len(existing_columns)} columns)")
+                
+                # Clean up temporary tables
+                conn.execute("DROP TABLE IF EXISTS temp_row_ids")
+                
+            else:
+                # For SQLite, process in batches but do full inserts each time
+                # Get existing data if we need to update
+                existing_count = 0
+                cursor = conn.cursor()
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM \"{self.table_name}\"")
+                    existing_count = cursor.fetchone()[0]
+                except Exception:
+                    existing_count = 0
+                
+                if existing_count > 0:
+                    self.progress.emit(f"Table already has {existing_count} rows. Will append new data.")
+                
+                # For SQLite, just do a regular insert with all columns
+                try:
+                    # Create a new DataFrame with all columns
+                    ordered_df = pd.DataFrame()
+                    for col in existing_columns:
+                        if col in df.columns:
+                            ordered_df[col] = df[col]
+                        else:
+                            ordered_df[col] = None
+                    
+                    # Insert using pandas
+                    ordered_df.to_sql(self.table_name, conn, if_exists='append', index=False)
+                    self.progress.emit(f"Inserted all {num_rows} rows with {len(existing_columns)} columns")
+                except Exception as e:
+                    self.progress.emit(f"Error inserting data: {str(e)}. Trying batch mode...")
+                    
+                    # Process in batches
+                    for batch_idx in range(total_batches):
+                        start_idx = batch_idx * batch_size
+                        end_idx = min((batch_idx + 1) * batch_size, len(existing_columns))
+                        batch_columns = existing_columns[start_idx:end_idx]
+                        
+                        if not batch_columns:
+                            continue
+                        
+                        # Create a DataFrame with just this batch of columns
+                        batch_df = pd.DataFrame(index=range(num_rows))
+                        for col in batch_columns:
+                            if col in df.columns:
+                                batch_df[col] = df[col]
+                            else:
+                                batch_df[col] = None
+                        
+                        try:
+                            # Try to insert this batch
+                            batch_df.to_sql(f"{self.table_name}_batch", conn, if_exists='replace', index=False)
+                            
+                            # Now copy from the batch table to the main table
+                            col_list = ', '.join([f'"{col}"' for col in batch_columns])
+                            cursor.execute(f"INSERT INTO \"{self.table_name}\" ({col_list}) SELECT {col_list} FROM \"{self.table_name}_batch\"")
+                            conn.commit()
+                            
+                            self.progress.emit(f"Processed batch {batch_idx+1}/{total_batches} ({start_idx+1}-{end_idx}/{len(existing_columns)} columns)")
+                        except Exception as e2:
+                            self.progress.emit(f"Error with batch {batch_idx+1}/{total_batches}: {str(e2)}")
+            
+            self.progress.emit(f"Successfully inserted all data using batched approach")
+            return True
+        except Exception as e:
+            self.progress.emit(f"Error in batched insertion: {str(e)}")
+            return False
     
     def run(self):
         try:
@@ -845,13 +991,14 @@ class MergeFilesWorker(QObject):
                 conn = duckdb.connect(self.db_path)
                 # Increase memory limit for DuckDB
                 try:
-                    conn.execute("SET memory_limit='8GB'")
-                    conn.execute("PRAGMA threads=4")  # Use multiple threads for better performance
+                    conn.execute("SET memory_limit='16GB'")  # Increase from 8GB to 16GB
+                    conn.execute("PRAGMA threads=8")  # Use more threads for better performance
+                    conn.execute("SET temp_directory='./'")  # Use local directory for temp files
                 except Exception as e:
                     self.progress.emit(f"Notice: Could not set memory limits: {str(e)}")
             else:
                 import sqlite3
-                conn = sqlite3.connect(self.db_path, timeout=300)  # Increase timeout to 5 minutes
+                conn = sqlite3.connect(self.db_path, timeout=600)  # Increase timeout to 10 minutes
                 conn.execute("PRAGMA journal_mode=WAL")  # Use WAL mode for better performance
                 conn.execute("PRAGMA synchronous=NORMAL")  # Reduce synchronous mode for better performance
             
@@ -861,19 +1008,19 @@ class MergeFilesWorker(QObject):
             all_column_types = {}
             sample_df = None
             
-            # Sample up to 5 files to get a comprehensive schema
-            sample_files = files[:min(5, len(files))]
+            # Sample up to 10 files to get a more comprehensive schema
+            sample_files = files[:min(10, len(files))]
             for file in sample_files:
                 try:
-                    # Read a small sample to determine schema
+                    # Read a larger sample to better determine schema for files with many columns
                     if file.suffix.lower() == '.csv':
-                        temp_df = pd.read_csv(file, nrows=100)
+                        temp_df = pd.read_csv(file, nrows=500)  # Increased from 100 to 500
                     elif file.suffix.lower() in ['.xlsx', '.xls']:
-                        temp_df = pd.read_excel(file, nrows=100)
+                        temp_df = pd.read_excel(file, nrows=500)  # Increased from 100 to 500
                     else:  # parquet
                         temp_df = pd.read_parquet(file)
-                        if len(temp_df) > 100:
-                            temp_df = temp_df.iloc[:100]
+                        if len(temp_df) > 500:  # Increased from 100 to 500
+                            temp_df = temp_df.iloc[:500]
                     
                     # Clean column names
                     temp_df.columns = self.clean_column_names(temp_df.columns)
@@ -2851,7 +2998,7 @@ class ImportFileWorker(QObject):
     finished = pyqtSignal()     # Signal to emit when process is complete
     table_created = pyqtSignal(str, str)  # Signal to emit when a table is created (db_path, table_name)
     
-    CHUNK_SIZE = 50000  # Chunk size for better memory management
+    CHUNK_SIZE = 25000  # Reduced chunk size for better memory management
     
     def __init__(self, file_path, db_path, table_name, use_existing_table=False, replace_table=False, import_options=None):
         super().__init__()
@@ -2892,6 +3039,11 @@ class ImportFileWorker(QObject):
                 # Add missing columns to DataFrame with NULL values
                 for col in missing_in_df:
                     df.loc[:, col] = None
+            
+            # For tables with large numbers of columns, use a batched approach
+            if len(existing_columns) > 150:
+                self.progress.emit(f"Large number of columns detected ({len(existing_columns)}). Using batched insertion approach.")
+                return self._handle_large_column_count(conn, df, existing_columns)
             
             # Create a new DataFrame that contains all columns from the table
             # This ensures we maintain column order and include all columns
@@ -2969,13 +3121,14 @@ class ImportFileWorker(QObject):
                 conn = duckdb.connect(self.db_path)
                 # Increase memory limit for DuckDB
                 try:
-                    conn.execute("SET memory_limit='8GB'")
-                    conn.execute("PRAGMA threads=4")  # Use multiple threads for better performance
+                    conn.execute("SET memory_limit='16GB'")  # Increase memory limit
+                    conn.execute("PRAGMA threads=8")  # Use more threads for better performance
+                    conn.execute("SET temp_directory='./'")  # Use local directory for temp files
                 except Exception as e:
                     self.progress.emit(f"Notice: Could not set memory limits: {str(e)}")
             else:
                 import sqlite3
-                conn = sqlite3.connect(self.db_path, timeout=300)  # Increase timeout to 5 minutes
+                conn = sqlite3.connect(self.db_path, timeout=600)  # Increase timeout to 10 minutes
                 conn.execute("PRAGMA journal_mode=WAL")  # Use WAL mode for better performance
                 conn.execute("PRAGMA synchronous=NORMAL")  # Reduce synchronous mode for better performance
             
@@ -3722,6 +3875,148 @@ class ImportFileWorker(QObject):
     def cancel(self):
         self.is_cancelled = True
         self.progress.emit("Cancelling operation...")
+
+    def _handle_large_column_count(self, conn, df, existing_columns):
+        """Handle insertion for tables with large numbers of columns by using column batches"""
+        try:
+            batch_size = 100  # Process columns in batches of 100
+            total_batches = (len(existing_columns) + batch_size - 1) // batch_size
+            num_rows = len(df)
+            
+            self.progress.emit(f"Processing {num_rows} rows with {len(existing_columns)} columns in {total_batches} batches")
+            
+            # Create a table of row IDs to join against if we're using DuckDB
+            if self.is_duckdb:
+                # Create temporary table for batch processing
+                row_ids = pd.DataFrame({'row_id': range(num_rows)})
+                conn.register('row_ids', row_ids)
+                conn.execute(f"CREATE TEMPORARY TABLE temp_row_ids AS SELECT * FROM row_ids")
+                
+                # Process each batch
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min((batch_idx + 1) * batch_size, len(existing_columns))
+                    batch_columns = existing_columns[start_idx:end_idx]
+                    
+                    if not batch_columns:
+                        continue
+                    
+                    # Create a DataFrame with the current batch of columns + row_id
+                    batch_df = pd.DataFrame({'row_id': range(num_rows)})
+                    for col in batch_columns:
+                        if col in df.columns:
+                            batch_df[col] = df[col].values
+                        else:
+                            batch_df[col] = None
+                    
+                    # Register the batch DataFrame
+                    conn.register('batch_df', batch_df)
+                    
+                    # Insert the batch using the row_id to align rows
+                    col_list = ', '.join([f'"{col}"' for col in batch_columns])
+                    
+                    try:
+                        # Update existing rows with this batch of columns
+                        conn.execute(f"""
+                            UPDATE "{self.table_name}" 
+                            SET ({col_list}) = (
+                                SELECT {col_list} 
+                                FROM batch_df 
+                                WHERE batch_df.row_id = {self.table_name}.row_id
+                            )
+                            WHERE EXISTS (
+                                SELECT 1 FROM batch_df WHERE batch_df.row_id = {self.table_name}.row_id
+                            )
+                        """)
+                        
+                        # Insert new rows that don't exist
+                        conn.execute(f"""
+                            INSERT INTO "{self.table_name}" ({col_list})
+                            SELECT {col_list}
+                            FROM batch_df
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM {self.table_name} 
+                                WHERE {self.table_name}.row_id = batch_df.row_id
+                            )
+                        """)
+                    except Exception as e:
+                        self.progress.emit(f"Error with batch {batch_idx+1}/{total_batches}: {str(e)}")
+                        # Try alternative method
+                        try:
+                            conn.execute(f"INSERT INTO \"{self.table_name}\" ({col_list}) SELECT {col_list} FROM batch_df")
+                        except Exception as e2:
+                            self.progress.emit(f"Alternative insertion also failed: {str(e2)}")
+                    
+                    self.progress.emit(f"Processed batch {batch_idx+1}/{total_batches} ({start_idx+1}-{end_idx}/{len(existing_columns)} columns)")
+                
+                # Clean up temporary tables
+                conn.execute("DROP TABLE IF EXISTS temp_row_ids")
+                
+            else:
+                # For SQLite, process in batches but do full inserts each time
+                # Get existing data if we need to update
+                existing_count = 0
+                cursor = conn.cursor()
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM \"{self.table_name}\"")
+                    existing_count = cursor.fetchone()[0]
+                except Exception:
+                    existing_count = 0
+                
+                if existing_count > 0:
+                    self.progress.emit(f"Table already has {existing_count} rows. Will append new data.")
+                
+                # For SQLite, just do a regular insert with all columns
+                try:
+                    # Create a new DataFrame with all columns
+                    ordered_df = pd.DataFrame()
+                    for col in existing_columns:
+                        if col in df.columns:
+                            ordered_df[col] = df[col]
+                        else:
+                            ordered_df[col] = None
+                    
+                    # Insert using pandas
+                    ordered_df.to_sql(self.table_name, conn, if_exists='append', index=False)
+                    self.progress.emit(f"Inserted all {num_rows} rows with {len(existing_columns)} columns")
+                except Exception as e:
+                    self.progress.emit(f"Error inserting data: {str(e)}. Trying batch mode...")
+                    
+                    # Process in batches
+                    for batch_idx in range(total_batches):
+                        start_idx = batch_idx * batch_size
+                        end_idx = min((batch_idx + 1) * batch_size, len(existing_columns))
+                        batch_columns = existing_columns[start_idx:end_idx]
+                        
+                        if not batch_columns:
+                            continue
+                        
+                        # Create a DataFrame with just this batch of columns
+                        batch_df = pd.DataFrame(index=range(num_rows))
+                        for col in batch_columns:
+                            if col in df.columns:
+                                batch_df[col] = df[col]
+                            else:
+                                batch_df[col] = None
+                        
+                        try:
+                            # Try to insert this batch
+                            batch_df.to_sql(f"{self.table_name}_batch", conn, if_exists='replace', index=False)
+                            
+                            # Now copy from the batch table to the main table
+                            col_list = ', '.join([f'"{col}"' for col in batch_columns])
+                            cursor.execute(f"INSERT INTO \"{self.table_name}\" ({col_list}) SELECT {col_list} FROM \"{self.table_name}_batch\"")
+                            conn.commit()
+                            
+                            self.progress.emit(f"Processed batch {batch_idx+1}/{total_batches} ({start_idx+1}-{end_idx}/{len(existing_columns)} columns)")
+                        except Exception as e2:
+                            self.progress.emit(f"Error with batch {batch_idx+1}/{total_batches}: {str(e2)}")
+            
+            self.progress.emit(f"Successfully inserted all data using batched approach")
+            return True
+        except Exception as e:
+            self.progress.emit(f"Error in batched insertion: {str(e)}")
+            return False
 
 class MainWindow(QMainWindow):
     def __init__(self):
