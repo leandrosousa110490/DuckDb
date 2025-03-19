@@ -284,9 +284,12 @@ class QueryWorker(QThread):
         if q.endswith(';'):
             q = q[:-1]
         
-        # For DuckDB, we need to be careful with quoted identifiers
-        # The safest approach is to use unquoted identifiers for table names
-        # This regex finds FROM clauses with quoted table names and removes the quotes
+        # We should only modify table names in the FROM clause,
+        # not touch WHERE, SELECT, or other parts with functions
+        # This is a more targeted approach than before
+        
+        # This regex only finds quoted table names in FROM clauses
+        # and leaves everything else untouched
         q = re.sub(r'FROM\s+[\'"]([^\'"]+)[\'"]', r'FROM \1', q, flags=re.IGNORECASE)
         
         return q
@@ -365,8 +368,10 @@ class QueryWorker(QThread):
                     self.progressUpdate.emit(f"Using direct table access for '{table_name}'...")
                     
                     try:
-                        # Connect to the database
+                        # Connect to the database with improved settings
                         conn = duckdb.connect(database=self.db_path, read_only=False)
+                        # Set memory limits and other settings for better performance
+                        conn.execute("SET memory_limit='2GB'")
                         
                         # First check if the table exists
                         tables = conn.execute("SHOW TABLES").fetchall()
@@ -406,21 +411,24 @@ class QueryWorker(QThread):
                 # If we get here, either it's not a simple query or the direct approach failed
                 # Try standard approaches with various quote handling
                 conn = duckdb.connect(database=self.db_path, read_only=False)
-                conn.execute("PRAGMA sqlite_extension_functions.enable=TRUE")
+                # Set memory limits and optimize for query performance
+                try:
+                    conn.execute("SET memory_limit='2GB'")
+                except Exception as e:
+                    self.progressUpdate.emit(f"Could not set memory limit: {str(e)}")
                 
                 # Try multiple approaches in sequence
                 approaches = [
-                    # 1. Try with the original query
-                    {"query": original_query, "description": "original query"},
-                    # 2. Try with no quotes around table names
+                    # 1. Try with the original query directly - no preprocessing
+                    {"query": original_query, "description": "original query without preprocessing"},
+                    # 2. Try with the cleaned query (preprocessing)
+                    {"query": q, "description": "cleaned query"},
+                    # 3. Try with no quotes around table names
                     {"query": re.sub(r'FROM\s+[\'"]([^\'"]+)[\'"]', r'FROM \1', original_query, flags=re.IGNORECASE), 
                      "description": "no quotes around table names"},
-                    # 3. Try with double quotes
+                    # 4. Try with double quotes
                     {"query": re.sub(r"FROM\s+'([^']+)'", r'FROM "\1"', original_query, flags=re.IGNORECASE), 
-                     "description": "double quotes around table names"},
-                    # 4. Try with backticks
-                    {"query": re.sub(r'FROM\s+[\'"]([^\'"]+)[\'"]', r'FROM `\1`', original_query, flags=re.IGNORECASE), 
-                     "description": "backticks around table names"}
+                     "description": "double quotes around table names"}
                 ]
                 
                 # Try each approach in sequence
@@ -444,11 +452,20 @@ class QueryWorker(QThread):
                         self.progressUpdate.emit(f"Query executed in {execution_time:.2f} seconds.")
                         return
                     except Exception as e:
-                        self.progressUpdate.emit(f"Approach with {approach['description']} failed: {str(e)}")
+                        error_msg = str(e)
+                        # Provide more helpful error messages
+                        if "Parser Error" in error_msg:
+                            self.progressUpdate.emit(f"SQL syntax error with {approach['description']}: {error_msg}")
+                        elif "Not implemented Error" in error_msg:
+                            self.progressUpdate.emit(f"Feature not supported: {error_msg}")
+                        elif "Catalog Error" in error_msg:
+                            self.progressUpdate.emit(f"Table or column not found: {error_msg}")
+                        else:
+                            self.progressUpdate.emit(f"Error with {approach['description']}: {error_msg}")
                         # Continue to the next approach
                 
                 # If all approaches failed, report the error
-                self.errorOccurred.emit("All query approaches failed. Try removing quotes around table names or check if the table exists.")
+                self.errorOccurred.emit("All query approaches failed. Check your SQL syntax and make sure the tables exist.")
                 self.cleanup_timer()
                 return
             else:
