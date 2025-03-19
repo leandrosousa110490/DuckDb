@@ -506,16 +506,17 @@ class ExportWorker(QObject):
 
     CHUNK_SIZE = 50000  # Chunk size for better memory management
     
-    def __init__(self, df, file_path, format):
+    def __init__(self, df, file_path, format, delimiter=','):
         super().__init__()
         self.df = df
         self.file_path = file_path
         self.format = format
+        self.delimiter = delimiter
         self.is_cancelled = False
     
     def export_csv_in_chunks(self):
         # Write header first
-        self.df.iloc[0:0].to_csv(self.file_path, index=False)
+        self.df.iloc[0:0].to_csv(self.file_path, index=False, sep=self.delimiter)
         
         # Then append data in chunks
         total_rows = len(self.df)
@@ -526,7 +527,7 @@ class ExportWorker(QObject):
             end_idx = min(i + self.CHUNK_SIZE, total_rows)
             chunk = self.df.iloc[i:end_idx]
             
-            chunk.to_csv(self.file_path, mode='a', header=False, index=False)
+            chunk.to_csv(self.file_path, mode='a', header=False, index=False, sep=self.delimiter)
             
             progress_pct = min(100, int((end_idx / total_rows) * 100))
             self.progress.emit(f"Exporting CSV: {progress_pct}% complete ({end_idx}/{total_rows} rows)")
@@ -1426,6 +1427,62 @@ class QueryTab(QWidget):
                 file_path += extension
                 
             try:
+                # For CSV format, ask for delimiter
+                delimiter = ','
+                if format_type == 'csv':
+                    delimiter_dialog = QDialog(self)
+                    delimiter_dialog.setWindowTitle("CSV Export Options")
+                    dialog_layout = QVBoxLayout(delimiter_dialog)
+                    
+                    # Create form layout for options
+                    form_layout = QFormLayout()
+                    
+                    # Delimiter selection
+                    delimiter_combo = QComboBox()
+                    delimiter_combo.addItem("Comma (,)", ",")
+                    delimiter_combo.addItem("Semicolon (;)", ";")
+                    delimiter_combo.addItem("Tab (\\t)", "\t")
+                    delimiter_combo.addItem("Pipe (|)", "|")
+                    delimiter_combo.addItem("Custom", "custom")
+                    form_layout.addRow("Delimiter:", delimiter_combo)
+                    
+                    # Custom delimiter input (initially hidden)
+                    custom_delimiter_widget = QWidget()
+                    custom_layout = QHBoxLayout(custom_delimiter_widget)
+                    custom_layout.setContentsMargins(0, 0, 0, 0)
+                    custom_delimiter_input = QLineEdit()
+                    custom_delimiter_input.setPlaceholderText("Enter custom delimiter")
+                    custom_layout.addWidget(custom_delimiter_input)
+                    form_layout.addRow("Custom delimiter:", custom_delimiter_widget)
+                    custom_delimiter_widget.hide()
+                    
+                    # Show/hide custom delimiter input based on selection
+                    def on_delimiter_changed(index):
+                        if delimiter_combo.currentData() == "custom":
+                            custom_delimiter_widget.show()
+                        else:
+                            custom_delimiter_widget.hide()
+                    
+                    delimiter_combo.currentIndexChanged.connect(on_delimiter_changed)
+                    
+                    dialog_layout.addLayout(form_layout)
+                    
+                    # Add buttons
+                    button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+                    button_box.accepted.connect(delimiter_dialog.accept)
+                    button_box.rejected.connect(delimiter_dialog.reject)
+                    dialog_layout.addWidget(button_box)
+                    
+                    # Show dialog
+                    if delimiter_dialog.exec() == QDialog.DialogCode.Accepted:
+                        if delimiter_combo.currentData() == "custom":
+                            custom_value = custom_delimiter_input.text()
+                            delimiter = custom_value if custom_value else ","
+                        else:
+                            delimiter = delimiter_combo.currentData()
+                    else:
+                        return  # User cancelled
+                
                 # Create a progress dialog
                 progress_dialog = QProgressDialog("Exporting data...", "Cancel", 0, 0, self)
                 progress_dialog.setWindowTitle("Export Progress")
@@ -1435,7 +1492,7 @@ class QueryTab(QWidget):
                 progress_dialog.setAutoReset(False)
                 
                 # Create and configure the export worker
-                self.export_worker = ExportWorker(current_tab.current_df, file_path, format_type)
+                self.export_worker = ExportWorker(current_tab.current_df, file_path, format_type, delimiter)
                 
                 # Create a thread to run the worker
                 self.export_thread = QThread()
