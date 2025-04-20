@@ -9,6 +9,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QPalette, QColor, QAction, QSyntaxHighlighter, QTextCharFormat, QFont
 from PyQt6.QtCore import Qt, QRegularExpression, QThread, QObject, pyqtSignal
+import re
+import pandas as pd
+import csv
 
 DARK_STYLESHEET = """
     QWidget {
@@ -206,14 +209,20 @@ class ImportWorker(QObject):
 class QueryWorker(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str)
-    success = pyqtSignal(list, list) # Emit data (list of rows) and headers (list of strings)
+    success = pyqtSignal(list, list, int) # Emit data (list of rows), headers (list of strings), and total count
+    progress = pyqtSignal(int, int)  # current, total
 
-    def __init__(self, db_conn_func, query):
+    def __init__(self, db_conn_func, query, limit=1000, offset=0):
         super().__init__()
         self.db_conn_func = db_conn_func
         self.query = query
-        # Cancellation for queries is harder; DuckDB might not support it easily mid-execution.
-        # We won't implement explicit cancellation for query worker for now.
+        self.limit = limit
+        self.offset = offset
+        self.is_cancelled = False
+        
+    def cancel(self):
+        self.is_cancelled = True
+        print("Query worker received cancel signal.")
 
     def run(self):
         db_conn = None
@@ -223,22 +232,79 @@ class QueryWorker(QObject):
                 raise ConnectionError("Failed to establish database connection in query worker thread.")
 
             print(f"Query Worker executing: {self.query[:100]}...")
-            result_relation = db_conn.execute(self.query)
+            
+            # First check if this is a SELECT query and get total count if it is
+            is_select = self.query.strip().upper().startswith("SELECT")
+            total_count = 0
+            
+            if is_select:
+                # Wrap original query in a count query to get total rows
+                # Use a subquery to ensure we're counting the actual result set
+                count_query = f"SELECT COUNT(*) FROM ({self.query}) AS count_subquery"
+                try:
+                    count_result = db_conn.execute(count_query).fetchone()
+                    if count_result:
+                        total_count = count_result[0]
+                        print(f"Total result count: {total_count}")
+                except Exception as count_e:
+                    print(f"Warning: Could not get count: {count_e}")
+                    # Continue anyway - we'll still fetch what we can
+                
+                # If it's a SELECT query, add LIMIT and OFFSET for pagination
+                # Only if the query doesn't already have a LIMIT clause
+                if not re.search(r'\bLIMIT\b\s+\d+', self.query, re.IGNORECASE):
+                    paginated_query = f"{self.query} LIMIT {self.limit} OFFSET {self.offset}"
+                else:
+                    paginated_query = self.query
+            else:
+                paginated_query = self.query
+
+            # Execute the query (paginated for SELECT)
+            result_relation = db_conn.execute(paginated_query)
+
+            # Check if cancelled
+            if self.is_cancelled:
+                raise InterruptedError("Query execution was cancelled")
 
             data = []
             headers = []
             if result_relation.description:
                 headers = [desc[0] for desc in result_relation.description]
-                # Fetch potentially large results. Could optimize later if needed (fetchmany).
-                data = result_relation.fetchall()
+                
+                # Use fetchmany for more control and to avoid loading everything at once
+                fetched_count = 0
+                while True:
+                    # Fetch a batch of rows (100 at a time)
+                    batch = result_relation.fetchmany(100)
+                    if not batch:
+                        break
+                        
+                    data.extend(batch)
+                    fetched_count += len(batch)
+                    
+                    # Report progress
+                    if total_count > 0:
+                        self.progress.emit(fetched_count, min(total_count, self.limit))
+                    
+                    # Check if we should stop (either cancelled or hit limit)
+                    if self.is_cancelled:
+                        raise InterruptedError("Query execution was cancelled")
+                        
+                    if fetched_count >= self.limit:
+                        break
+                
                 print(f"Query Worker fetched {len(data)} rows.")
-                self.success.emit(data, headers)
+                self.success.emit(data, headers, total_count)
             else:
                 # Non-SELECT query (no data/headers to emit, but signal success)
                 print("Query Worker executed non-SELECT query.")
-                # Emit empty lists to signify non-SELECT success
-                self.success.emit([], [])
+                # Emit empty lists to signify non-SELECT success, still include total count
+                self.success.emit([], [], 0)
 
+        except InterruptedError as interrupt_e:
+            error_message = f"Query cancelled: {interrupt_e}"
+            print(error_message)
+            self.error.emit(error_message)
         except Exception as e:
             import traceback
             tb_str = traceback.format_exc()
@@ -250,6 +316,167 @@ class QueryWorker(QObject):
                 db_conn.close()
                 print("Query Worker DB connection closed.")
             self.finished.emit()
+
+# --- Worker for Exports ---
+class ExportWorker(QObject):
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+    success = pyqtSignal(str)
+    progress = pyqtSignal(int, int)  # current, total
+    
+    def __init__(self, export_type, data, file_path, **kwargs):
+        super().__init__()
+        self.export_type = export_type  # 'csv', 'excel', or 'parquet'
+        self.data = data
+        self.file_path = file_path
+        self.kwargs = kwargs
+        self.is_cancelled = False
+    
+    def cancel(self):
+        self.is_cancelled = True
+        print("Export worker received cancel signal.")
+    
+    def run(self):
+        try:
+            # Report start
+            self.progress.emit(0, 100)
+            
+            # Export batches of data to avoid freezing
+            total_rows = len(self.data)
+            batch_size = 5000  # Adjust based on your needs
+            
+            if self.export_type == 'csv':
+                self.export_to_csv()
+            elif self.export_type == 'excel':
+                self.export_to_excel()
+            elif self.export_type == 'parquet':
+                self.export_to_parquet()
+            else:
+                raise ValueError(f"Unknown export type: {self.export_type}")
+            
+            self.success.emit(f"Data exported successfully to {self.file_path}")
+        
+        except InterruptedError as interrupt_e:
+            error_message = f"Export cancelled: {interrupt_e}"
+            print(error_message)
+            self.error.emit(error_message)
+        except Exception as e:
+            import traceback
+            tb_str = traceback.format_exc()
+            error_message = f"Error during export: {e}\n{tb_str}"
+            print(error_message)
+            self.error.emit(error_message)
+        finally:
+            self.finished.emit()
+    
+    def export_to_csv(self):
+        """Export data to CSV file with progress updates."""
+        import csv
+        
+        delimiter = self.kwargs.get('delimiter', ',')
+        total_rows = len(self.data)
+        batch_size = 5000
+        
+        try:
+            with open(self.file_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f, delimiter=delimiter)
+                
+                # Write header
+                writer.writerow(self.data.columns)
+                
+                # Write data in batches
+                rows_written = 0
+                for start_idx in range(0, total_rows, batch_size):
+                    if self.is_cancelled:
+                        raise InterruptedError("Export was cancelled")
+                        
+                    end_idx = min(start_idx + batch_size, total_rows)
+                    batch = self.data.iloc[start_idx:end_idx]
+                    
+                    # Write each row in the batch
+                    for _, row in batch.iterrows():
+                        writer.writerow(row)
+                    
+                    rows_written += len(batch)
+                    self.progress.emit(rows_written, total_rows)
+                    
+                    # Small sleep to keep UI responsive
+                    QThread.msleep(1)
+        except Exception as e:
+            print(f"CSV export error: {e}")
+            raise
+    
+    def export_to_excel(self):
+        """Export data to Excel file with progress updates."""
+        total_rows = len(self.data)
+        
+        try:
+            # For very large datasets, use the openpyxl engine with batch processing
+            if total_rows > 100000:
+                self._export_excel_batched()
+            else:
+                # For smaller datasets, use the simpler approach
+                self.progress.emit(10, 100)  # Starting
+                self.data.to_excel(self.file_path, index=False)
+                self.progress.emit(100, 100)  # Completed
+        except Exception as e:
+            print(f"Excel export error: {e}")
+            raise
+    
+    def _export_excel_batched(self):
+        """Export data to Excel in batches for very large datasets."""
+        import openpyxl
+        from openpyxl.utils.dataframe import dataframe_to_rows
+        
+        total_rows = len(self.data)
+        batch_size = 5000
+        
+        # Create a new workbook
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        
+        # Add headers
+        self.progress.emit(1, 100)
+        headers = list(self.data.columns)
+        ws.append(headers)
+        
+        # Write data in batches
+        rows_written = 0
+        for start_idx in range(0, total_rows, batch_size):
+            if self.is_cancelled:
+                raise InterruptedError("Export was cancelled")
+                
+            end_idx = min(start_idx + batch_size, total_rows)
+            batch = self.data.iloc[start_idx:end_idx]
+            
+            # Add each row from the batch to the worksheet
+            for row in dataframe_to_rows(batch, index=False, header=False):
+                ws.append(row)
+            
+            rows_written += len(batch)
+            progress = int(min((rows_written / total_rows) * 100, 99))
+            self.progress.emit(progress, 100)
+            
+            # Small sleep to keep UI responsive
+            QThread.msleep(1)
+        
+        # Save the workbook
+        wb.save(self.file_path)
+        self.progress.emit(100, 100)
+    
+    def export_to_parquet(self):
+        """Export data to Parquet file."""
+        try:
+            self.progress.emit(10, 100)  # Starting
+            
+            # Parquet is efficient and doesn't need the same batching approach
+            # The pyarrow library handles large datasets well
+            self.data.to_parquet(self.file_path, index=False)
+            
+            self.progress.emit(100, 100)  # Completed
+        except Exception as e:
+            print(f"Parquet export error: {e}")
+            raise
 
 class DuckDBApp(QMainWindow):
     def __init__(self):
@@ -582,6 +809,19 @@ class DuckDBApp(QMainWindow):
         if not query:
             QMessageBox.warning(self, "Warning", "Query cannot be empty.")
             return
+            
+        # Store state for pagination
+        self.current_query = query
+        self.current_page = 0
+        self.rows_per_page = 1000  # Default page size
+        self.total_rows = 0
+        
+        # --- Setup Progress Dialog ---
+        self.query_progress = QProgressDialog("Executing query...", "Cancel", 0, 100, self)
+        self.query_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.query_progress.setMinimumDuration(300)  # Show after 300ms delay
+        self.query_progress.setWindowTitle("Executing Query")
+        self.query_progress.setValue(0)
         
         # --- Show Loading Indicator (e.g., change button text/disable) --- 
         # Find the button - assumes it's the last widget in query_layout
@@ -601,7 +841,12 @@ class DuckDBApp(QMainWindow):
 
         # --- Setup Thread and Worker ---
         self.query_thread = QThread(self)
-        self.query_worker = QueryWorker(self._get_new_db_connection, query)
+        self.query_worker = QueryWorker(
+            self._get_new_db_connection, 
+            query, 
+            limit=self.rows_per_page, 
+            offset=self.current_page * self.rows_per_page
+        )
         self.query_worker.moveToThread(self.query_thread)
 
         # --- Connect Signals/Slots ---
@@ -612,36 +857,189 @@ class DuckDBApp(QMainWindow):
 
         self.query_worker.error.connect(self._on_query_error)
         self.query_worker.success.connect(self._on_query_success)
+        self.query_worker.progress.connect(self._on_query_progress)
         self.query_worker.finished.connect(self._on_query_finished)
-        # No cancellation signal for query progress dialog for now
+        self.query_progress.canceled.connect(self.query_worker.cancel)
 
         # --- Start Thread ---
         self.query_thread.start()
 
     # --- Query UI Update Slots ---
-    def _on_query_success(self, data, headers):
+    def _on_query_progress(self, current, total):
+        """Updates the progress dialog during query execution."""
+        if hasattr(self, 'query_progress') and self.query_progress:
+            if total > 0:
+                percentage = min(int((current / total) * 100), 100)
+                self.query_progress.setValue(percentage)
+                self.query_progress.setLabelText(f"Fetched {current} of {total} rows...")
+            else:
+                self.query_progress.setValue(0)
+                self.query_progress.setLabelText(f"Fetched {current} rows...")
+
+    def _on_query_success(self, data, headers, total_count):
         """Handles successful query execution in the UI thread."""
         print(f"Query Success (UI Thread): Received {len(data)} rows.")
+        
+        # Store total count for pagination
+        self.total_rows = total_count
+        
         if headers: # SELECT query with results
-            self.results_table.setRowCount(0) # Ensure clear before populating
-            self.results_table.setColumnCount(len(headers))
-            self.results_table.setHorizontalHeaderLabels(headers)
-
-            self.results_table.setRowCount(len(data))
-            for row_idx, row_data in enumerate(data):
-                for col_idx, cell_data in enumerate(row_data):
-                    item = QTableWidgetItem(str(cell_data))
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    self.results_table.setItem(row_idx, col_idx, item)
+            # Update table with the returned data
+            self._populate_results_table(data, headers)
             
-            self.results_table.resizeColumnsToContents()
-            QMessageBox.information(self, "Success", f"Query executed successfully.\n{len(data)} rows returned.")
+            # Show pagination controls if we have a large result set
+            if total_count > self.rows_per_page:
+                pagination_msg = f"Showing page {self.current_page + 1} of {(total_count + self.rows_per_page - 1) // self.rows_per_page} " + \
+                                 f"(rows {self.current_page * self.rows_per_page + 1}-{min((self.current_page + 1) * self.rows_per_page, total_count)} of {total_count})"
+                QMessageBox.information(self, "Success", f"Query executed successfully.\n{pagination_msg}")
+                
+                # Add pagination UI if not already present
+                self._ensure_pagination_controls()
+            else:
+                QMessageBox.information(self, "Success", f"Query executed successfully.\n{len(data)} rows returned.")
         else: # Non-SELECT query successful
             self.results_table.setRowCount(0)
             self.results_table.setColumnCount(0)
             QMessageBox.information(self, "Success", "Query executed successfully (no results returned).")
             # Reload tables in case the schema changed (e.g., CREATE TABLE, DROP TABLE)
             self.load_tables()
+    
+    def _populate_results_table(self, data, headers):
+        """Efficiently populate the results table with data."""
+        # Temporarily turn off sorting to improve performance
+        self.results_table.setSortingEnabled(False)
+        
+        # Clear and set up the table
+        self.results_table.setRowCount(0)
+        self.results_table.setColumnCount(len(headers))
+        self.results_table.setHorizontalHeaderLabels(headers)
+        
+        # Pre-allocate rows
+        self.results_table.setRowCount(len(data))
+        
+        # Use batch processing to reduce UI updates
+        # Block signals while populating to avoid individual cell change events
+        self.results_table.blockSignals(True)
+        
+        for row_idx, row_data in enumerate(data):
+            for col_idx, cell_data in enumerate(row_data):
+                item = QTableWidgetItem(str(cell_data) if cell_data is not None else "NULL")
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.results_table.setItem(row_idx, col_idx, item)
+        
+        # Restore signals when done
+        self.results_table.blockSignals(False)
+        
+        # Re-enable sorting
+        self.results_table.setSortingEnabled(True)
+        
+        # Adjust column widths - but limit to reasonable size
+        self.results_table.horizontalHeader().setMinimumSectionSize(50)
+        self.results_table.horizontalHeader().setDefaultSectionSize(150)
+        self.results_table.resizeColumnsToContents()
+        
+        # Set a max width for columns to avoid excessively wide columns
+        for col in range(self.results_table.columnCount()):
+            current_width = self.results_table.columnWidth(col)
+            if current_width > 300:
+                self.results_table.setColumnWidth(col, 300)
+
+    def _ensure_pagination_controls(self):
+        """Create or update pagination controls if needed."""
+        # Check if we already have a layout with buttons below the results table
+        if not hasattr(self, 'pagination_widget'):
+            # Create pagination widgets
+            self.pagination_widget = QWidget()
+            pagination_layout = QHBoxLayout(self.pagination_widget)
+            
+            self.page_info_label = QLabel()
+            pagination_layout.addWidget(self.page_info_label)
+            
+            pagination_layout.addStretch()
+            
+            self.prev_page_button = QPushButton("Previous Page")
+            self.prev_page_button.clicked.connect(self._load_prev_page)
+            pagination_layout.addWidget(self.prev_page_button)
+            
+            self.next_page_button = QPushButton("Next Page")
+            self.next_page_button.clicked.connect(self._load_next_page)
+            pagination_layout.addWidget(self.next_page_button)
+            
+            # Add to the layout that contains the results table
+            results_parent_layout = self.results_table.parent().layout()
+            results_parent_layout.addWidget(self.pagination_widget)
+        
+        # Update pagination status
+        total_pages = (self.total_rows + self.rows_per_page - 1) // self.rows_per_page
+        start_row = self.current_page * self.rows_per_page + 1
+        end_row = min((self.current_page + 1) * self.rows_per_page, self.total_rows)
+        
+        self.page_info_label.setText(f"Page {self.current_page + 1} of {total_pages} (rows {start_row}-{end_row} of {self.total_rows})")
+        
+        # Enable/disable buttons based on current page
+        self.prev_page_button.setEnabled(self.current_page > 0)
+        self.next_page_button.setEnabled(self.current_page < total_pages - 1)
+        
+        # Show the pagination controls
+        self.pagination_widget.setVisible(True)
+    
+    def _load_prev_page(self):
+        """Load the previous page of results."""
+        if self.current_page > 0:
+            self.current_page -= 1
+            self._load_current_page()
+    
+    def _load_next_page(self):
+        """Load the next page of results."""
+        total_pages = (self.total_rows + self.rows_per_page - 1) // self.rows_per_page
+        if self.current_page < total_pages - 1:
+            self.current_page += 1
+            self._load_current_page()
+    
+    def _load_current_page(self):
+        """Load the current page of results."""
+        if not hasattr(self, 'current_query') or not self.current_query:
+            return
+            
+        # Show a progress dialog
+        self.query_progress = QProgressDialog("Loading page...", "Cancel", 0, 100, self)
+        self.query_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.query_progress.setMinimumDuration(300)
+        self.query_progress.setWindowTitle("Loading Results")
+        self.query_progress.setValue(0)
+        
+        # Setup thread and worker
+        self.query_thread = QThread(self)
+        self.query_worker = QueryWorker(
+            self._get_new_db_connection, 
+            self.current_query, 
+            limit=self.rows_per_page, 
+            offset=self.current_page * self.rows_per_page
+        )
+        self.query_worker.moveToThread(self.query_thread)
+        
+        # Connect signals
+        self.query_thread.started.connect(self.query_worker.run)
+        self.query_worker.finished.connect(self.query_thread.quit)
+        self.query_worker.finished.connect(self.query_worker.deleteLater)
+        self.query_thread.finished.connect(self.query_thread.deleteLater)
+        
+        self.query_worker.error.connect(self._on_query_error)
+        self.query_worker.success.connect(self._on_page_loaded)
+        self.query_worker.progress.connect(self._on_query_progress)
+        self.query_worker.finished.connect(self._on_query_finished)
+        self.query_progress.canceled.connect(self.query_worker.cancel)
+        
+        # Start thread
+        self.query_thread.start()
+    
+    def _on_page_loaded(self, data, headers, total_count):
+        """Handle loading a new page of results."""
+        # Update the results table with the new page data
+        self._populate_results_table(data, headers)
+        
+        # Update pagination controls
+        self._ensure_pagination_controls()
 
     def _on_query_error(self, error_message):
         """Handles query errors in the UI thread."""
@@ -653,6 +1051,11 @@ class DuckDBApp(QMainWindow):
     def _on_query_finished(self):
         """Cleans up after query execution in the UI thread."""
         print("Query thread finished.")
+        
+        # Close the progress dialog if it exists
+        if hasattr(self, 'query_progress') and self.query_progress:
+            self.query_progress.close()
+            
         # Restore button state
         # Find the button again (or use self.run_query_button if set up)
         run_button = self.query_editor.parent().layout().itemAt(self.query_editor.parent().layout().count() - 1).widget()
@@ -1270,23 +1673,89 @@ class DuckDBApp(QMainWindow):
         try:
             import pandas as pd
             
+            # For very large tables, this could be slow
+            # First, check if we have stored the full result set for pagination
+            if hasattr(self, 'current_query') and self.current_query and hasattr(self, 'total_rows') and self.total_rows > self.rows_per_page:
+                # For large result sets, directly query the database to avoid UI freezing
+                try:
+                    # Show progress dialog for direct database query
+                    progress = QProgressDialog("Preparing data for export...", "Cancel", 0, 100, self)
+                    progress.setWindowModality(Qt.WindowModality.WindowModal)
+                    progress.setMinimumDuration(300)
+                    progress.setValue(10)
+                    
+                    # Create a temporary connection and get all data directly
+                    temp_conn = self._get_new_db_connection()
+                    if temp_conn:
+                        progress.setValue(20)
+                        # Process in batches with pd.read_sql_query to avoid memory issues
+                        # First, make sure we don't have LIMIT or OFFSET in the original query
+                        query = self.current_query
+                        # Remove any existing LIMIT clause
+                        if re.search(r'\bLIMIT\b\s+\d+', query, re.IGNORECASE):
+                            query = re.sub(r'\bLIMIT\b\s+\d+', '', query, flags=re.IGNORECASE)
+                        # Remove any existing OFFSET clause
+                        if re.search(r'\bOFFSET\b\s+\d+', query, re.IGNORECASE):
+                            query = re.sub(r'\bOFFSET\b\s+\d+', '', query, flags=re.IGNORECASE)
+                            
+                        progress.setValue(30)
+                        df = pd.read_sql_query(query, temp_conn)
+                        progress.setValue(90)
+                        temp_conn.close()
+                        progress.setValue(100)
+                        progress.close()
+                        return df
+                except Exception as e:
+                    print(f"Could not export full result set directly: {e}")
+                    # Fall back to UI table data
+                    if progress:
+                        progress.close()
+            
             # Get column headers
             headers = []
             for col in range(self.results_table.columnCount()):
                 header_item = self.results_table.horizontalHeaderItem(col)
                 headers.append(header_item.text() if header_item else f"Column{col}")
             
-            # Get data from table
+            # Get data from table (for when direct database access fails or for smaller datasets)
             data = []
-            for row in range(self.results_table.rowCount()):
-                row_data = []
-                for col in range(self.results_table.columnCount()):
-                    item = self.results_table.item(row, col)
-                    # Handle null values
-                    value = item.text() if item else None
-                    row_data.append(value)
-                data.append(row_data)
+            total_rows = self.results_table.rowCount()
             
+            # Show progress for larger tables
+            progress = None
+            if total_rows > 1000:
+                progress = QProgressDialog("Reading table data...", "Cancel", 0, total_rows, self)
+                progress.setWindowModality(Qt.WindowModality.WindowModal)
+                progress.setMinimumDuration(300)
+            
+            # Process in batches
+            batch_size = 1000
+            for start_row in range(0, total_rows, batch_size):
+                end_row = min(start_row + batch_size, total_rows)
+                
+                if progress:
+                    progress.setValue(start_row)
+                    if progress.wasCanceled():
+                        if progress:
+                            progress.close()
+                        return None
+                
+                # Process this batch
+                for row in range(start_row, end_row):
+                    row_data = []
+                    for col in range(self.results_table.columnCount()):
+                        item = self.results_table.item(row, col)
+                        # Handle null values
+                        value = item.text() if item else None
+                        # Convert "NULL" string to None
+                        if value == "NULL":
+                            value = None
+                        row_data.append(value)
+                    data.append(row_data)
+            
+            if progress:
+                progress.close()
+                
             # Create DataFrame
             df = pd.DataFrame(data, columns=headers)
             return df
@@ -1353,13 +1822,38 @@ class DuckDBApp(QMainWindow):
             if not ok or not custom_delimiter:
                 return  # User cancelled or entered empty delimiter
             selected_delimiter = custom_delimiter
-            
-        try:
-            # Export to CSV with selected delimiter
-            df.to_csv(file_path, sep=selected_delimiter, index=False)
-            QMessageBox.information(self, "Success", f"Data exported successfully to {file_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to export data to CSV:\n{e}")
+        
+        # --- Setup Progress Dialog ---
+        self.export_progress = QProgressDialog("Exporting data to CSV...", "Cancel", 0, 100, self)
+        self.export_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.export_progress.setMinimumDuration(300)
+        self.export_progress.setWindowTitle("Exporting Data")
+        self.export_progress.setValue(0)
+        
+        # --- Setup Thread and Worker ---
+        self.export_thread = QThread(self)
+        self.export_worker = ExportWorker(
+            'csv', 
+            df, 
+            file_path, 
+            delimiter=selected_delimiter
+        )
+        self.export_worker.moveToThread(self.export_thread)
+        
+        # --- Connect Signals/Slots ---
+        self.export_thread.started.connect(self.export_worker.run)
+        self.export_worker.finished.connect(self.export_thread.quit)
+        self.export_worker.finished.connect(self.export_worker.deleteLater)
+        self.export_thread.finished.connect(self.export_thread.deleteLater)
+        
+        self.export_worker.error.connect(self._on_export_error)
+        self.export_worker.success.connect(self._on_export_success)
+        self.export_worker.progress.connect(self._on_export_progress)
+        self.export_worker.finished.connect(self._on_export_finished)
+        self.export_progress.canceled.connect(self.export_worker.cancel)
+        
+        # --- Start Thread ---
+        self.export_thread.start()
     
     def export_to_excel(self):
         """Export current query results to an Excel file."""
@@ -1390,13 +1884,37 @@ class DuckDBApp(QMainWindow):
         # Add .xlsx extension if not present
         if not file_path.lower().endswith('.xlsx'):
             file_path += '.xlsx'
-            
-        try:
-            # Export to Excel
-            df.to_excel(file_path, index=False)
-            QMessageBox.information(self, "Success", f"Data exported successfully to {file_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to export data to Excel:\n{e}")
+        
+        # --- Setup Progress Dialog ---
+        self.export_progress = QProgressDialog("Exporting data to Excel...", "Cancel", 0, 100, self)
+        self.export_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.export_progress.setMinimumDuration(300)
+        self.export_progress.setWindowTitle("Exporting Data")
+        self.export_progress.setValue(0)
+        
+        # --- Setup Thread and Worker ---
+        self.export_thread = QThread(self)
+        self.export_worker = ExportWorker(
+            'excel', 
+            df, 
+            file_path
+        )
+        self.export_worker.moveToThread(self.export_thread)
+        
+        # --- Connect Signals/Slots ---
+        self.export_thread.started.connect(self.export_worker.run)
+        self.export_worker.finished.connect(self.export_thread.quit)
+        self.export_worker.finished.connect(self.export_worker.deleteLater)
+        self.export_thread.finished.connect(self.export_thread.deleteLater)
+        
+        self.export_worker.error.connect(self._on_export_error)
+        self.export_worker.success.connect(self._on_export_success)
+        self.export_worker.progress.connect(self._on_export_progress)
+        self.export_worker.finished.connect(self._on_export_finished)
+        self.export_progress.canceled.connect(self.export_worker.cancel)
+        
+        # --- Start Thread ---
+        self.export_thread.start()
     
     def export_to_parquet(self):
         """Export current query results to a Parquet file."""
@@ -1427,13 +1945,66 @@ class DuckDBApp(QMainWindow):
         # Add .parquet extension if not present
         if not file_path.lower().endswith('.parquet'):
             file_path += '.parquet'
+        
+        # --- Setup Progress Dialog ---
+        self.export_progress = QProgressDialog("Exporting data to Parquet...", "Cancel", 0, 100, self)
+        self.export_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.export_progress.setMinimumDuration(300)
+        self.export_progress.setWindowTitle("Exporting Data")
+        self.export_progress.setValue(0)
+        
+        # --- Setup Thread and Worker ---
+        self.export_thread = QThread(self)
+        self.export_worker = ExportWorker(
+            'parquet', 
+            df, 
+            file_path
+        )
+        self.export_worker.moveToThread(self.export_thread)
+        
+        # --- Connect Signals/Slots ---
+        self.export_thread.started.connect(self.export_worker.run)
+        self.export_worker.finished.connect(self.export_thread.quit)
+        self.export_worker.finished.connect(self.export_worker.deleteLater)
+        self.export_thread.finished.connect(self.export_thread.deleteLater)
+        
+        self.export_worker.error.connect(self._on_export_error)
+        self.export_worker.success.connect(self._on_export_success)
+        self.export_worker.progress.connect(self._on_export_progress)
+        self.export_worker.finished.connect(self._on_export_finished)
+        self.export_progress.canceled.connect(self.export_worker.cancel)
+        
+        # --- Start Thread ---
+        self.export_thread.start()
+    
+    # --- Export UI Update Slots ---
+    def _on_export_progress(self, current, total):
+        """Updates the progress dialog during export."""
+        if hasattr(self, 'export_progress') and self.export_progress:
+            if total > 0:
+                percentage = min(int((current / total) * 100), 100)
+                self.export_progress.setValue(percentage)
+                self.export_progress.setLabelText(f"Exported {current} of {total} rows...")
+            else:
+                self.export_progress.setValue(0)
+    
+    def _on_export_success(self, message):
+        """Handles successful export in the UI thread."""
+        QMessageBox.information(self, "Success", message)
+    
+    def _on_export_error(self, error_message):
+        """Handles export errors in the UI thread."""
+        QMessageBox.critical(self, "Export Error", error_message)
+    
+    def _on_export_finished(self):
+        """Cleans up after export in the UI thread."""
+        # Close the progress dialog if it exists
+        if hasattr(self, 'export_progress') and self.export_progress:
+            self.export_progress.close()
             
-        try:
-            # Export to Parquet
-            df.to_parquet(file_path, index=False)
-            QMessageBox.information(self, "Success", f"Data exported successfully to {file_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to export data to Parquet:\n{e}")
+        # Clean up references
+        self.export_thread = None
+        self.export_worker = None
 
 
 if __name__ == "__main__":
