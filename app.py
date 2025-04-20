@@ -258,9 +258,48 @@ class DuckDBApp(QMainWindow):
         self.setGeometry(100, 100, 1200, 800)
         self.db_conn = None
         self.db_path = None
-
+        self.recent_dbs = []
+        self.max_recent_dbs = 5
+        
+        # Load recent databases
+        self.load_recent_dbs()
+        
         self.init_ui()
         self.apply_dark_theme()
+
+    def load_recent_dbs(self):
+        """Load list of recently opened databases from file."""
+        try:
+            recent_dbs_file = os.path.join(os.path.expanduser("~"), ".duckdb_recent")
+            if os.path.exists(recent_dbs_file):
+                with open(recent_dbs_file, "r") as f:
+                    self.recent_dbs = [line.strip() for line in f.readlines() if os.path.exists(line.strip())]
+                    # Only keep existing files
+                    self.recent_dbs = self.recent_dbs[:self.max_recent_dbs]
+        except Exception as e:
+            print(f"Error loading recent databases: {e}")
+            self.recent_dbs = []
+            
+    def save_recent_dbs(self):
+        """Save list of recently opened databases to file."""
+        try:
+            recent_dbs_file = os.path.join(os.path.expanduser("~"), ".duckdb_recent")
+            with open(recent_dbs_file, "w") as f:
+                for db_path in self.recent_dbs:
+                    f.write(f"{db_path}\n")
+        except Exception as e:
+            print(f"Error saving recent databases: {e}")
+            
+    def add_to_recent_dbs(self, db_path):
+        """Add a database path to the recent list."""
+        if db_path in self.recent_dbs:
+            # Move to top of list if already exists
+            self.recent_dbs.remove(db_path)
+        self.recent_dbs.insert(0, db_path)
+        # Keep only max number
+        self.recent_dbs = self.recent_dbs[:self.max_recent_dbs]
+        self.save_recent_dbs()
+        self.update_recent_menu()
 
     def apply_dark_theme(self):
         self.setStyleSheet(DARK_STYLESHEET)
@@ -277,6 +316,14 @@ class DuckDBApp(QMainWindow):
         open_action = QAction("&Open Database", self)
         open_action.triggered.connect(self.open_db)
         file_menu.addAction(open_action)
+        
+        # Recent databases submenu
+        self.recent_menu = file_menu.addMenu("Open &Recent")
+        self.update_recent_menu()
+
+        close_action = QAction("&Close Database", self)
+        close_action.triggered.connect(self.close_db)
+        file_menu.addAction(close_action)
 
         file_menu.addSeparator()
 
@@ -363,6 +410,51 @@ class DuckDBApp(QMainWindow):
         # Set initial focus
         self.query_editor.setFocus()
 
+    def update_recent_menu(self):
+        """Update the recent databases menu with current list."""
+        self.recent_menu.clear()
+        if not self.recent_dbs:
+            no_recent = QAction("No Recent Databases", self)
+            no_recent.setEnabled(False)
+            self.recent_menu.addAction(no_recent)
+            return
+            
+        for db_path in self.recent_dbs:
+            # Create display name (just the filename)
+            display_name = os.path.basename(db_path)
+            recent_action = QAction(display_name, self)
+            # Store the full path as data in the action
+            recent_action.setData(db_path)
+            recent_action.setStatusTip(db_path)
+            recent_action.triggered.connect(self.open_recent_db)
+            self.recent_menu.addAction(recent_action)
+            
+        self.recent_menu.addSeparator()
+        clear_action = QAction("Clear Recent", self)
+        clear_action.triggered.connect(self.clear_recent_dbs)
+        self.recent_menu.addAction(clear_action)
+        
+    def open_recent_db(self):
+        """Open a database from the recent list."""
+        action = self.sender()
+        if action and isinstance(action, QAction):
+            db_path = action.data()
+            if db_path and os.path.exists(db_path):
+                self.connect_db(db_path)
+            else:
+                QMessageBox.warning(self, "Warning", f"Database file not found: {db_path}")
+                # Remove invalid path from recent list
+                if db_path in self.recent_dbs:
+                    self.recent_dbs.remove(db_path)
+                    self.save_recent_dbs()
+                    self.update_recent_menu()
+                    
+    def clear_recent_dbs(self):
+        """Clear the list of recent databases."""
+        self.recent_dbs = []
+        self.save_recent_dbs()
+        self.update_recent_menu()
+
     def _get_new_db_connection(self):
         """Creates a new DuckDB connection (for worker threads)."""
         if not self.db_path:
@@ -390,6 +482,9 @@ class DuckDBApp(QMainWindow):
             self.results_table.setRowCount(0) # Clear results
             self.results_table.setColumnCount(0)
             self.query_editor.clear()
+            
+            # Add to recent databases list
+            self.add_to_recent_dbs(db_path)
         except Exception as e:
             QMessageBox.critical(self, "Database Error", f"Failed to connect to database:\n{e}")
             self.db_conn = None
@@ -407,6 +502,7 @@ class DuckDBApp(QMainWindow):
             if not filePath.endswith('.duckdb'):
                 filePath += '.duckdb'
             self.connect_db(filePath)
+            # Note: connect_db already adds to recent list
 
     def open_db(self):
         """Opens a dialog to select and connect to an existing DuckDB file."""
@@ -415,6 +511,25 @@ class DuckDBApp(QMainWindow):
                                                 "DuckDB Files (*.duckdb);;All Files (*)", options=options)
         if filePath:
             self.connect_db(filePath)
+            # Note: connect_db already adds to recent list
+            
+    def close_db(self):
+        """Closes the current database connection."""
+        if self.db_conn:
+            try:
+                self.db_conn.close()
+                self.db_conn = None
+                self.db_path = None
+                self.db_status_label.setText("No database connected")
+                self.table_list_widget.clear()
+                self.results_table.setRowCount(0)
+                self.results_table.setColumnCount(0)
+                self.query_editor.clear()
+                QMessageBox.information(self, "Success", "Database connection closed successfully.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to close database connection:\n{e}")
+        else:
+            QMessageBox.information(self, "Info", "No database connection is currently open.")
 
     def load_tables(self):
         """Loads the list of tables from the connected database into the list widget."""
