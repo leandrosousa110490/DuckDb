@@ -345,6 +345,21 @@ class DuckDBApp(QMainWindow):
         import_excel_action = QAction("Import &Excel...", self)
         import_excel_action.triggered.connect(self.import_excel)
         import_menu.addAction(import_excel_action)
+        
+        # --- Export Menu ---
+        export_menu = menubar.addMenu("&Export")
+        
+        export_csv_action = QAction("Export as &CSV...", self)
+        export_csv_action.triggered.connect(self.export_to_csv)
+        export_menu.addAction(export_csv_action)
+        
+        export_excel_action = QAction("Export as &Excel...", self)
+        export_excel_action.triggered.connect(self.export_to_excel)
+        export_menu.addAction(export_excel_action)
+        
+        export_parquet_action = QAction("Export as &Parquet...", self)
+        export_parquet_action.triggered.connect(self.export_to_parquet)
+        export_menu.addAction(export_parquet_action)
 
         # --- Central Widget & Layout ---
         central_widget = QWidget()
@@ -1243,6 +1258,182 @@ class DuckDBApp(QMainWindow):
                 QMessageBox.information(self, "Success", f"Table '{table_name}' deleted successfully.")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to delete table '{table_name}':\n{e}")
+
+    # --- Export Methods ---
+    
+    def _get_results_as_dataframe(self):
+        """Convert current query results to a pandas DataFrame."""
+        if not hasattr(self, 'results_table') or self.results_table.rowCount() == 0 or self.results_table.columnCount() == 0:
+            QMessageBox.warning(self, "Warning", "No results to export. Run a query first.")
+            return None
+            
+        try:
+            import pandas as pd
+            
+            # Get column headers
+            headers = []
+            for col in range(self.results_table.columnCount()):
+                header_item = self.results_table.horizontalHeaderItem(col)
+                headers.append(header_item.text() if header_item else f"Column{col}")
+            
+            # Get data from table
+            data = []
+            for row in range(self.results_table.rowCount()):
+                row_data = []
+                for col in range(self.results_table.columnCount()):
+                    item = self.results_table.item(row, col)
+                    # Handle null values
+                    value = item.text() if item else None
+                    row_data.append(value)
+                data.append(row_data)
+            
+            # Create DataFrame
+            df = pd.DataFrame(data, columns=headers)
+            return df
+            
+        except ImportError:
+            QMessageBox.critical(self, "Error", "Pandas library is required for exporting data.\nPlease install it with 'pip install pandas'.")
+            return None
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error preparing data for export:\n{e}")
+            return None
+    
+    def export_to_csv(self):
+        """Export current query results to a CSV file."""
+        df = self._get_results_as_dataframe()
+        if df is None:
+            return
+            
+        # Get file path
+        options = QFileDialog.Option.DontUseNativeDialog
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export as CSV", "", "CSV Files (*.csv);;All Files (*)", 
+            options=options
+        )
+        
+        if not file_path:
+            return  # User cancelled
+            
+        # Add .csv extension if not present
+        if not file_path.lower().endswith('.csv'):
+            file_path += '.csv'
+            
+        # Ask for delimiter
+        delimiters = [
+            ("Comma (,)", ","), 
+            ("Tab (\\t)", "\t"), 
+            ("Semicolon (;)", ";"), 
+            ("Pipe (|)", "|"),
+            ("Other", "custom")
+        ]
+        
+        delimiter_items = [name for name, _ in delimiters]
+        delimiter_choice, ok = QInputDialog.getItem(
+            self, "CSV Delimiter", 
+            "Select the delimiter to use in the CSV file:", 
+            delimiter_items, 0, False
+        )
+        
+        if not ok:
+            return  # User cancelled
+            
+        # Get the delimiter value
+        selected_delimiter = None
+        for name, value in delimiters:
+            if name == delimiter_choice:
+                selected_delimiter = value
+                break
+                
+        # If "Other" was selected, ask for the custom delimiter
+        if selected_delimiter == "custom":
+            custom_delimiter, ok = QInputDialog.getText(
+                self, "Custom Delimiter", 
+                "Enter the custom delimiter character:"
+            )
+            if not ok or not custom_delimiter:
+                return  # User cancelled or entered empty delimiter
+            selected_delimiter = custom_delimiter
+            
+        try:
+            # Export to CSV with selected delimiter
+            df.to_csv(file_path, sep=selected_delimiter, index=False)
+            QMessageBox.information(self, "Success", f"Data exported successfully to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export data to CSV:\n{e}")
+    
+    def export_to_excel(self):
+        """Export current query results to an Excel file."""
+        df = self._get_results_as_dataframe()
+        if df is None:
+            return
+            
+        # Check for required libraries
+        try:
+            import openpyxl
+        except ImportError:
+            QMessageBox.critical(self, "Error", 
+                "The openpyxl library is required for Excel export.\n"
+                "Please install it with 'pip install openpyxl'."
+            )
+            return
+            
+        # Get file path
+        options = QFileDialog.Option.DontUseNativeDialog
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export as Excel", "", "Excel Files (*.xlsx);;All Files (*)", 
+            options=options
+        )
+        
+        if not file_path:
+            return  # User cancelled
+            
+        # Add .xlsx extension if not present
+        if not file_path.lower().endswith('.xlsx'):
+            file_path += '.xlsx'
+            
+        try:
+            # Export to Excel
+            df.to_excel(file_path, index=False)
+            QMessageBox.information(self, "Success", f"Data exported successfully to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export data to Excel:\n{e}")
+    
+    def export_to_parquet(self):
+        """Export current query results to a Parquet file."""
+        df = self._get_results_as_dataframe()
+        if df is None:
+            return
+            
+        # Check for required libraries
+        try:
+            import pyarrow
+        except ImportError:
+            QMessageBox.critical(self, "Error", 
+                "The pyarrow library is required for Parquet export.\n"
+                "Please install it with 'pip install pyarrow'."
+            )
+            return
+            
+        # Get file path
+        options = QFileDialog.Option.DontUseNativeDialog
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export as Parquet", "", "Parquet Files (*.parquet);;All Files (*)", 
+            options=options
+        )
+        
+        if not file_path:
+            return  # User cancelled
+            
+        # Add .parquet extension if not present
+        if not file_path.lower().endswith('.parquet'):
+            file_path += '.parquet'
+            
+        try:
+            # Export to Parquet
+            df.to_parquet(file_path, index=False)
+            QMessageBox.information(self, "Success", f"Data exported successfully to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export data to Parquet:\n{e}")
 
 
 if __name__ == "__main__":
