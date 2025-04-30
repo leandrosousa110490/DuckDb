@@ -490,7 +490,7 @@ class DuckDBApp(QMainWindow):
         
         # Load recent databases
         self.load_recent_dbs()
-        
+
         self.init_ui()
         self.apply_dark_theme()
 
@@ -630,6 +630,7 @@ class DuckDBApp(QMainWindow):
         self.highlighter = SQLHighlighter(self.query_editor.document())
         query_layout.addWidget(self.query_editor)
         run_query_button = QPushButton("Run Query")
+        run_query_button.setToolTip("Execute the full query or just the selected text if a selection is made")
         run_query_button.clicked.connect(self.execute_query) # Connect here
         query_layout.addWidget(run_query_button)
         right_splitter.addWidget(query_pane)
@@ -800,7 +801,17 @@ class DuckDBApp(QMainWindow):
 
     def execute_query(self):
         """Starts the background thread to execute the SQL query."""
-        query = self.query_editor.toPlainText().strip()
+        # Check if there's a selection in the editor
+        cursor = self.query_editor.textCursor()
+        selected_text = cursor.selectedText()
+        
+        # Use the selected text if available, otherwise use the entire content
+        self.is_partial_query = False
+        if selected_text:
+            query = selected_text.strip()
+            self.is_partial_query = True
+        else:
+            query = self.query_editor.toPlainText().strip()
 
         if not self.db_conn:
             QMessageBox.warning(self, "Warning", "No database connected.")
@@ -817,7 +828,8 @@ class DuckDBApp(QMainWindow):
         self.total_rows = 0
         
         # --- Setup Progress Dialog ---
-        self.query_progress = QProgressDialog("Executing query...", "Cancel", 0, 100, self)
+        progress_title = "Executing selected query..." if self.is_partial_query else "Executing query..."
+        self.query_progress = QProgressDialog(progress_title, "Cancel", 0, 100, self)
         self.query_progress.setWindowModality(Qt.WindowModality.WindowModal)
         self.query_progress.setMinimumDuration(300)  # Show after 300ms delay
         self.query_progress.setWindowTitle("Executing Query")
@@ -891,16 +903,19 @@ class DuckDBApp(QMainWindow):
             if total_count > self.rows_per_page:
                 pagination_msg = f"Showing page {self.current_page + 1} of {(total_count + self.rows_per_page - 1) // self.rows_per_page} " + \
                                  f"(rows {self.current_page * self.rows_per_page + 1}-{min((self.current_page + 1) * self.rows_per_page, total_count)} of {total_count})"
-                QMessageBox.information(self, "Success", f"Query executed successfully.\n{pagination_msg}")
+                success_type = "Selected query" if hasattr(self, 'is_partial_query') and self.is_partial_query else "Query"
+                QMessageBox.information(self, "Success", f"{success_type} executed successfully.\n{pagination_msg}")
                 
                 # Add pagination UI if not already present
                 self._ensure_pagination_controls()
             else:
-                QMessageBox.information(self, "Success", f"Query executed successfully.\n{len(data)} rows returned.")
+                success_type = "Selected query" if hasattr(self, 'is_partial_query') and self.is_partial_query else "Query"
+                QMessageBox.information(self, "Success", f"{success_type} executed successfully.\n{len(data)} rows returned.")
         else: # Non-SELECT query successful
             self.results_table.setRowCount(0)
             self.results_table.setColumnCount(0)
-            QMessageBox.information(self, "Success", "Query executed successfully (no results returned).")
+            success_type = "Selected query" if hasattr(self, 'is_partial_query') and self.is_partial_query else "Query"
+            QMessageBox.information(self, "Success", f"{success_type} executed successfully (no results returned).")
             # Reload tables in case the schema changed (e.g., CREATE TABLE, DROP TABLE)
             self.load_tables()
     
@@ -913,7 +928,7 @@ class DuckDBApp(QMainWindow):
         self.results_table.setRowCount(0)
         self.results_table.setColumnCount(len(headers))
         self.results_table.setHorizontalHeaderLabels(headers)
-        
+
         # Pre-allocate rows
         self.results_table.setRowCount(len(data))
         
@@ -926,7 +941,7 @@ class DuckDBApp(QMainWindow):
                 item = QTableWidgetItem(str(cell_data) if cell_data is not None else "NULL")
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.results_table.setItem(row_idx, col_idx, item)
-        
+            
         # Restore signals when done
         self.results_table.blockSignals(False)
         
