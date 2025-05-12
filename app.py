@@ -1,14 +1,20 @@
 import sys
 import duckdb
 import os
+import json
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QListWidget, QTextEdit, QTableWidget,
     QTableWidgetItem, QLabel, QMessageBox, QSplitter, QHeaderView,
-    QInputDialog, QProgressDialog, QMenu
+    QInputDialog, QProgressDialog, QMenu, QTabWidget, QDialog,
+    QLineEdit, QFormLayout, QDialogButtonBox, QListView, QAbstractItemView,
+    QCompleter, QFrame
 )
-from PyQt6.QtGui import QPalette, QColor, QAction, QSyntaxHighlighter, QTextCharFormat, QFont
-from PyQt6.QtCore import Qt, QRegularExpression, QThread, QObject, pyqtSignal
+from PyQt6.QtGui import (
+    QPalette, QColor, QAction, QSyntaxHighlighter, QTextCharFormat, QFont,
+    QTextCursor, QStandardItemModel, QStandardItem
+)
+from PyQt6.QtCore import Qt, QRegularExpression, QThread, QObject, pyqtSignal, QStringListModel, QRect, QSize
 import re
 import pandas as pd
 import csv
@@ -237,10 +243,14 @@ class QueryWorker(QObject):
             is_select = self.query.strip().upper().startswith("SELECT")
             total_count = 0
             
+            # Prepare the query for execution
+            query_to_execute = self.query.strip()
+            if query_to_execute.endswith(";"):
+                query_to_execute = query_to_execute[:-1].strip()
+            
             if is_select:
-                # Wrap original query in a count query to get total rows
-                # Use a subquery to ensure we're counting the actual result set
-                count_query = f"SELECT COUNT(*) FROM ({self.query}) AS count_subquery"
+                # Wrap original query (without semicolon) in a count query to get total rows
+                count_query = f"SELECT COUNT(*) FROM ({query_to_execute}) AS count_subquery"
                 try:
                     count_result = db_conn.execute(count_query).fetchone()
                     if count_result:
@@ -252,15 +262,15 @@ class QueryWorker(QObject):
                 
                 # If it's a SELECT query, add LIMIT and OFFSET for pagination
                 # Only if the query doesn't already have a LIMIT clause
-                if not re.search(r'\bLIMIT\b\s+\d+', self.query, re.IGNORECASE):
-                    paginated_query = f"{self.query} LIMIT {self.limit} OFFSET {self.offset}"
+                if not re.search(r'\bLIMIT\b\s+\d+', query_to_execute, re.IGNORECASE):
+                    paginated_query = f"{query_to_execute} LIMIT {self.limit} OFFSET {self.offset}"
                 else:
-                    paginated_query = self.query
+                    paginated_query = query_to_execute
             else:
-                paginated_query = self.query
+                paginated_query = query_to_execute
 
             # Execute the query (paginated for SELECT)
-            result_relation = db_conn.execute(paginated_query)
+            result_relation = db_conn.execute(paginated_query + ";") # Add semicolon back for execution
 
             # Check if cancelled
             if self.is_cancelled:
@@ -478,6 +488,320 @@ class ExportWorker(QObject):
             print(f"Parquet export error: {e}")
             raise
 
+class SaveQueryDialog(QDialog):
+    def __init__(self, query_text, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Save Query")
+        self.setModal(True)
+        
+        layout = QFormLayout(self)
+        
+        self.name_edit = QLineEdit()
+        layout.addRow("Query Name:", self.name_edit)
+        
+        self.description_edit = QTextEdit()
+        self.description_edit.setMaximumHeight(100)
+        layout.addRow("Description:", self.description_edit)
+        
+        # Preview of the query (read-only)
+        self.query_preview = QTextEdit()
+        self.query_preview.setPlainText(query_text)
+        self.query_preview.setReadOnly(True)
+        self.query_preview.setMaximumHeight(150)
+        layout.addRow("Query:", self.query_preview)
+        
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addRow(button_box)
+        
+        self.resize(400, 350)
+
+class SQLTextEdit(QTextEdit):
+    """A custom QTextEdit with SQL autocompletion."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.completer = None
+        self.completion_prefix = "" # This stores the part of the word to be completed (e.g., "SEL" or "col")
+        self.current_tables_info = {} # {table_name: [column1, column2, ...]}}
+        self.keywords = []
+        self.auto_parentheses = True
+        self.load_keywords()
+    
+    def load_keywords(self):
+        self.keywords = [
+            "SELECT", "FROM", "WHERE", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP",
+            "TABLE", "VIEW", "INDEX", "TRIGGER", "FUNCTION", "PROCEDURE", "DATABASE", "SCHEMA",
+            "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "ON", "USING",
+            "GROUP BY", "ORDER BY", "HAVING", "LIMIT", "OFFSET", "AS", "DISTINCT", "ALL",
+            "UNION", "INTERSECT", "EXCEPT", "IN", "EXISTS", "NOT", "AND", "OR", "BETWEEN",
+            "LIKE", "IS NULL", "IS NOT NULL", "DESC", "ASC", "VALUES", "SET", "INTO",
+            "COUNT", "SUM", "AVG", "MIN", "MAX", "CASE", "WHEN", "THEN", "ELSE", "END",
+            "PRIMARY KEY", "FOREIGN KEY", "REFERENCES", "CHECK", "UNIQUE", "DEFAULT",
+            "AUTO_INCREMENT", "CASCADE", "RESTRICT", "PRAGMA", "EXPLAIN", "WITH", "RECURSIVE"
+        ]
+    
+    def set_completer(self, completer):
+        if self.completer:
+            self.completer.activated.disconnect()
+        self.completer = completer
+        if self.completer:
+            self.completer.setWidget(self)
+            self.completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+            self.completer.activated.connect(self.insert_completion)
+    
+    def update_completions_data(self, tables_info):
+        self.current_tables_info = tables_info
+        # print(f"[SQLTextEdit] Updated completions data: {self.current_tables_info}")
+
+    def insert_completion(self, completion):
+        if self.completer and self.completer.widget() != self:
+            return
+        tc = self.textCursor()
+        # self.completion_prefix was set by keyPressEvent based on get_text_before_cursor...
+        prefix_to_replace_len = len(self.completion_prefix) 
+
+        current_pos = tc.position()
+        tc.setPosition(current_pos - prefix_to_replace_len)
+        tc.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor, prefix_to_replace_len)
+        tc.removeSelectedText()
+        tc.insertText(completion)
+            
+        if self.auto_parentheses and completion.upper() in [
+            "COUNT", "SUM", "AVG", "MIN", "MAX", "COALESCE", "IFNULL",
+            "NULLIF", "CAST", "EXTRACT", "DATE_TRUNC", "REGEXP_MATCHES"
+        ]:
+            tc.insertText("()")
+            tc.movePosition(QTextCursor.MoveOperation.Left)
+        self.setTextCursor(tc)
+        if self.completer: self.completer.popup().hide()
+    
+    def get_text_before_cursor_for_completion(self):
+        tc = self.textCursor()
+        pos_in_block = tc.positionInBlock()
+        text_before_cursor = tc.block().text()[:pos_in_block]
+
+        _unquoted_ident_chars = r'[a-zA-Z0-9_]'
+        _unquoted_ident = f'{_unquoted_ident_chars}+'
+        _quoted_ident = r'\"[^\"\\r\\n]+\"'
+        _any_ident = f'(?:{_unquoted_ident}|{_quoted_ident})'
+
+        pat_ident_dot_prefix = rf'({_any_ident})(\.)({_unquoted_ident_chars}*)$'
+        match = re.search(pat_ident_dot_prefix, text_before_cursor)
+        if match:
+            full_prefix_matched = match.group(0) 
+            # completion_trigger_prefix is the part after the dot
+            completion_trigger_prefix = match.group(4) if len(match.groups()) >=4 and match.group(4) is not None else ""
+            return full_prefix_matched, completion_trigger_prefix
+
+        pat_identifier_alone = rf'({_any_ident})$'
+        match = re.search(pat_identifier_alone, text_before_cursor)
+        if match:
+            full_prefix_matched = match.group(1)
+            # For standalone identifiers, the full prefix is also the part to complete
+            return full_prefix_matched, full_prefix_matched
+
+        pat_solitary_dot = r'(\.)$'
+        match = re.search(pat_solitary_dot, text_before_cursor)
+        if match:
+            return ".", ""
+
+        return "", ""
+
+    def focusInEvent(self, event):
+        if self.completer:
+            self.completer.setWidget(self)
+        super().focusInEvent(event)
+    
+    def keyPressEvent(self, event):
+        if self.completer and self.completer.popup().isVisible():
+            key = event.key()
+            if key in [Qt.Key.Key_Enter, Qt.Key.Key_Return, Qt.Key.Key_Tab]:
+                current_comp = self.completer.currentCompletion()
+                self.completer.popup().hide() 
+                self.insert_completion(current_comp)
+                return 
+            elif key == Qt.Key.Key_Escape:
+                self.completer.popup().hide()
+                return
+            elif key in [Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown]:
+                # Let QCompleter handle these navigation keys for its popup
+                pass # Do not return, let superclass handle it after completer potentially acts
+        
+        if event.key() in [Qt.Key.Key_Enter, Qt.Key.Key_Return]:
+            # ... (auto-indent logic remains the same)
+            cursor = self.textCursor()
+            block = cursor.block()
+            text = block.text()
+            indentation = ""
+            for char in text:
+                if char.isspace(): indentation += char
+                else: break
+            super().keyPressEvent(event)
+            if indentation: self.insertPlainText(indentation)
+            return
+        
+        if event.key() == Qt.Key.Key_ParenLeft:
+            # ... (auto-pair logic remains the same)
+            super().keyPressEvent(event)
+            self.insertPlainText(")")
+            cursor = self.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Left)
+            self.setTextCursor(cursor)
+            return
+        
+        super().keyPressEvent(event) # Allow QTextEdit to process the key press first
+        
+        # Completion Logic
+        text_char = event.text() # Character actually typed, if printable
+        full_prefix_text, current_trigger_prefix = self.get_text_before_cursor_for_completion()
+        self.completion_prefix = current_trigger_prefix # Store for insert_completion
+
+        print(f"[KPE] Char: '{text_char}', FP: '{full_prefix_text}', TP: '{current_trigger_prefix}'")
+
+        # Conditions to show completer:
+        # 1. Printable character typed (event.text() is not empty)
+        # 2. OR it's a backspace/delete (to re-evaluate completion)
+        # 3. AND (there's a trigger_prefix OR the full_prefix_text ends with a dot)
+        # 4. AND it's not a modifier key press alone
+
+        is_char_key = bool(text_char) and not event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier)
+        is_meaningful_action = is_char_key or event.key() in [Qt.Key.Key_Backspace, Qt.Key.Key_Delete]
+
+        if is_meaningful_action and (current_trigger_prefix or full_prefix_text.endswith(".")):
+            print(f"[KPE] ==> Calling handle_completion for FP: '{full_prefix_text}', TP: '{current_trigger_prefix}'")
+            self.handle_completion(full_prefix_text, current_trigger_prefix)
+        else:
+            if self.completer: self.completer.popup().hide()
+            print(f"[KPE] ==> Hiding popup. Meaningful: {is_meaningful_action}, TriggerPrefix: '{current_trigger_prefix}', EndsWithDot: {full_prefix_text.endswith('.')}")
+
+    def parse_aliases(self, query_text):
+        # ... (parse_aliases logic remains the same)
+        aliases = {}
+        patterns = [
+            r'\bFROM\s+((?:\"[^\"\r\n]+\"|\w+))\s+(?:AS\s+)?((?:\"[^\"\r\n]+\"|\w+))(?=[\s\r\n\(,;]|$)',
+            r'\bJOIN\s+((?:\"[^\"\r\n]+\"|\w+))\s+(?:AS\s+)?((?:\"[^\"\r\n]+\"|\w+))(?=[\s\r\n\(,;]|$)'
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, query_text, re.IGNORECASE):
+                table_name = match.group(1).strip('"')
+                alias_name = match.group(2).strip('"')
+                if alias_name.upper() not in ["ON", "USING", "WHERE", "GROUP", "ORDER", "LIMIT"]:
+                     aliases[alias_name] = table_name
+        return aliases
+    
+    def handle_completion(self, full_prefix_text, current_trigger_prefix):
+        if not self.completer: return
+        print(f"[HC] Handling FP: '{full_prefix_text}', TP: '{current_trigger_prefix}'")
+        
+        model = QStandardItemModel()
+        query_text = self.toPlainText()
+        aliases = self.parse_aliases(query_text)
+        print(f"[HC] Aliases: {aliases}, Tables: {list(self.current_tables_info.keys())}")
+        
+        is_after_dot = full_prefix_text.endswith(".") and len(full_prefix_text) > 1 # e.g. "table." or "alias."
+        # The part before the dot is in full_prefix_text[:-1]
+        # current_trigger_prefix is ALREADY the part *after* the dot, or empty if just "table."
+
+        if is_after_dot:
+            table_or_alias_before_dot = full_prefix_text[:-1].strip('"')
+            print(f"[HC] After dot. Table/Alias: '{table_or_alias_before_dot}'. Col CP: '{current_trigger_prefix}'")
+            actual_table_name = None
+            if table_or_alias_before_dot in aliases:
+                actual_table_name = aliases[table_or_alias_before_dot]
+            elif table_or_alias_before_dot in self.current_tables_info:
+                actual_table_name = table_or_alias_before_dot
+            
+            if actual_table_name and actual_table_name in self.current_tables_info:
+                for column in self.current_tables_info[actual_table_name]:
+                    if not current_trigger_prefix or column.lower().startswith(current_trigger_prefix.lower()):
+                        item = QStandardItem(column); item.setData("column", Qt.ItemDataRole.UserRole); model.appendRow(item)
+        else:
+            # Not after a dot, suggest keywords, tables, aliases based on current_trigger_prefix
+            print(f"[HC] Not after dot. Suggesting based on TP: '{current_trigger_prefix}'")
+            for keyword in self.keywords:
+                if not current_trigger_prefix or keyword.lower().startswith(current_trigger_prefix.lower()):
+                    item = QStandardItem(keyword); item.setData("keyword", Qt.ItemDataRole.UserRole); model.appendRow(item)
+            for table_name in self.current_tables_info.keys():
+                if not current_trigger_prefix or table_name.lower().startswith(current_trigger_prefix.lower()):
+                    item = QStandardItem(table_name); item.setData("table", Qt.ItemDataRole.UserRole); model.appendRow(item)
+            for alias, aliased_table_name in aliases.items():
+                if not current_trigger_prefix or alias.lower().startswith(current_trigger_prefix.lower()):
+                    item_display_text = f'{alias} (alias for {aliased_table_name})' 
+                    item = QStandardItem(alias) # Insert the alias itself
+                    # item.setData(alias, Qt.DisplayRole) # Redundant, QStandardItem constructor does this
+                    item.setData(f'{alias} (alias for {aliased_table_name})', Qt.ItemDataRole.ToolTipRole) # Tooltip
+                    item.setData("alias", Qt.ItemDataRole.UserRole) 
+                    model.appendRow(item)
+
+        print(f"[HC] Model row count: {model.rowCount()}")
+        if model.rowCount() > 0:
+            self.completer.setModel(model)
+            self.completer.setCompletionPrefix(current_trigger_prefix) # Filter model by this
+            cr = self.cursorRect()
+            # Basic width calculation, can be improved
+            popup_width = self.completer.popup().sizeHintForColumn(0) + 30 
+            if self.completer.popup().verticalScrollBar().isVisible():
+                 popup_width += self.completer.popup().verticalScrollBar().sizeHint().width()
+            cr.setWidth(popup_width)
+            self.completer.complete(cr)
+            print(f"[HC] Called completer.complete(). Popup visible: {self.completer.popup().isVisible()}")
+        else:
+            self.completer.popup().hide()
+            print(f"[HC] Model empty or no matches, hiding popup.")
+
+class QueryTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.init_ui()
+        
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        query_layout = QVBoxLayout()
+        query_layout.addWidget(QLabel("SQL Query:"))
+        
+        # Use the custom SQLTextEdit with autocompletion
+        self.query_editor = SQLTextEdit()
+        self.query_editor.setPlaceholderText("Enter your SQL query here...")
+        self.highlighter = SQLHighlighter(self.query_editor.document())
+        
+        # Set up the completer
+        completer = QCompleter(self)
+        completer.setModelSorting(QCompleter.ModelSorting.CaseSensitivelySortedModel)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setWrapAround(False)
+        completer.setMaxVisibleItems(10)
+        
+        # Set custom popup
+        popup = completer.popup()
+        popup.setObjectName("completionPopup")
+        popup.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        popup.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        popup.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Plain)
+        
+        self.query_editor.set_completer(completer)
+        
+        query_layout.addWidget(self.query_editor)
+        
+        button_layout = QHBoxLayout()
+        self.run_query_button = QPushButton("Run Query")
+        self.run_query_button.setToolTip("Execute the full query or just the selected text if a selection is made")
+        button_layout.addWidget(self.run_query_button)
+        
+        query_layout.addLayout(button_layout)
+        layout.addLayout(query_layout)
+        
+        # Results section
+        layout.addWidget(QLabel("Results:"))
+        self.results_table = QTableWidget()
+        self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.results_table.verticalHeader().setVisible(False)
+        layout.addWidget(self.results_table, 1)  # Give the results table more vertical space
+
 class DuckDBApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -487,9 +811,13 @@ class DuckDBApp(QMainWindow):
         self.db_path = None
         self.recent_dbs = []
         self.max_recent_dbs = 5
+        self.saved_queries = []
+        self.query_tabs = []
+        self.current_tab_index = 0
         
-        # Load recent databases
+        # Load recent databases and saved queries
         self.load_recent_dbs()
+        self.load_saved_queries()
 
         self.init_ui()
         self.apply_dark_theme()
@@ -506,7 +834,18 @@ class DuckDBApp(QMainWindow):
         except Exception as e:
             print(f"Error loading recent databases: {e}")
             self.recent_dbs = []
-            
+    
+    def load_saved_queries(self):
+        """Load saved queries from file."""
+        try:
+            saved_queries_file = os.path.join(os.path.expanduser("~"), ".duckdb_queries")
+            if os.path.exists(saved_queries_file):
+                with open(saved_queries_file, "r") as f:
+                    self.saved_queries = json.load(f)
+        except Exception as e:
+            print(f"Error loading saved queries: {e}")
+            self.saved_queries = []
+    
     def save_recent_dbs(self):
         """Save list of recently opened databases to file."""
         try:
@@ -516,6 +855,15 @@ class DuckDBApp(QMainWindow):
                     f.write(f"{db_path}\n")
         except Exception as e:
             print(f"Error saving recent databases: {e}")
+    
+    def save_saved_queries(self):
+        """Save queries to file."""
+        try:
+            saved_queries_file = os.path.join(os.path.expanduser("~"), ".duckdb_queries")
+            with open(saved_queries_file, "w") as f:
+                json.dump(self.saved_queries, f, indent=2)
+        except Exception as e:
+            print(f"Error saving queries: {e}")
             
     def add_to_recent_dbs(self, db_path):
         """Add a database path to the recent list."""
@@ -587,6 +935,30 @@ class DuckDBApp(QMainWindow):
         export_parquet_action = QAction("Export as &Parquet...", self)
         export_parquet_action.triggered.connect(self.export_to_parquet)
         export_menu.addAction(export_parquet_action)
+        
+        # --- Query Menu ---
+        query_menu = menubar.addMenu("&Query")
+        
+        new_tab_action = QAction("&New Query Tab", self)
+        new_tab_action.triggered.connect(self.add_query_tab)
+        new_tab_action.setShortcut("Ctrl+T")
+        query_menu.addAction(new_tab_action)
+        
+        close_tab_action = QAction("&Close Current Tab", self)
+        close_tab_action.triggered.connect(self.close_current_tab)
+        close_tab_action.setShortcut("Ctrl+W")
+        query_menu.addAction(close_tab_action)
+        
+        query_menu.addSeparator()
+        
+        save_query_action = QAction("&Save Query...", self)
+        save_query_action.triggered.connect(self.save_query)
+        save_query_action.setShortcut("Ctrl+S")
+        query_menu.addAction(save_query_action)
+        
+        # Saved queries submenu
+        self.saved_queries_menu = query_menu.addMenu("&Saved Queries")
+        self.update_saved_queries_menu()
 
         # --- Central Widget & Layout ---
         central_widget = QWidget()
@@ -613,46 +985,28 @@ class DuckDBApp(QMainWindow):
         left_layout.addWidget(self.table_list_widget)
         main_splitter.addWidget(left_pane)
 
-        # --- Right Pane (Query and Results - Splitter) ---
+        # --- Right Pane (Tabs for Queries) ---
         right_pane = QWidget()
         right_layout = QVBoxLayout(right_pane)
-        right_splitter = QSplitter(Qt.Orientation.Vertical)
-        right_layout.addWidget(right_splitter)
+        
+        # Create tab widget
+        self.query_tab_widget = QTabWidget()
+        self.query_tab_widget.setTabsClosable(True)
+        self.query_tab_widget.tabCloseRequested.connect(self.close_tab)
+        self.query_tab_widget.currentChanged.connect(self.on_tab_changed)
+        right_layout.addWidget(self.query_tab_widget)
+        
+        # Add initial tab
+        self.add_query_tab()
+        
         main_splitter.addWidget(right_pane)
-
-        # --- Query Editor ---
-        query_pane = QWidget()
-        query_layout = QVBoxLayout(query_pane)
-        query_layout.addWidget(QLabel("SQL Query:"))
-        self.query_editor = QTextEdit()
-        self.query_editor.setPlaceholderText("Enter your SQL query here...")
-        # Apply SQL syntax highlighting
-        self.highlighter = SQLHighlighter(self.query_editor.document())
-        query_layout.addWidget(self.query_editor)
-        run_query_button = QPushButton("Run Query")
-        run_query_button.setToolTip("Execute the full query or just the selected text if a selection is made")
-        run_query_button.clicked.connect(self.execute_query) # Connect here
-        query_layout.addWidget(run_query_button)
-        right_splitter.addWidget(query_pane)
-
-        # --- Results Table ---
-        results_pane = QWidget()
-        results_layout = QVBoxLayout(results_pane)
-        results_layout.addWidget(QLabel("Results:"))
-        self.results_table = QTableWidget()
-        self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers) # Read-only
-        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.results_table.verticalHeader().setVisible(False) # Hide row numbers by default
-        results_layout.addWidget(self.results_table)
-        right_splitter.addWidget(results_pane)
 
         # Adjust splitter sizes (optional initial split)
         main_splitter.setSizes([200, 1000]) # Adjust initial width split
-        right_splitter.setSizes([300, 500]) # Adjust initial height split
-
-        # Set initial focus
-        self.query_editor.setFocus()
-
+        
+        # Set initial focus to the query editor
+        self.get_current_query_editor().setFocus()
+    
     def update_recent_menu(self):
         """Update the recent databases menu with current list."""
         self.recent_menu.clear()
@@ -722,9 +1076,15 @@ class DuckDBApp(QMainWindow):
             self.db_path = db_path
             self.db_status_label.setText(f"Connected to: {self.db_path}")
             self.load_tables()
-            self.results_table.setRowCount(0) # Clear results
-            self.results_table.setColumnCount(0)
-            self.query_editor.clear()
+            
+            # Update autocompletion data for all tabs
+            self.update_autocompletion_data()
+            
+            # Clear all tabs' query editors and results tables
+            for tab in self.query_tabs:
+                tab.results_table.setRowCount(0)
+                tab.results_table.setColumnCount(0)
+                tab.query_editor.clear()
             
             # Add to recent databases list
             self.add_to_recent_dbs(db_path)
@@ -734,7 +1094,44 @@ class DuckDBApp(QMainWindow):
             self.db_path = None
             self.db_status_label.setText("Connection failed.")
             self.table_list_widget.clear()
-
+    
+    def update_autocompletion_data(self):
+        """Update the autocompletion data for all query editors."""
+        if not self.db_conn:
+            return
+        
+        try:
+            # Get list of tables
+            tables = [t[0] for t in self.db_conn.execute("SHOW TABLES").fetchall()]
+            
+            # Get columns for each table
+            columns = {}
+            for table in tables:
+                column_info = self.db_conn.execute(f"PRAGMA table_info('{table}')").fetchall()
+                columns[table] = [col[1] for col in column_info]  # col[1] is the column name
+            
+            # Update each query editor
+            for tab in self.query_tabs:
+                tab.query_editor.update_completions_data(columns)
+            
+        except Exception as e:
+            print(f"Error updating autocompletion data: {e}")
+    
+    def load_tables(self):
+        """Loads the list of tables from the connected database into the list widget."""
+        self.table_list_widget.clear()
+        if not self.db_conn:
+            return
+        try:
+            tables = self.db_conn.execute("SHOW TABLES").fetchall()
+            for table in tables:
+                self.table_list_widget.addItem(table[0])
+            
+            # Update autocompletion data
+            self.update_autocompletion_data()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not fetch tables:\n{e}")
+    
     def create_db(self):
         """Opens a dialog to create and connect to a new DuckDB file."""
         options = QFileDialog.Option.DontUseNativeDialog
@@ -765,44 +1162,59 @@ class DuckDBApp(QMainWindow):
                 self.db_path = None
                 self.db_status_label.setText("No database connected")
                 self.table_list_widget.clear()
-                self.results_table.setRowCount(0)
-                self.results_table.setColumnCount(0)
-                self.query_editor.clear()
+                
+                # Clear all tabs' query editors and results tables
+                for tab in self.query_tabs:
+                    tab.results_table.setRowCount(0)
+                    tab.results_table.setColumnCount(0)
+                    tab.query_editor.clear()
+                
                 QMessageBox.information(self, "Success", "Database connection closed successfully.")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to close database connection:\n{e}")
         else:
             QMessageBox.information(self, "Info", "No database connection is currently open.")
 
-    def load_tables(self):
-        """Loads the list of tables from the connected database into the list widget."""
-        self.table_list_widget.clear()
-        if not self.db_conn:
-            return
-        try:
-            tables = self.db_conn.execute("SHOW TABLES").fetchall()
-            for table in tables:
-                self.table_list_widget.addItem(table[0])
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Could not fetch tables:\n{e}")
-
     def display_table_schema(self, current, previous):
         """When a table is selected, populate the query editor with a basic SELECT query."""
         if current:
             table_name = current.text()
-            # Basic quoting for potential spaces or special chars, might need adjustment for complex names
-            quoted_table_name = f'"{table_name}"'
+            # Only quote the table name if it contains spaces or special characters
+            if ' ' in table_name or any(c in table_name for c in '-.+/*()[]{}'):
+                quoted_table_name = f'"{table_name}"'
+            else:
+                quoted_table_name = table_name
+            
             query = f"SELECT * FROM {quoted_table_name} LIMIT 100;"
-            self.query_editor.setPlainText(query)
+            
+            # Get the current query editor and set its text
+            current_editor = self.get_current_query_editor()
+            if current_editor:
+                current_editor.setPlainText(query)
         else:
-            # Optionally clear the editor if no table is selected
-            # self.query_editor.clear()
-            pass # Keep existing query if user clicks away
+            # Keep existing query if user clicks away
+            pass
 
-    def execute_query(self):
+    def quote_identifier(self, identifier):
+        """Quote SQL identifier (table or column name) only if needed."""
+        if ' ' in identifier or any(c in identifier for c in '-.+/*()[]{}'):
+            return f'"{identifier}"'
+        return identifier
+
+    def execute_query(self, tab_index=None):
         """Starts the background thread to execute the SQL query."""
+        # Use the provided tab index or current tab
+        if tab_index is None:
+            tab_index = self.query_tab_widget.currentIndex()
+        
+        # Get the query tab
+        query_tab = self.query_tabs[tab_index]
+        query_editor = query_tab.query_editor
+        results_table = query_tab.results_table
+        run_button = query_tab.run_query_button
+        
         # Check if there's a selection in the editor
-        cursor = self.query_editor.textCursor()
+        cursor = query_editor.textCursor()
         selected_text = cursor.selectedText()
         
         # Use the selected text if available, otherwise use the entire content
@@ -811,7 +1223,7 @@ class DuckDBApp(QMainWindow):
             query = selected_text.strip()
             self.is_partial_query = True
         else:
-            query = self.query_editor.toPlainText().strip()
+            query = query_editor.toPlainText().strip()
 
         if not self.db_conn:
             QMessageBox.warning(self, "Warning", "No database connected.")
@@ -826,6 +1238,7 @@ class DuckDBApp(QMainWindow):
         self.current_page = 0
         self.rows_per_page = 1000  # Default page size
         self.total_rows = 0
+        self.current_tab_for_query = tab_index  # Remember which tab executed the query
         
         # --- Setup Progress Dialog ---
         progress_title = "Executing selected query..." if self.is_partial_query else "Executing query..."
@@ -835,21 +1248,15 @@ class DuckDBApp(QMainWindow):
         self.query_progress.setWindowTitle("Executing Query")
         self.query_progress.setValue(0)
         
-        # --- Show Loading Indicator (e.g., change button text/disable) --- 
-        # Find the button - assumes it's the last widget in query_layout
-        # More robust: give the button an object name `self.run_query_button = ...` in init_ui
-        run_button = self.query_editor.parent().layout().itemAt(self.query_editor.parent().layout().count() - 1).widget()
-        if isinstance(run_button, QPushButton):
+        # --- Show Loading Indicator --- 
+        if run_button:
             self.original_button_text = run_button.text()
             run_button.setText("Running...")
             run_button.setEnabled(False)
-        else:
-            self.original_button_text = None
-            run_button = None # Button not found correctly
 
         # Clear previous results immediately for visual feedback
-        self.results_table.setRowCount(0)
-        self.results_table.setColumnCount(0)
+        results_table.setRowCount(0)
+        results_table.setColumnCount(0)
 
         # --- Setup Thread and Worker ---
         self.query_thread = QThread(self)
@@ -895,126 +1302,144 @@ class DuckDBApp(QMainWindow):
         # Store total count for pagination
         self.total_rows = total_count
         
+        # Get the tab that executed the query
+        tab_index = getattr(self, 'current_tab_for_query', self.query_tab_widget.currentIndex())
+        query_tab = self.query_tabs[tab_index]
+        results_table = query_tab.results_table
+        
         if headers: # SELECT query with results
             # Update table with the returned data
-            self._populate_results_table(data, headers)
+            self._populate_results_table(results_table, data, headers)
             
             # Show pagination controls if we have a large result set
             if total_count > self.rows_per_page:
                 pagination_msg = f"Showing page {self.current_page + 1} of {(total_count + self.rows_per_page - 1) // self.rows_per_page} " + \
-                                 f"(rows {self.current_page * self.rows_per_page + 1}-{min((self.current_page + 1) * self.rows_per_page, total_count)} of {total_count})"
+                                f"(rows {self.current_page * self.rows_per_page + 1}-{min((self.current_page + 1) * self.rows_per_page, total_count)} of {total_count})"
                 success_type = "Selected query" if hasattr(self, 'is_partial_query') and self.is_partial_query else "Query"
                 QMessageBox.information(self, "Success", f"{success_type} executed successfully.\n{pagination_msg}")
                 
                 # Add pagination UI if not already present
-                self._ensure_pagination_controls()
+                self._ensure_pagination_controls(tab_index)
             else:
                 success_type = "Selected query" if hasattr(self, 'is_partial_query') and self.is_partial_query else "Query"
                 QMessageBox.information(self, "Success", f"{success_type} executed successfully.\n{len(data)} rows returned.")
         else: # Non-SELECT query successful
-            self.results_table.setRowCount(0)
-            self.results_table.setColumnCount(0)
+            results_table.setRowCount(0)
+            results_table.setColumnCount(0)
             success_type = "Selected query" if hasattr(self, 'is_partial_query') and self.is_partial_query else "Query"
             QMessageBox.information(self, "Success", f"{success_type} executed successfully (no results returned).")
             # Reload tables in case the schema changed (e.g., CREATE TABLE, DROP TABLE)
             self.load_tables()
     
-    def _populate_results_table(self, data, headers):
+    def _populate_results_table(self, table_widget, data, headers):
         """Efficiently populate the results table with data."""
         # Temporarily turn off sorting to improve performance
-        self.results_table.setSortingEnabled(False)
+        table_widget.setSortingEnabled(False)
         
         # Clear and set up the table
-        self.results_table.setRowCount(0)
-        self.results_table.setColumnCount(len(headers))
-        self.results_table.setHorizontalHeaderLabels(headers)
+        table_widget.setRowCount(0)
+        table_widget.setColumnCount(len(headers))
+        table_widget.setHorizontalHeaderLabels(headers)
 
         # Pre-allocate rows
-        self.results_table.setRowCount(len(data))
+        table_widget.setRowCount(len(data))
         
         # Use batch processing to reduce UI updates
         # Block signals while populating to avoid individual cell change events
-        self.results_table.blockSignals(True)
+        table_widget.blockSignals(True)
         
         for row_idx, row_data in enumerate(data):
             for col_idx, cell_data in enumerate(row_data):
                 item = QTableWidgetItem(str(cell_data) if cell_data is not None else "NULL")
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.results_table.setItem(row_idx, col_idx, item)
+                table_widget.setItem(row_idx, col_idx, item)
             
         # Restore signals when done
-        self.results_table.blockSignals(False)
+        table_widget.blockSignals(False)
         
         # Re-enable sorting
-        self.results_table.setSortingEnabled(True)
+        table_widget.setSortingEnabled(True)
         
         # Adjust column widths - but limit to reasonable size
-        self.results_table.horizontalHeader().setMinimumSectionSize(50)
-        self.results_table.horizontalHeader().setDefaultSectionSize(150)
-        self.results_table.resizeColumnsToContents()
+        table_widget.horizontalHeader().setMinimumSectionSize(50)
+        table_widget.horizontalHeader().setDefaultSectionSize(150)
+        table_widget.resizeColumnsToContents()
         
         # Set a max width for columns to avoid excessively wide columns
-        for col in range(self.results_table.columnCount()):
-            current_width = self.results_table.columnWidth(col)
+        for col in range(table_widget.columnCount()):
+            current_width = table_widget.columnWidth(col)
             if current_width > 300:
-                self.results_table.setColumnWidth(col, 300)
+                table_widget.setColumnWidth(col, 300)
 
-    def _ensure_pagination_controls(self):
+    def _ensure_pagination_controls(self, tab_index=None):
         """Create or update pagination controls if needed."""
-        # Check if we already have a layout with buttons below the results table
-        if not hasattr(self, 'pagination_widget'):
-            # Create pagination widgets
-            self.pagination_widget = QWidget()
-            pagination_layout = QHBoxLayout(self.pagination_widget)
+        if tab_index is None:
+            tab_index = self.query_tab_widget.currentIndex()
             
-            self.page_info_label = QLabel()
-            pagination_layout.addWidget(self.page_info_label)
+        query_tab = self.query_tabs[tab_index]
+        
+        # Check if we already have a layout with buttons below the results table
+        if not hasattr(query_tab, 'pagination_widget'):
+            # Create pagination widgets
+            query_tab.pagination_widget = QWidget()
+            pagination_layout = QHBoxLayout(query_tab.pagination_widget)
+            
+            query_tab.page_info_label = QLabel()
+            pagination_layout.addWidget(query_tab.page_info_label)
             
             pagination_layout.addStretch()
             
-            self.prev_page_button = QPushButton("Previous Page")
-            self.prev_page_button.clicked.connect(self._load_prev_page)
-            pagination_layout.addWidget(self.prev_page_button)
+            query_tab.prev_page_button = QPushButton("Previous Page")
+            query_tab.prev_page_button.clicked.connect(lambda: self._load_prev_page(tab_index))
+            pagination_layout.addWidget(query_tab.prev_page_button)
             
-            self.next_page_button = QPushButton("Next Page")
-            self.next_page_button.clicked.connect(self._load_next_page)
-            pagination_layout.addWidget(self.next_page_button)
+            query_tab.next_page_button = QPushButton("Next Page")
+            query_tab.next_page_button.clicked.connect(lambda: self._load_next_page(tab_index))
+            pagination_layout.addWidget(query_tab.next_page_button)
             
             # Add to the layout that contains the results table
-            results_parent_layout = self.results_table.parent().layout()
-            results_parent_layout.addWidget(self.pagination_widget)
+            query_tab.layout().addWidget(query_tab.pagination_widget)
         
         # Update pagination status
         total_pages = (self.total_rows + self.rows_per_page - 1) // self.rows_per_page
         start_row = self.current_page * self.rows_per_page + 1
         end_row = min((self.current_page + 1) * self.rows_per_page, self.total_rows)
         
-        self.page_info_label.setText(f"Page {self.current_page + 1} of {total_pages} (rows {start_row}-{end_row} of {self.total_rows})")
+        query_tab.page_info_label.setText(f"Page {self.current_page + 1} of {total_pages} (rows {start_row}-{end_row} of {self.total_rows})")
         
         # Enable/disable buttons based on current page
-        self.prev_page_button.setEnabled(self.current_page > 0)
-        self.next_page_button.setEnabled(self.current_page < total_pages - 1)
+        query_tab.prev_page_button.setEnabled(self.current_page > 0)
+        query_tab.next_page_button.setEnabled(self.current_page < total_pages - 1)
         
         # Show the pagination controls
-        self.pagination_widget.setVisible(True)
+        query_tab.pagination_widget.setVisible(True)
     
-    def _load_prev_page(self):
+    def _load_prev_page(self, tab_index=None):
         """Load the previous page of results."""
         if self.current_page > 0:
             self.current_page -= 1
-            self._load_current_page()
+            self._load_current_page(tab_index)
     
-    def _load_next_page(self):
+    def _load_next_page(self, tab_index=None):
         """Load the next page of results."""
         total_pages = (self.total_rows + self.rows_per_page - 1) // self.rows_per_page
         if self.current_page < total_pages - 1:
             self.current_page += 1
-            self._load_current_page()
+            self._load_current_page(tab_index)
     
-    def _load_current_page(self):
+    def _load_current_page(self, tab_index=None):
         """Load the current page of results."""
+        if tab_index is None:
+            tab_index = self.query_tab_widget.currentIndex()
+            
+        self.current_tab_for_query = tab_index
+        
         if not hasattr(self, 'current_query') or not self.current_query:
             return
+            
+        # Get the tab that will display the results
+        query_tab = self.query_tabs[tab_index]
+        results_table = query_tab.results_table
             
         # Show a progress dialog
         self.query_progress = QProgressDialog("Loading page...", "Cancel", 0, 100, self)
@@ -1040,7 +1465,8 @@ class DuckDBApp(QMainWindow):
         self.query_thread.finished.connect(self.query_thread.deleteLater)
         
         self.query_worker.error.connect(self._on_query_error)
-        self.query_worker.success.connect(self._on_page_loaded)
+        self.query_worker.success.connect(lambda data, headers, total_count: 
+                                         self._on_page_loaded(data, headers, total_count, tab_index))
         self.query_worker.progress.connect(self._on_query_progress)
         self.query_worker.finished.connect(self._on_query_finished)
         self.query_progress.canceled.connect(self.query_worker.cancel)
@@ -1048,19 +1474,31 @@ class DuckDBApp(QMainWindow):
         # Start thread
         self.query_thread.start()
     
-    def _on_page_loaded(self, data, headers, total_count):
+    def _on_page_loaded(self, data, headers, total_count, tab_index=None):
         """Handle loading a new page of results."""
+        if tab_index is None:
+            tab_index = self.query_tab_widget.currentIndex()
+            
+        query_tab = self.query_tabs[tab_index]
+        results_table = query_tab.results_table
+        
         # Update the results table with the new page data
-        self._populate_results_table(data, headers)
+        self._populate_results_table(results_table, data, headers)
         
         # Update pagination controls
-        self._ensure_pagination_controls()
+        self._ensure_pagination_controls(tab_index)
 
     def _on_query_error(self, error_message):
         """Handles query errors in the UI thread."""
         print("Query Error (UI Thread):", error_message)
-        self.results_table.setRowCount(0)
-        self.results_table.setColumnCount(0)
+        
+        # Get the tab that executed the query
+        tab_index = getattr(self, 'current_tab_for_query', self.query_tab_widget.currentIndex())
+        query_tab = self.query_tabs[tab_index]
+        results_table = query_tab.results_table
+        
+        results_table.setRowCount(0)
+        results_table.setColumnCount(0)
         QMessageBox.critical(self, "Query Error", error_message)
 
     def _on_query_finished(self):
@@ -1071,12 +1509,16 @@ class DuckDBApp(QMainWindow):
         if hasattr(self, 'query_progress') and self.query_progress:
             self.query_progress.close()
             
-        # Restore button state
-        # Find the button again (or use self.run_query_button if set up)
-        run_button = self.query_editor.parent().layout().itemAt(self.query_editor.parent().layout().count() - 1).widget()
-        if isinstance(run_button, QPushButton) and self.original_button_text is not None:
-            run_button.setText(self.original_button_text)
-            run_button.setEnabled(True)
+        # Get the tab that executed the query
+        tab_index = getattr(self, 'current_tab_for_query', self.query_tab_widget.currentIndex())
+        if 0 <= tab_index < len(self.query_tabs):
+            query_tab = self.query_tabs[tab_index]
+            run_button = query_tab.run_query_button
+            
+            # Restore button state
+            if hasattr(self, 'original_button_text') and self.original_button_text is not None:
+                run_button.setText(self.original_button_text)
+                run_button.setEnabled(True)
             
         # Clean up references
         self.query_thread = None
@@ -1209,6 +1651,12 @@ class DuckDBApp(QMainWindow):
         file_name = os.path.basename(file_path)
         escaped_file_name = file_name.replace("'", "''")
 
+        # Helper function to quote identifiers only when needed
+        def quote_id(identifier):
+            if ' ' in identifier or any(c in identifier for c in '-.+/*()[]{}'):
+                return f'"{identifier}"'
+            return identifier
+
         # We need temporary schema functions that use the worker connection
         def _worker_table_exists(name):
             try: return len(db_conn_worker.execute(f"PRAGMA table_info('{name}')").fetchall()) > 0
@@ -1250,21 +1698,22 @@ class DuckDBApp(QMainWindow):
              raise InterruptedError("Import cancelled before execution.")
 
         select_with_source = f"SELECT *, '{escaped_file_name}' AS source_file FROM {read_function_sql}"
+        quoted_table_name = quote_id(table_name)
 
         if mode == "Create New Table":
             if table_exists:
                 raise ValueError(f"Table '{table_name}' already exists.")
-            query = f'CREATE TABLE "{table_name}" AS {select_with_source};'
+            query = f'CREATE TABLE {quoted_table_name} AS {select_with_source};'
 
         elif mode == "Replace Existing Table":
             # Use DROP CASCADE + CREATE AS to ensure no old constraints (like PKs) remain
             # This forcefully removes the table and anything depending on it.
-            drop_query = f'DROP TABLE IF EXISTS "{table_name}" CASCADE;'
+            drop_query = f'DROP TABLE IF EXISTS {quoted_table_name} CASCADE;'
             print(f"Worker executing: {drop_query}")
             db_conn_worker.execute(drop_query)
             
             # Create the new table from source, without constraints
-            query = f'CREATE TABLE "{table_name}" AS {select_with_source};'
+            query = f'CREATE TABLE {quoted_table_name} AS {select_with_source};'
             # No DELETE, ALTER, or extra schema checks needed here for Replace mode
 
         elif mode == "Append to Existing Table":
@@ -1298,8 +1747,9 @@ class DuckDBApp(QMainWindow):
             # Compare using lowercase keys
             for lower_col_name, (orig_col_name, col_type) in source_schema.items():
                 if lower_col_name not in target_schema:
-                     # Use original case name for ALTER TABLE
-                    alter_statements.append(f'ALTER TABLE "{table_name}" ADD COLUMN "{orig_col_name}" {col_type};')
+                     # Quote column name only if needed
+                    quoted_col_name = quote_id(orig_col_name)
+                    alter_statements.append(f'ALTER TABLE {quoted_table_name} ADD COLUMN {quoted_col_name} {col_type};')
 
             # Check for cancellation before potentially long ALTER/INSERT
             if worker_ref.is_cancelled: raise InterruptedError("Import cancelled before schema change/insert.")
@@ -1313,11 +1763,12 @@ class DuckDBApp(QMainWindow):
             source_cols_result = db_conn_worker.execute(f"SELECT * FROM {read_function_sql} LIMIT 0").description
             if source_cols_result:
                 orig_source_cols = [desc[0] for desc in source_cols_result] + ['source_file']
-                cols_str = ', '.join([f'"{col}"' for col in orig_source_cols])
-                query = f'INSERT INTO "{table_name}" ({cols_str}) ({select_with_source});'
+                # Quote column names only when needed
+                cols_str = ', '.join([quote_id(col) for col in orig_source_cols])
+                query = f'INSERT INTO {quoted_table_name} ({cols_str}) ({select_with_source});'
             else:
                 # Fallback if can't get columns
-                query = f'INSERT INTO "{table_name}" ({select_with_source});'
+                query = f'INSERT INTO {quoted_table_name} ({select_with_source});'
 
         if query:
             print(f"Worker executing: {query}")
@@ -1338,6 +1789,12 @@ class DuckDBApp(QMainWindow):
         file_name = os.path.basename(file_path)
         escaped_file_name = file_name.replace("'", "''")
         temp_view_name = f"__{table_name}_excel_worker_view"
+
+        # Helper function to quote identifiers only when needed
+        def quote_id(identifier):
+            if ' ' in identifier or any(c in identifier for c in '-.+/*()[]{}'):
+                return f'"{identifier}"'
+            return identifier
 
         # Helper schema functions using worker connection
         def _worker_table_exists(name):
@@ -1377,21 +1834,22 @@ class DuckDBApp(QMainWindow):
 
             table_exists = _worker_table_exists(table_name)
             query = None
+            quoted_table_name = quote_id(table_name)
 
             if mode == "Create New Table":
                 if table_exists:
                     raise ValueError(f"Table '{table_name}' already exists.")
-                query = f'CREATE TABLE "{table_name}" AS {select_from_view};'
+                query = f'CREATE TABLE {quoted_table_name} AS {select_from_view};'
 
             elif mode == "Replace Existing Table":
                 # Use DROP CASCADE + CREATE AS to ensure no old constraints (like PKs) remain
                 # This forcefully removes the table and anything depending on it.
-                drop_query = f'DROP TABLE IF EXISTS "{table_name}" CASCADE;'
+                drop_query = f'DROP TABLE IF EXISTS {quoted_table_name} CASCADE;'
                 print(f"Worker executing: {drop_query}")
                 db_conn_worker.execute(drop_query)
                 
                 # Create the new table from source, without constraints
-                query = f'CREATE TABLE "{table_name}" AS {select_from_view};'
+                query = f'CREATE TABLE {quoted_table_name} AS {select_from_view};'
                 # No DELETE, ALTER, or extra schema checks needed here for Replace mode
 
             elif mode == "Append to Existing Table":
@@ -1426,8 +1884,9 @@ class DuckDBApp(QMainWindow):
                 # Compare using lowercase keys
                 for lower_col_name, (orig_col_name, col_type) in source_schema.items():
                     if lower_col_name not in target_schema:
-                        # Use original case name for ALTER TABLE
-                        alter_statements.append(f'ALTER TABLE "{table_name}" ADD COLUMN "{orig_col_name}" {col_type};')
+                        # Quote column name only if needed
+                        quoted_col_name = quote_id(orig_col_name)
+                        alter_statements.append(f'ALTER TABLE {quoted_table_name} ADD COLUMN {quoted_col_name} {col_type};')
 
                 # Check for cancellation before potentially long ALTER/INSERT
                 if worker_ref.is_cancelled: raise InterruptedError("Import cancelled before schema change/insert.")
@@ -1439,8 +1898,9 @@ class DuckDBApp(QMainWindow):
 
                 # Modified INSERT query to explicitly list columns (original case)
                 df_columns = [col_info[0] for col_info in source_schema.values()] # Get original names
-                source_cols = ', '.join([f'"{col}"' for col in df_columns])
-                query = f'INSERT INTO "{table_name}" ({source_cols}) {select_from_view};'
+                # Quote column names only when needed
+                source_cols = ', '.join([quote_id(col) for col in df_columns])
+                query = f'INSERT INTO {quoted_table_name} ({source_cols}) {select_from_view};'
 
             if query:
                 print(f"Worker executing: {query}")
@@ -1669,7 +2129,8 @@ class DuckDBApp(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             try:
                 # Use CASCADE to remove dependencies
-                drop_query = f'DROP TABLE "{table_name}" CASCADE;'
+                quoted_table_name = self.quote_identifier(table_name)
+                drop_query = f'DROP TABLE {quoted_table_name} CASCADE;'
                 print(f"Executing: {drop_query}")
                 self.db_conn.execute(drop_query)
                 self.load_tables() # Refresh list
@@ -1680,107 +2141,36 @@ class DuckDBApp(QMainWindow):
     # --- Export Methods ---
     
     def _get_results_as_dataframe(self):
-        """Convert current query results to a pandas DataFrame."""
-        if not hasattr(self, 'results_table') or self.results_table.rowCount() == 0 or self.results_table.columnCount() == 0:
-            QMessageBox.warning(self, "Warning", "No results to export. Run a query first.")
+        """Get the current results as a pandas dataframe."""
+        current_tab = self.get_current_query_tab()
+        if not current_tab or not hasattr(current_tab, 'results_table'):
             return None
             
-        try:
-            import pandas as pd
-            
-            # For very large tables, this could be slow
-            # First, check if we have stored the full result set for pagination
-            if hasattr(self, 'current_query') and self.current_query and hasattr(self, 'total_rows') and self.total_rows > self.rows_per_page:
-                # For large result sets, directly query the database to avoid UI freezing
-                try:
-                    # Show progress dialog for direct database query
-                    progress = QProgressDialog("Preparing data for export...", "Cancel", 0, 100, self)
-                    progress.setWindowModality(Qt.WindowModality.WindowModal)
-                    progress.setMinimumDuration(300)
-                    progress.setValue(10)
-                    
-                    # Create a temporary connection and get all data directly
-                    temp_conn = self._get_new_db_connection()
-                    if temp_conn:
-                        progress.setValue(20)
-                        # Process in batches with pd.read_sql_query to avoid memory issues
-                        # First, make sure we don't have LIMIT or OFFSET in the original query
-                        query = self.current_query
-                        # Remove any existing LIMIT clause
-                        if re.search(r'\bLIMIT\b\s+\d+', query, re.IGNORECASE):
-                            query = re.sub(r'\bLIMIT\b\s+\d+', '', query, flags=re.IGNORECASE)
-                        # Remove any existing OFFSET clause
-                        if re.search(r'\bOFFSET\b\s+\d+', query, re.IGNORECASE):
-                            query = re.sub(r'\bOFFSET\b\s+\d+', '', query, flags=re.IGNORECASE)
-                            
-                        progress.setValue(30)
-                        df = pd.read_sql_query(query, temp_conn)
-                        progress.setValue(90)
-                        temp_conn.close()
-                        progress.setValue(100)
-                        progress.close()
-                        return df
-                except Exception as e:
-                    print(f"Could not export full result set directly: {e}")
-                    # Fall back to UI table data
-                    if progress:
-                        progress.close()
-            
-            # Get column headers
-            headers = []
-            for col in range(self.results_table.columnCount()):
-                header_item = self.results_table.horizontalHeaderItem(col)
-                headers.append(header_item.text() if header_item else f"Column{col}")
-            
-            # Get data from table (for when direct database access fails or for smaller datasets)
-            data = []
-            total_rows = self.results_table.rowCount()
-            
-            # Show progress for larger tables
-            progress = None
-            if total_rows > 1000:
-                progress = QProgressDialog("Reading table data...", "Cancel", 0, total_rows, self)
-                progress.setWindowModality(Qt.WindowModality.WindowModal)
-                progress.setMinimumDuration(300)
-            
-            # Process in batches
-            batch_size = 1000
-            for start_row in range(0, total_rows, batch_size):
-                end_row = min(start_row + batch_size, total_rows)
-                
-                if progress:
-                    progress.setValue(start_row)
-                    if progress.wasCanceled():
-                        if progress:
-                            progress.close()
-                        return None
-                
-                # Process this batch
-                for row in range(start_row, end_row):
-                    row_data = []
-                    for col in range(self.results_table.columnCount()):
-                        item = self.results_table.item(row, col)
-                        # Handle null values
-                        value = item.text() if item else None
-                        # Convert "NULL" string to None
-                        if value == "NULL":
-                            value = None
-                        row_data.append(value)
-                    data.append(row_data)
-            
-            if progress:
-                progress.close()
-                
-            # Create DataFrame
-            df = pd.DataFrame(data, columns=headers)
-            return df
-            
-        except ImportError:
-            QMessageBox.critical(self, "Error", "Pandas library is required for exporting data.\nPlease install it with 'pip install pandas'.")
+        results_table = current_tab.results_table
+        
+        if results_table.rowCount() == 0 or results_table.columnCount() == 0:
             return None
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Error preparing data for export:\n{e}")
-            return None
+        
+        # Get column headers
+        headers = []
+        for col in range(results_table.columnCount()):
+            header_item = results_table.horizontalHeaderItem(col)
+            headers.append(header_item.text() if header_item else f"Column_{col}")
+        
+        # Get data
+        data = []
+        for row in range(results_table.rowCount()):
+            row_data = []
+            for col in range(results_table.columnCount()):
+                item = results_table.item(row, col)
+                value = item.text() if item else ""
+                # Handle NULL values
+                row_data.append(None if value == "NULL" else value)
+            data.append(row_data)
+        
+        # Create dataframe
+        df = pd.DataFrame(data, columns=headers)
+        return df
     
     def export_to_csv(self):
         """Export current query results to a CSV file."""
@@ -2020,6 +2410,212 @@ class DuckDBApp(QMainWindow):
         # Clean up references
         self.export_thread = None
         self.export_worker = None
+
+    def save_query(self):
+        """Save the current query as a named snippet."""
+        current_editor = self.get_current_query_editor()
+        if not current_editor:
+            return
+            
+        query_text = current_editor.toPlainText().strip()
+        if not query_text:
+            QMessageBox.warning(self, "Warning", "Query cannot be empty.")
+            return
+            
+        # Show save dialog
+        dialog = SaveQueryDialog(query_text, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            query_name = dialog.name_edit.text().strip()
+            query_desc = dialog.description_edit.toPlainText().strip()
+            
+            if not query_name:
+                QMessageBox.warning(self, "Warning", "Query name cannot be empty.")
+                return
+                
+            # Check if name already exists
+            for query in self.saved_queries:
+                if query['name'] == query_name:
+                    confirm = QMessageBox.question(
+                        self, "Confirm Overwrite", 
+                        f"A query named '{query_name}' already exists. Overwrite?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if confirm == QMessageBox.StandardButton.No:
+                        return
+                    # Remove the existing query
+                    self.saved_queries.remove(query)
+                    break
+                    
+            # Add the query to the saved list
+            self.saved_queries.append({
+                'name': query_name,
+                'description': query_desc,
+                'query': query_text
+            })
+            
+            # Sort by name
+            self.saved_queries.sort(key=lambda q: q['name'].lower())
+            
+            # Save to file
+            self.save_saved_queries()
+            
+            # Update menu
+            self.update_saved_queries_menu()
+            
+            QMessageBox.information(self, "Success", f"Query '{query_name}' saved successfully.")
+    
+    def load_saved_query(self):
+        """Load a saved query into the current editor."""
+        action = self.sender()
+        if action and isinstance(action, QAction):
+            idx = action.data()
+            if idx is not None and 0 <= idx < len(self.saved_queries):
+                query_info = self.saved_queries[idx]
+                
+                current_editor = self.get_current_query_editor()
+                if current_editor:
+                    # Check if editor has content
+                    if current_editor.toPlainText().strip():
+                        # Ask if user wants to replace or append
+                        options = QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
+                        response = QMessageBox.question(
+                            self, "Load Query", 
+                            f"Current editor has content. Replace it with '{query_info['name']}'?\n\n"
+                            f"Yes - Replace content\n"
+                            f"No - Append to current content\n"
+                            f"Cancel - Do nothing",
+                            options
+                        )
+                        
+                        if response == QMessageBox.StandardButton.Cancel:
+                            return
+                        elif response == QMessageBox.StandardButton.Yes:
+                            # Replace editor content
+                            current_editor.setPlainText(query_info['query'])
+                        else:  # No - append
+                            # Add a newline if needed
+                            current_text = current_editor.toPlainText()
+                            if current_text and not current_text.endswith('\n'):
+                                current_text += '\n\n'
+                            # Append the query
+                            current_editor.setPlainText(current_text + query_info['query'])
+                    else:
+                        # Empty editor, just set the content
+                        current_editor.setPlainText(query_info['query'])
+                    
+                    # Set focus to the editor
+                    current_editor.setFocus()
+    
+    def manage_saved_queries(self):
+        """Open dialog to manage saved queries."""
+        # This would be a more complex dialog with a list widget
+        # For now, we'll implement a simple version that lets users delete queries
+        if not self.saved_queries:
+            QMessageBox.information(self, "Info", "No saved queries to manage.")
+            return
+            
+        items = [query['name'] for query in self.saved_queries]
+        item, ok = QInputDialog.getItem(
+            self, "Delete Saved Query", 
+            "Select a query to delete:", 
+            items, 0, False
+        )
+        
+        if ok and item:
+            # Find the index of the query with this name
+            for idx, query in enumerate(self.saved_queries):
+                if query['name'] == item:
+                    confirm = QMessageBox.question(
+                        self, "Confirm Delete", 
+                        f"Are you sure you want to delete the query '{item}'?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if confirm == QMessageBox.StandardButton.Yes:
+                        self.saved_queries.pop(idx)
+                        self.save_saved_queries()
+                        self.update_saved_queries_menu()
+                        QMessageBox.information(self, "Success", f"Query '{item}' deleted.")
+                    break
+
+    def add_query_tab(self):
+        """Add a new query tab."""
+        new_tab = QueryTab()
+        tab_count = self.query_tab_widget.count() + 1
+        tab_title = f"Query {tab_count}"
+        
+        index = self.query_tab_widget.addTab(new_tab, tab_title)
+        
+        # Connect the run button to our execute_query method
+        new_tab.run_query_button.clicked.connect(lambda: self.execute_query(tab_index=index))
+        
+        # Update autocompletion data for the new tab
+        if self.db_conn:
+            self.update_autocompletion_data()
+        
+        # Store reference to the tab
+        self.query_tabs.append(new_tab)
+        
+        # Switch to the new tab
+        self.query_tab_widget.setCurrentIndex(index)
+        
+        return new_tab
+    
+    def close_tab(self, index):
+        """Close a tab by index."""
+        if self.query_tab_widget.count() > 1:  # Don't close the last tab
+            widget = self.query_tab_widget.widget(index)
+            self.query_tab_widget.removeTab(index)
+            self.query_tabs.pop(index)
+            widget.deleteLater()
+    
+    def close_current_tab(self):
+        """Close the currently active tab."""
+        current_index = self.query_tab_widget.currentIndex()
+        self.close_tab(current_index)
+    
+    def on_tab_changed(self, index):
+        """Handle tab change events."""
+        self.current_tab_index = index
+    
+    def get_current_query_tab(self):
+        """Get the current query tab widget."""
+        return self.query_tab_widget.currentWidget()
+    
+    def get_current_query_editor(self):
+        """Get the query editor in the current tab."""
+        current_tab = self.get_current_query_tab()
+        if current_tab:
+            return current_tab.query_editor
+        return None
+    
+    def get_current_results_table(self):
+        """Get the results table in the current tab."""
+        current_tab = self.get_current_query_tab()
+        if current_tab:
+            return current_tab.results_table
+        return None
+
+    def update_saved_queries_menu(self):
+        """Update the saved queries menu."""
+        self.saved_queries_menu.clear()
+        
+        if not self.saved_queries:
+            no_saved = QAction("No Saved Queries", self)
+            no_saved.setEnabled(False)
+            self.saved_queries_menu.addAction(no_saved)
+            return
+            
+        for idx, query_info in enumerate(self.saved_queries):
+            query_action = QAction(query_info['name'], self)
+            query_action.setToolTip(query_info['description'])
+            query_action.setData(idx)  # Store the index in the action
+            query_action.triggered.connect(self.load_saved_query)
+            self.saved_queries_menu.addAction(query_action)
+            
+        self.saved_queries_menu.addSeparator()
+        manage_action = QAction("Manage Saved Queries...", self)
+        manage_action.triggered.connect(self.manage_saved_queries)
+        self.saved_queries_menu.addAction(manage_action)
 
 
 if __name__ == "__main__":
