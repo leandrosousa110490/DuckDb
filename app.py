@@ -800,7 +800,79 @@ class QueryTab(QWidget):
         self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.results_table.verticalHeader().setVisible(False)
+        
+        # Enable context menu for results table
+        self.results_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.results_table.customContextMenuRequested.connect(self.show_results_context_menu)
+        
         layout.addWidget(self.results_table, 1)  # Give the results table more vertical space
+        
+    def show_results_context_menu(self, pos):
+        """Shows the context menu for the results table cells."""
+        # Get the table widget (sender)
+        table = self.sender()
+        if not table:
+            return
+            
+        # Get the item at the position
+        item = table.itemAt(pos)
+        if not item:
+            return
+            
+        menu = QMenu()
+        
+        # Copy cell value action
+        copy_cell_action = QAction("Copy Value", table)
+        copy_cell_action.triggered.connect(lambda: self.copy_cell_value(item))
+        menu.addAction(copy_cell_action)
+        
+        # Copy table action
+        copy_table_action = QAction("Copy Table", table)
+        copy_table_action.triggered.connect(lambda: self.copy_table_contents(table))
+        menu.addAction(copy_table_action)
+        
+        # Show the menu at the cursor position
+        menu.exec(table.mapToGlobal(pos))
+        
+    def copy_cell_value(self, item):
+        """Copy the value of a single cell to the clipboard."""
+        if not item:
+            return
+            
+        # Get the cell value
+        value = item.text()
+        
+        # Copy to clipboard
+        clipboard = QApplication.clipboard()
+        clipboard.setText(value)
+        
+    def copy_table_contents(self, table):
+        """Copy the entire table contents to the clipboard."""
+        if not table or table.rowCount() == 0 or table.columnCount() == 0:
+            return
+            
+        rows = []
+        
+        # Get headers
+        headers = []
+        for col in range(table.columnCount()):
+            header_item = table.horizontalHeaderItem(col)
+            headers.append(header_item.text() if header_item else f"Column_{col}")
+        
+        rows.append("\t".join(headers))
+        
+        # Get data
+        for row in range(table.rowCount()):
+            row_data = []
+            for col in range(table.columnCount()):
+                item = table.item(row, col)
+                value = item.text() if item else ""
+                row_data.append(value)
+            rows.append("\t".join(row_data))
+        
+        # Copy to clipboard as tab-separated text (works well for pasting into Excel or other tools)
+        clipboard = QApplication.clipboard()
+        clipboard.setText("\n".join(rows))
 
 class DuckDBApp(QMainWindow):
     def __init__(self):
