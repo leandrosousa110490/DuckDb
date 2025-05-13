@@ -3311,6 +3311,9 @@ class BulkExcelImportWorker(QObject):
                 for col in sorted(columns_to_use):
                     schema_parts.append(f'"{col}" VARCHAR')
                 
+                # Add source_file column to schema
+                schema_parts.append('"source_file" VARCHAR')
+                
                 schema_sql = ", ".join(schema_parts)
                 conn.execute(f'CREATE TABLE IF NOT EXISTS "{self.table_name}" ({schema_sql})')
             
@@ -3331,7 +3334,11 @@ class BulkExcelImportWorker(QObject):
                 for col in columns_to_use:
                     if col not in existing_column_names:
                         conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col}" VARCHAR')
-                        
+                
+                # Ensure source_file column exists
+                if 'source_file' not in existing_column_names:
+                    conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "source_file" VARCHAR')
+            
             self.progress.emit(20)
             
             # Step 2: Process each file - using pandas instead of read_excel_auto
@@ -3343,9 +3350,13 @@ class BulkExcelImportWorker(QObject):
                     # Read the Excel file using pandas
                     df = pd.read_excel(file_path, sheet_name=self.sheet_name)
                     
+                    # Add source filename column
+                    file_name = os.path.basename(file_path)
+                    df['source_file'] = file_name
+                    
                     if self.use_common_only:
                         # Filter to only include common columns
-                        df = df[list(common_columns)]
+                        df = df[list(common_columns) + ['source_file']]
                     else:
                         # For all columns, add missing columns as NULL
                         for col in all_columns:
