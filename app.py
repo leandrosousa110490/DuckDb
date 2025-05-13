@@ -118,13 +118,144 @@ DARK_STYLESHEET = """
     }
 """
 
-class SQLHighlighter(QSyntaxHighlighter):
-    def __init__(self, parent=None):
-        super().__init__(parent)
+LIGHT_STYLESHEET = """
+    QWidget {
+        background-color: #f5f5f5;
+        color: #333333;
+        font-size: 10pt;
+    }
+    QMainWindow {
+        background-color: #f5f5f5;
+    }
+    QMenuBar {
+        background-color: #e0e0e0;
+        color: #333333;
+    }
+    QMenuBar::item {
+        background-color: #e0e0e0;
+        color: #333333;
+    }
+    QMenuBar::item:selected {
+        background-color: #c0c0c0;
+    }
+    QMenu {
+        background-color: #e0e0e0;
+        color: #333333;
+        border: 1px solid #c0c0c0;
+    }
+    QMenu::item:selected {
+        background-color: #c0c0c0;
+    }
+    QPushButton {
+        background-color: #e0e0e0;
+        color: #333333;
+        border: 1px solid #c0c0c0;
+        padding: 5px;
+        min-height: 15px;
+        border-radius: 4px;
+    }
+    QPushButton:hover {
+        background-color: #d0d0d0;
+    }
+    QPushButton:pressed {
+        background-color: #c0c0c0;
+    }
+    QListWidget {
+        background-color: #ffffff;
+        color: #333333;
+        border: 1px solid #c0c0c0;
+        padding: 5px;
+    }
+    QTextEdit {
+        background-color: #ffffff;
+        color: #333333;
+        border: 1px solid #c0c0c0;
+        padding: 5px;
+    }
+    QTableWidget {
+        background-color: #ffffff;
+        color: #333333;
+        border: 1px solid #c0c0c0;
+        gridline-color: #d0d0d0;
+    }
+    QTableWidget::item {
+        padding: 5px;
+    }
+    QHeaderView::section {
+        background-color: #e0e0e0;
+        color: #333333;
+        padding: 4px;
+        border: 1px solid #c0c0c0;
+    }
+    QLabel {
+        color: #333333;
+    }
+    QSplitter::handle {
+        background-color: #e0e0e0;
+        border: 1px solid #c0c0c0;
+        height: 5px; /* Vertical splitter */
+        width: 5px; /* Horizontal splitter */
+    }
+    QSplitter::handle:hover {
+        background-color: #d0d0d0;
+    }
+    QSplitter::handle:pressed {
+        background-color: #c0c0c0;
+    }
+    QMessageBox {
+        background-color: #f5f5f5;
+    }
+    QMessageBox QLabel {
+        color: #333333;
+    }
+    QMessageBox QPushButton {
+        background-color: #e0e0e0;
+        color: #333333;
+        border: 1px solid #c0c0c0;
+        padding: 5px;
+        min-width: 70px;
+    }
+"""
 
-        keyword_format = QTextCharFormat()
-        keyword_format.setForeground(QColor("#569cd6")) # Blue color for keywords
-        keyword_format.setFontWeight(QFont.Weight.Bold)
+class SQLHighlighter(QSyntaxHighlighter):
+    def __init__(self, parent=None, dark_theme=True):
+        super().__init__(parent)
+        self.dark_theme = dark_theme
+        self.set_color_theme(dark_theme)
+
+    def set_color_theme(self, dark_theme):
+        """Set the color theme for syntax highlighting."""
+        self.dark_theme = dark_theme
+        
+        # Define colors for different themes
+        if dark_theme:
+            # Dark theme colors
+            keyword_color = QColor("#569cd6")  # Blue color for keywords
+            string_color = QColor("#ce9178")   # Orange/brown for strings
+            comment_color = QColor("#6a9955")  # Green for comments
+        else:
+            # Light theme colors
+            keyword_color = QColor("#0000ff")  # Blue color for keywords
+            string_color = QColor("#a31515")   # Red for strings
+            comment_color = QColor("#008000")  # Green for comments
+
+        # Set up formats with the theme colors
+        self.keyword_format = QTextCharFormat()
+        self.keyword_format.setForeground(keyword_color)
+        self.keyword_format.setFontWeight(QFont.Weight.Bold)
+        
+        self.string_format = QTextCharFormat()
+        self.string_format.setForeground(string_color)
+        
+        self.comment_format = QTextCharFormat()
+        self.comment_format.setForeground(comment_color)
+        self.comment_format.setFontItalic(True)
+        
+        # Rebuild highlighting rules
+        self.update_highlighting_rules()
+
+    def update_highlighting_rules(self):
+        """Update highlighting rules with current formats."""
         keywords = [
             "\\bSELECT\\b", "\\bFROM\\b", "\\bWHERE\\b", "\\bINSERT\\b", "\\bUPDATE\\b",
             "\\bDELETE\\b", "\\bCREATE\\b", "\\bALTER\\b", "\\bDROP\\b", "\\bTABLE\\b",
@@ -135,18 +266,31 @@ class SQLHighlighter(QSyntaxHighlighter):
             "\\bLIKE\\b", "\\bIN\\b", "\\bBETWEEN\\b", "\\bCASE\\b", "\\bWHEN\\b", "\\bTHEN\\b",
             "\\bELSE\\b", "\\bEND\\b", "\\bSHOW\\b", "\\bDESCRIBE\\b", "\\bPRAGMA\\b"
         ]
-        self.highlighting_rules = [(QRegularExpression(pattern, QRegularExpression.PatternOption.CaseInsensitiveOption), keyword_format) for pattern in keywords]
-
-        # Optional: Add rules for strings and comments
-        string_format = QTextCharFormat()
-        string_format.setForeground(QColor("#ce9178")) # Orange/brown for strings
-        self.highlighting_rules.append((QRegularExpression("'.*?'"), string_format))
-        self.highlighting_rules.append((QRegularExpression("\"[^\"]*\""), string_format)) # Double quotes too
-
-        comment_format = QTextCharFormat()
-        comment_format.setForeground(QColor("#6a9955")) # Green for comments
-        comment_format.setFontItalic(True)
-        self.highlighting_rules.append((QRegularExpression("--.*"), comment_format))
+        
+        self.highlighting_rules = []
+        
+        # Add keyword rules
+        for pattern in keywords:
+            self.highlighting_rules.append(
+                (QRegularExpression(pattern, QRegularExpression.PatternOption.CaseInsensitiveOption), 
+                 self.keyword_format)
+            )
+        
+        # Add string rules
+        self.highlighting_rules.append(
+            (QRegularExpression("'.*?'"), self.string_format)
+        )
+        self.highlighting_rules.append(
+            (QRegularExpression("\"[^\"]*\""), self.string_format)
+        )
+        
+        # Add comment rule
+        self.highlighting_rules.append(
+            (QRegularExpression("--.*"), self.comment_format)
+        )
+        
+        # Force rehighlight of the document
+        self.rehighlight()
 
     def highlightBlock(self, text):
         for pattern, format in self.highlighting_rules:
@@ -752,8 +896,9 @@ class SQLTextEdit(QTextEdit):
             print(f"[HC] Model empty or no matches, hiding popup.")
 
 class QueryTab(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, dark_theme=True):
         super().__init__(parent)
+        self.dark_theme = dark_theme
         self.init_ui()
         
     def init_ui(self):
@@ -765,7 +910,7 @@ class QueryTab(QWidget):
         # Use the custom SQLTextEdit with autocompletion
         self.query_editor = SQLTextEdit()
         self.query_editor.setPlaceholderText("Enter your SQL query here...")
-        self.highlighter = SQLHighlighter(self.query_editor.document())
+        self.highlighter = SQLHighlighter(self.query_editor.document(), self.dark_theme)
         
         # Set up the completer
         completer = QCompleter(self)
@@ -958,13 +1103,20 @@ class DuckDBApp(QMainWindow):
         self.saved_queries = []
         self.query_tabs = []
         self.current_tab_index = 0
+        self.dark_theme_enabled = True  # Default to dark theme
         
-        # Load recent databases and saved queries
+        # Load recent databases, saved queries, and theme preference
         self.load_recent_dbs()
         self.load_saved_queries()
+        self.load_theme_preference()
 
         self.init_ui()
-        self.apply_dark_theme()
+        
+        # Apply theme based on preference
+        if self.dark_theme_enabled:
+            self.apply_dark_theme()
+        else:
+            self.apply_light_theme()
 
     def load_recent_dbs(self):
         """Load list of recently opened databases from file."""
@@ -989,6 +1141,30 @@ class DuckDBApp(QMainWindow):
         except Exception as e:
             print(f"Error loading saved queries: {e}")
             self.saved_queries = []
+    
+    def load_theme_preference(self):
+        """Load theme preference from file."""
+        try:
+            theme_file = os.path.join(os.path.expanduser("~"), ".duckdb_theme")
+            if os.path.exists(theme_file):
+                with open(theme_file, "r") as f:
+                    theme_data = f.read().strip()
+                    self.dark_theme_enabled = theme_data.lower() == "dark"
+            else:
+                # Default to dark theme if no preference file exists
+                self.dark_theme_enabled = True
+        except Exception as e:
+            print(f"Error loading theme preference: {e}")
+            self.dark_theme_enabled = True  # Default to dark theme on error
+    
+    def save_theme_preference(self):
+        """Save theme preference to file."""
+        try:
+            theme_file = os.path.join(os.path.expanduser("~"), ".duckdb_theme")
+            with open(theme_file, "w") as f:
+                f.write("dark" if self.dark_theme_enabled else "light")
+        except Exception as e:
+            print(f"Error saving theme preference: {e}")
     
     def save_recent_dbs(self):
         """Save list of recently opened databases to file."""
@@ -1021,7 +1197,47 @@ class DuckDBApp(QMainWindow):
         self.update_recent_menu()
 
     def apply_dark_theme(self):
+        """Apply dark theme to the application."""
         self.setStyleSheet(DARK_STYLESHEET)
+        self.dark_theme_enabled = True
+        
+        # Update theme toggle menu item
+        if hasattr(self, 'theme_action'):
+            self.theme_action.setText("Switch to Light Theme")
+        
+        # Update syntax highlighters in all query tabs
+        self.update_syntax_highlighters(dark_theme=True)
+        
+        # Save preference
+        self.save_theme_preference()
+    
+    def apply_light_theme(self):
+        """Apply light theme to the application."""
+        self.setStyleSheet(LIGHT_STYLESHEET)
+        self.dark_theme_enabled = False
+        
+        # Update theme toggle menu item
+        if hasattr(self, 'theme_action'):
+            self.theme_action.setText("Switch to Dark Theme")
+            
+        # Update syntax highlighters in all query tabs
+        self.update_syntax_highlighters(dark_theme=False)
+        
+        # Save preference
+        self.save_theme_preference()
+    
+    def update_syntax_highlighters(self, dark_theme):
+        """Update syntax highlighters in all query tabs to match the current theme."""
+        for tab in self.query_tabs:
+            if hasattr(tab, 'highlighter') and tab.highlighter:
+                tab.highlighter.set_color_theme(dark_theme)
+    
+    def toggle_theme(self):
+        """Toggle between dark and light themes."""
+        if self.dark_theme_enabled:
+            self.apply_light_theme()
+        else:
+            self.apply_dark_theme()
 
     def init_ui(self):
         # --- Menu Bar ---
@@ -1079,6 +1295,15 @@ class DuckDBApp(QMainWindow):
         export_parquet_action = QAction("Export as &Parquet...", self)
         export_parquet_action.triggered.connect(self.export_to_parquet)
         export_menu.addAction(export_parquet_action)
+        
+        # --- View Menu ---
+        view_menu = menubar.addMenu("&View")
+        
+        # Theme toggle action
+        theme_text = "Switch to Light Theme" if self.dark_theme_enabled else "Switch to Dark Theme"
+        self.theme_action = QAction(theme_text, self)
+        self.theme_action.triggered.connect(self.toggle_theme)
+        view_menu.addAction(self.theme_action)
         
         # --- Query Menu ---
         query_menu = menubar.addMenu("&Query")
@@ -2683,7 +2908,7 @@ class DuckDBApp(QMainWindow):
 
     def add_query_tab(self):
         """Add a new query tab."""
-        new_tab = QueryTab()
+        new_tab = QueryTab(dark_theme=self.dark_theme_enabled)
         tab_count = self.query_tab_widget.count() + 1
         tab_title = f"Query {tab_count}"
         
