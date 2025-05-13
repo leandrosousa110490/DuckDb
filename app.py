@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import duckdb
 import os
 import json
@@ -18,6 +18,7 @@ from PyQt6.QtCore import Qt, QRegularExpression, QThread, QObject, pyqtSignal, Q
 import re
 import pandas as pd
 import csv
+import glob
 
 DARK_STYLESHEET = """
     QWidget {
@@ -1347,6 +1348,10 @@ class DuckDBApp(QMainWindow):
         import_excel_action.triggered.connect(self.import_excel)
         import_menu.addAction(import_excel_action)
         
+        bulk_excel_import_action = QAction("Bulk Import Excel Files from &Folder...", self)
+        bulk_excel_import_action.triggered.connect(self.import_excel_folder)
+        import_menu.addAction(bulk_excel_import_action)
+        
         # --- Export Menu ---
         export_menu = menubar.addMenu("&Export")
         
@@ -2527,24 +2532,167 @@ class DuckDBApp(QMainWindow):
             self._start_import_thread(self._execute_import_core, filePath, read_function)
 
     def import_excel(self):
-        """Imports data from an Excel file (uses thread)."""
+        """Import data from an Excel file into a DuckDB table."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Import Excel File", "", "Excel Files (*.xlsx *.xls *.xlsm)"
+        )
+        if not file_path:
+            return
+        
+        # Get sheet names for further selection
+        try:
+            sheet_names = pd.ExcelFile(file_path).sheet_names
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to read Excel file: {str(e)}")
+            return
+            
+        if not sheet_names:
+            QMessageBox.warning(self, "Warning", "No sheets found in the Excel file.")
+            return
+            
+        # Let user select a sheet
+        sheet_name, ok = QInputDialog.getItem(
+            self, "Select Sheet", "Choose a sheet to import:", sheet_names, 0, False
+        )
+        if not ok or not sheet_name:
+            return
+            
+        # Start the import thread
+        self._start_import_thread(self._execute_excel_import_core, file_path, sheet_name)
+
+    def import_excel_folder(self):
+        """Import multiple Excel files from a folder and append to a single table."""
+        # Check if we have a database connection
         if not self.db_conn:
             QMessageBox.warning(self, "Warning", "Please connect to a database first.")
             return
-        # Check for pandas/openpyxl in main thread first for early feedback
+            
+        folder_path = QFileDialog.getExistingDirectory(self, "Select Folder with Excel Files")
+        if not folder_path:
+            return
+            
+        # Find all Excel files in the folder
+        excel_files = []
+        for ext in ['.xlsx', '.xls', '.xlsm']:
+            excel_files.extend([f for f in glob.glob(os.path.join(folder_path, f'*{ext}'))])
+        
+        if not excel_files:
+            QMessageBox.warning(self, "Warning", "No Excel files found in the folder.")
+            return
+            
+        # Get sheet names from the first file
         try:
-            import pandas as pd
-            import openpyxl
-        except ImportError:
-             QMessageBox.critical(self, "Import Error", "Libraries `pandas` and `openpyxl` are required for Excel import.\nPlease install them (e.g., `pip install pandas openpyxl`).")
-             return
-
-        options = QFileDialog.Option.DontUseNativeDialog
-        filePath, _ = QFileDialog.getOpenFileName(self, "Import Excel File", "",
-                                                "Excel Files (*.xlsx *.xls);;All Files (*)", options=options)
-        if filePath:
-            # No extra args needed here initially, sheet name is handled in _start_import_thread
-            self._start_import_thread(self._execute_excel_import_core, filePath)
+            first_file_sheets = pd.ExcelFile(excel_files[0]).sheet_names
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to read first Excel file: {str(e)}")
+            return
+            
+        if not first_file_sheets:
+            QMessageBox.warning(self, "Warning", "No sheets found in the first Excel file.")
+            return
+            
+        # Let user select a sheet
+        sheet_name, ok = QInputDialog.getItem(
+            self, "Select Sheet", "Choose a sheet to import from all files:", 
+            first_file_sheets, 0, False
+        )
+        if not ok or not sheet_name:
+            return
+            
+        # Ask for table operation mode
+        options = ["Create new table", "Add to existing table", "Replace existing table"]
+        mode, ok = QInputDialog.getItem(
+            self, "Table Operation", 
+            "How would you like to handle the target table:", 
+            options, 0, False
+        )
+        if not ok:
+            return
+            
+        # Get table name based on the selected mode
+        if mode == options[0]:  # Create new
+            table_name, ok = QInputDialog.getText(
+                self, "Table Name", "Enter name for the new table:"
+            )
+            if not ok or not table_name:
+                return
+                
+            # Check if table exists
+            if self._table_exists(table_name):
+                confirm = QMessageBox.question(
+                    self, "Table Exists", 
+                    f"Table '{table_name}' already exists. Replace it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if confirm == QMessageBox.StandardButton.No:
+                    return
+                    
+        elif mode in [options[1], options[2]]:  # Add to or Replace existing
+            # Get list of existing tables
+            conn = self.db_conn
+            tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+            table_names = [table[0] for table in tables]
+            
+            if not table_names:
+                QMessageBox.warning(self, "Warning", "No tables exist in the database to modify.")
+                return
+                
+            table_name, ok = QInputDialog.getItem(
+                self, "Select Table", 
+                "Choose the target table:", 
+                table_names, 0, False
+            )
+            if not ok or not table_name:
+                return
+        
+        # Ask for column handling strategy
+        col_options = ["Common columns only", "All columns (fill missing with NULL)"]
+        col_strategy, ok = QInputDialog.getItem(
+            self, "Column Strategy", 
+            "How to handle different column structures:", 
+            col_options, 1, False  # Default to all columns for more flexibility
+        )
+        if not ok:
+            return
+            
+        use_common_only = col_strategy == col_options[0]
+        
+        # Create a progress dialog
+        self.progress = QProgressDialog("Preparing to import Excel files...", "Cancel", 0, 100, self)
+        self.progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress.show()
+        
+        # Create a worker to run in a separate thread
+        worker_thread = QThread()
+        worker = BulkExcelImportWorker(
+            self._get_new_db_connection,
+            excel_files,
+            table_name,
+            sheet_name,
+            mode,
+            use_common_only
+        )
+        
+        # Connect signals
+        worker.progress.connect(self.progress.setValue)
+        worker.error.connect(self._on_import_error)
+        worker.success.connect(self._on_import_success)
+        worker.finished.connect(worker_thread.quit)
+        worker.finished.connect(self.progress.close)
+        worker.finished.connect(self._on_import_finished)
+        
+        # Start the worker
+        worker.moveToThread(worker_thread)
+        worker_thread.started.connect(worker.run)
+        worker_thread.finished.connect(worker.deleteLater)
+        worker_thread.finished.connect(worker_thread.deleteLater)
+        
+        # Store references to prevent garbage collection
+        self.import_worker = worker
+        self.import_thread = worker_thread
+        
+        # Start the thread
+        worker_thread.start()
 
     def show_table_context_menu(self, pos):
         """Shows the context menu for the table list."""
@@ -3068,8 +3216,185 @@ class DuckDBApp(QMainWindow):
         self.saved_queries_menu.addAction(manage_action)
 
 
+class BulkExcelImportWorker(QObject):
+    """Worker class for importing multiple Excel files in a background thread."""
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+    success = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    
+    def __init__(self, db_conn_func, file_paths, table_name, sheet_name, operation_mode, use_common_only):
+        super().__init__()
+        self.db_conn_func = db_conn_func
+        self.file_paths = file_paths
+        self.table_name = table_name
+        self.sheet_name = sheet_name
+        self.operation_mode = operation_mode  # "Create new table", "Add to existing table", "Replace existing table"
+        self.use_common_only = use_common_only
+        self.is_cancelled = False
+        
+    def run(self):
+        try:
+            conn = self.db_conn_func()
+            
+            # Filter files that contain the requested sheet
+            valid_files = []
+            self.progress.emit(5)
+            
+            for i, file_path in enumerate(self.file_paths):
+                if self.is_cancelled:
+                    return
+                
+                try:
+                    sheet_names = pd.ExcelFile(file_path).sheet_names
+                    if self.sheet_name in sheet_names:
+                        valid_files.append(file_path)
+                except Exception as e:
+                    print(f"Warning: Could not read sheet names from {file_path}: {str(e)}")
+                    
+                # Update progress (10% of total for file validation)
+                self.progress.emit(5 + int((i / len(self.file_paths)) * 5))
+            
+            if not valid_files:
+                self.error.emit(f"No files contain the specified sheet '{self.sheet_name}'.")
+                self.finished.emit()
+                return
+                
+            # Step 1: Analyze schemas from all valid files
+            all_columns = set()
+            common_columns = None
+            file_schemas = {}
+            
+            self.progress.emit(10)
+            total_valid_files = len(valid_files)
+            
+            for i, file_path in enumerate(valid_files):
+                if self.is_cancelled:
+                    return
+                
+                # Read Excel file header only to get schema
+                try:
+                    df_sample = pd.read_excel(file_path, sheet_name=self.sheet_name, nrows=1)
+                    columns = set(df_sample.columns)
+                    file_schemas[file_path] = columns
+                    
+                    # Track all possible columns
+                    all_columns.update(columns)
+                    
+                    # Track common columns across all files
+                    if common_columns is None:
+                        common_columns = columns
+                    else:
+                        common_columns &= columns
+                except Exception as e:
+                    print(f"Warning: Error reading schema from {file_path}: {str(e)}")
+                
+                # Update progress (10% for schema analysis)
+                self.progress.emit(10 + int((i / total_valid_files) * 10))
+            
+            # Handle case where there are no common columns
+            if self.use_common_only and not common_columns:
+                self.error.emit("No common columns found across Excel files. Try using 'All columns' option.")
+                self.finished.emit()
+                return
+                
+            # Use either common columns or all columns based on user choice
+            columns_to_use = list(common_columns if self.use_common_only else all_columns)
+            
+            # Handle table creation based on operation mode
+            if self.operation_mode == "Replace existing table":
+                conn.execute(f'DROP TABLE IF EXISTS "{self.table_name}"')
+                
+            if self.operation_mode in ["Create new table", "Replace existing table"]:
+                # Create schema strings for SQL
+                schema_parts = []
+                for col in sorted(columns_to_use):
+                    schema_parts.append(f'"{col}" VARCHAR')
+                
+                schema_sql = ", ".join(schema_parts)
+                conn.execute(f'CREATE TABLE IF NOT EXISTS "{self.table_name}" ({schema_sql})')
+            
+            # For "Add to existing table", verify the table exists
+            elif self.operation_mode == "Add to existing table":
+                tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", 
+                                     (self.table_name,)).fetchall()
+                if not tables:
+                    self.error.emit(f"Table '{self.table_name}' does not exist.")
+                    self.finished.emit()
+                    return
+                
+                # Get existing columns for this table
+                existing_columns = conn.execute(f'PRAGMA table_info("{self.table_name}")').fetchall()
+                existing_column_names = [col[1] for col in existing_columns]
+                
+                # Add any missing columns to the table
+                for col in columns_to_use:
+                    if col not in existing_column_names:
+                        conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col}" VARCHAR')
+                        
+            self.progress.emit(20)
+            
+            # Step 2: Process each file - using pandas instead of read_excel_auto
+            for i, file_path in enumerate(valid_files):
+                if self.is_cancelled:
+                    return
+                
+                try:
+                    # Read the Excel file using pandas
+                    df = pd.read_excel(file_path, sheet_name=self.sheet_name)
+                    
+                    if self.use_common_only:
+                        # Filter to only include common columns
+                        df = df[list(common_columns)]
+                    else:
+                        # For all columns, add missing columns as NULL
+                        for col in all_columns:
+                            if col not in df.columns:
+                                df[col] = None
+                    
+                    # Create a temporary table for this file's data
+                    temp_table = f"temp_import_{i}"
+                    
+                    # Use duckdb's DataFrame registration
+                    conn.register(temp_table, df)
+                    
+                    # Insert into main table
+                    target_cols = ", ".join([f'"{col}"' for col in sorted(df.columns)])
+                    source_cols = ", ".join([f'"{col}"' for col in sorted(df.columns)])
+                    
+                    conn.execute(f'INSERT INTO "{self.table_name}" ({target_cols}) SELECT {source_cols} FROM {temp_table};')
+                    
+                    # Unregister the temporary table
+                    conn.unregister(temp_table)
+                    
+                except Exception as e:
+                    self.error.emit(f"Error processing {file_path}: {str(e)}")
+                    self.finished.emit()
+                    return
+                
+                # Update progress (70% allocated for file processing)
+                self.progress.emit(20 + int((i / total_valid_files) * 70))
+            
+            # Get row count
+            row_count = conn.execute(f'SELECT COUNT(*) FROM "{self.table_name}"').fetchone()[0]
+            file_count = len(valid_files)
+            
+            # Success message
+            self.progress.emit(100)
+            self.success.emit(f"Successfully imported {file_count} Excel files into table '{self.table_name}' ({row_count} rows total)")
+            
+        except Exception as e:
+            self.error.emit(f"Error during bulk Excel import: {str(e)}")
+        finally:
+            self.finished.emit()
+            
+    def cancel(self):
+        self.is_cancelled = True
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     main_win = DuckDBApp()
     main_win.show()
     sys.exit(app.exec()) 
+
