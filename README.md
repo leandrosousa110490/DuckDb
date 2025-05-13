@@ -25,10 +25,6 @@ A powerful desktop application for interacting with DuckDB databases through a u
   - Import files containing the same sheet name
   - Choose between using only common columns or all columns
   - Add to existing table, create new, or replace existing
-- **NEW**: Bulk import multiple CSV files from a folder
-  - Select delimiter for all files in the folder
-  - Choose between using only common columns or all columns
-  - Add to existing table, create new, or replace existing
 
 ### Data Export
 - Export query results to CSV
