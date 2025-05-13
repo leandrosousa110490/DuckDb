@@ -1352,6 +1352,10 @@ class DuckDBApp(QMainWindow):
         bulk_excel_import_action.triggered.connect(self.import_excel_folder)
         import_menu.addAction(bulk_excel_import_action)
         
+        bulk_csv_import_action = QAction("Bulk Import &CSV Files from Folder...", self)
+        bulk_csv_import_action.triggered.connect(self.import_csv_folder)
+        import_menu.addAction(bulk_csv_import_action)
+        
         # --- Export Menu ---
         export_menu = menubar.addMenu("&Export")
         
@@ -2516,6 +2520,147 @@ class DuckDBApp(QMainWindow):
             # Call the starter function which sets up the thread
             self._start_import_thread(self._execute_import_core, filePath, read_function)
 
+    def import_csv_folder(self):
+        """Import multiple CSV files from a folder and append to a single table."""
+        # Check if we have a database connection
+        if not self.db_conn:
+            QMessageBox.warning(self, "Warning", "Please connect to a database first.")
+            return
+            
+        folder_path = QFileDialog.getExistingDirectory(self, "Select Folder with CSV Files")
+        if not folder_path:
+            return
+            
+        # Find all CSV files in the folder
+        csv_files = []
+        csv_files.extend([f for f in glob.glob(os.path.join(folder_path, f'*.csv'))])
+        csv_files.extend([f for f in glob.glob(os.path.join(folder_path, f'*.tsv'))])
+        
+        if not csv_files:
+            QMessageBox.warning(self, "Warning", "No CSV files found in the folder.")
+            return
+            
+        # Ask for delimiter
+        delimiters = [("Auto-detect (default)", None), ("Comma (,)", ","), ("Tab (\\t)", "\t"), 
+                    ("Semicolon (;)", ";"), ("Pipe (|)", "|"), ("Other", "custom")]
+        
+        delimiter_items = [f"{name}" for name, _ in delimiters]
+        delimiter_choice, ok = QInputDialog.getItem(self, "CSV Delimiter", 
+                                                 "Select the delimiter used in the CSV files:", 
+                                                 delimiter_items, 0, False)
+        if not ok:
+            return  # User cancelled
+        
+        # Get the delimiter value
+        selected_delimiter = None
+        for i, (name, value) in enumerate(delimiters):
+            if delimiter_items[i] == delimiter_choice:
+                selected_delimiter = value
+                break
+        
+        # If "Other" was selected, ask for the custom delimiter
+        if selected_delimiter == "custom":
+            custom_delimiter, ok = QInputDialog.getText(self, "Custom Delimiter", 
+                                                    "Enter the custom delimiter character:")
+            if not ok or not custom_delimiter:
+                return  # User cancelled or entered empty delimiter
+            selected_delimiter = custom_delimiter
+            
+        # Ask for table operation mode
+        options = ["Create new table", "Add to existing table", "Replace existing table"]
+        mode, ok = QInputDialog.getItem(
+            self, "Table Operation", 
+            "How would you like to handle the target table:", 
+            options, 0, False
+        )
+        if not ok:
+            return
+            
+        # Get table name based on the selected mode
+        if mode == options[0]:  # Create new
+            table_name, ok = QInputDialog.getText(
+                self, "Table Name", "Enter name for the new table:"
+            )
+            if not ok or not table_name:
+                return
+                
+            # Check if table exists
+            if self._table_exists(table_name):
+                confirm = QMessageBox.question(
+                    self, "Table Exists", 
+                    f"Table '{table_name}' already exists. Replace it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if confirm == QMessageBox.StandardButton.No:
+                    return
+                    
+        elif mode in [options[1], options[2]]:  # Add to or Replace existing
+            # Get list of existing tables
+            conn = self.db_conn
+            tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+            table_names = [table[0] for table in tables]
+            
+            if not table_names:
+                QMessageBox.warning(self, "Warning", "No tables exist in the database to modify.")
+                return
+                
+            table_name, ok = QInputDialog.getItem(
+                self, "Select Table", 
+                "Choose the target table:", 
+                table_names, 0, False
+            )
+            if not ok or not table_name:
+                return
+        
+        # Ask for column handling strategy
+        col_options = ["Common columns only", "All columns (fill missing with NULL)"]
+        col_strategy, ok = QInputDialog.getItem(
+            self, "Column Strategy", 
+            "How to handle different column structures:", 
+            col_options, 1, False  # Default to all columns for more flexibility
+        )
+        if not ok:
+            return
+            
+        use_common_only = col_strategy == col_options[0]
+        
+        # Create a progress dialog
+        self.progress = QProgressDialog("Preparing to import CSV files...", "Cancel", 0, 100, self)
+        self.progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress.show()
+        
+        # Create a worker to run in a separate thread
+        worker_thread = QThread()
+        worker = BulkCSVImportWorker(
+            self._get_new_db_connection,
+            csv_files,
+            table_name,
+            selected_delimiter,
+            mode,
+            use_common_only
+        )
+        
+        # Connect signals
+        worker.progress.connect(self.progress.setValue)
+        worker.error.connect(self._on_import_error)
+        worker.success.connect(self._on_import_success)
+        worker.finished.connect(worker_thread.quit)
+        worker.finished.connect(self.progress.close)
+        worker.finished.connect(self._on_import_finished)
+        
+        # Start the worker
+        worker.moveToThread(worker_thread)
+        worker_thread.started.connect(worker.run)
+        worker_thread.finished.connect(worker.deleteLater)
+        worker_thread.finished.connect(worker_thread.deleteLater)
+        
+        # Store references to prevent garbage collection
+        self.import_worker = worker
+        self.import_thread = worker_thread
+        
+        # Start the thread
+        worker_thread.start()
+
     def import_parquet(self):
         """Imports data from a Parquet file into a table with options (uses thread)."""
         if not self.db_conn:
@@ -3311,6 +3456,9 @@ class BulkExcelImportWorker(QObject):
                 for col in sorted(columns_to_use):
                     schema_parts.append(f'"{col}" VARCHAR')
                 
+                # Add source file column
+                schema_parts.append(f'"{source_column_name}" VARCHAR')
+                
                 schema_sql = ", ".join(schema_parts)
                 conn.execute(f'CREATE TABLE IF NOT EXISTS "{self.table_name}" ({schema_sql})')
             
@@ -3331,6 +3479,12 @@ class BulkExcelImportWorker(QObject):
                 for col in columns_to_use:
                     if col not in existing_column_names:
                         conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col}" VARCHAR')
+                        
+                # Make sure source column exists - case-insensitive check
+                source_column_lower = source_column_name.lower()
+                has_source_col = any(col.lower() == source_column_lower for col in existing_column_names)
+                if not has_source_col:
+                    conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{source_column_name}" VARCHAR')
                         
             self.progress.emit(20)
             
@@ -3385,6 +3539,200 @@ class BulkExcelImportWorker(QObject):
             
         except Exception as e:
             self.error.emit(f"Error during bulk Excel import: {str(e)}")
+        finally:
+            self.finished.emit()
+            
+    def cancel(self):
+        self.is_cancelled = True
+
+
+class BulkCSVImportWorker(QObject):
+    """Worker class for importing multiple CSV files in a background thread."""
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+    success = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    
+    def __init__(self, db_conn_func, file_paths, table_name, delimiter, operation_mode, use_common_only):
+        super().__init__()
+        self.db_conn_func = db_conn_func
+        self.file_paths = file_paths
+        self.table_name = table_name
+        self.delimiter = delimiter
+        self.operation_mode = operation_mode  # "Create new table", "Add to existing table", "Replace existing table"
+        self.use_common_only = use_common_only
+        self.is_cancelled = False
+        
+    def run(self):
+        try:
+            conn = self.db_conn_func()
+            
+            # Step 1: Analyze schemas from all valid files
+            all_columns = set()
+            common_columns = None
+            file_schemas = {}
+            has_source_file_column = False
+            
+            self.progress.emit(5)
+            total_files = len(self.file_paths)
+            
+            for i, file_path in enumerate(self.file_paths):
+                if self.is_cancelled:
+                    return
+                
+                # Read CSV file header only to get schema
+                try:
+                    # Use DuckDB to get schema without loading entire file
+                    escaped_path = file_path.replace("'", "''")
+                    
+                    # Prepare read function based on delimiter
+                    if self.delimiter is None:
+                        # Auto-detect with read_csv_auto
+                        read_function = f"read_csv_auto('{escaped_path}', SAMPLE_SIZE=1000)"
+                    else:
+                        # Use specific delimiter with read_csv
+                        escaped_delimiter = self.delimiter.replace("'", "''")
+                        read_function = f"read_csv('{escaped_path}', delim='{escaped_delimiter}', header=true, SAMPLE_SIZE=1000)"
+                    
+                    # Get column names from the first row
+                    result = conn.execute(f"SELECT * FROM {read_function} LIMIT 1")
+                    if result.description:
+                        columns = set(desc[0] for desc in result.description)
+                        
+                        # Check if source_file column exists in any file
+                        if 'source_file' in columns:
+                            has_source_file_column = True
+                            
+                        # Store schema without source_file column to avoid conflicts 
+                        file_schemas[file_path] = columns
+                        
+                        # Track all possible columns
+                        all_columns.update(columns)
+                        
+                        # Track common columns across all files
+                        if common_columns is None:
+                            common_columns = columns
+                        else:
+                            common_columns &= columns
+                except Exception as e:
+                    print(f"Warning: Error reading schema from {file_path}: {str(e)}")
+                
+                # Update progress (15% for schema analysis)
+                self.progress.emit(5 + int((i / total_files) * 15))
+                
+            # Always use a consistent column name for source tracking
+            source_column_name = "import_source_file"
+            
+            # Handle case where there are no common columns
+            if self.use_common_only and not common_columns:
+                self.error.emit("No common columns found across CSV files. Try using 'All columns' option.")
+                self.finished.emit()
+                return
+                
+            # Use either common columns or all columns based on user choice
+            columns_to_use = list(common_columns if self.use_common_only else all_columns)
+            
+            # Handle table creation based on operation mode
+            if self.operation_mode == "Replace existing table":
+                conn.execute(f'DROP TABLE IF EXISTS "{self.table_name}"')
+                
+            if self.operation_mode in ["Create new table", "Replace existing table"]:
+                # Create schema strings for SQL
+                schema_parts = []
+                for col in sorted(columns_to_use):
+                    schema_parts.append(f'"{col}" VARCHAR')
+                
+                schema_sql = ", ".join(schema_parts)
+                conn.execute(f'CREATE TABLE IF NOT EXISTS "{self.table_name}" ({schema_sql})')
+            
+            # For "Add to existing table", verify the table exists
+            elif self.operation_mode == "Add to existing table":
+                tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", 
+                                     (self.table_name,)).fetchall()
+                if not tables:
+                    self.error.emit(f"Table '{self.table_name}' does not exist.")
+                    self.finished.emit()
+                    return
+                
+                # Get existing columns for this table
+                existing_columns = conn.execute(f'PRAGMA table_info("{self.table_name}")').fetchall()
+                existing_column_names = [col[1] for col in existing_columns]
+                
+                # Add any missing columns to the table
+                for col in columns_to_use:
+                    if col not in existing_column_names:
+                        conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col}" VARCHAR')
+                        
+            self.progress.emit(20)
+            
+            # Step 2: Process each file
+            for i, file_path in enumerate(self.file_paths):
+                if self.is_cancelled:
+                    return
+                
+                try:
+                    # Prepare file path for SQL
+                    escaped_path = file_path.replace("'", "''")
+                    file_name = os.path.basename(file_path)
+                    
+                    # Determine read function based on delimiter
+                    if self.delimiter is None:
+                        read_function = f"read_csv_auto('{escaped_path}')"
+                    else:
+                        escaped_delimiter = self.delimiter.replace("'", "''")
+                        read_function = f"read_csv('{escaped_path}', delim='{escaped_delimiter}', header=true, auto_detect=true)"
+                    
+                    # Add source tracking column to the query
+                    read_function_with_source = f"SELECT *, '{file_name}' AS {source_column_name} FROM {read_function}"
+                    
+                    # Prepare column lists for both source and target
+                    file_cols = file_schemas.get(file_path, set())
+                    
+                    if self.use_common_only:
+                        # For common columns approach - add the source column
+                        columns_for_insert = [f'"{col}"' for col in sorted(common_columns)] + [f'"{source_column_name}"']
+                        col_list = ', '.join(columns_for_insert)
+                        conn.execute(f'INSERT INTO "{self.table_name}" ({col_list}) SELECT {col_list} FROM ({read_function_with_source})')
+                    else:
+                        # For all columns approach, use NULL for missing columns
+                        target_cols = []
+                        select_parts = []
+                        
+                        # Add all columns
+                        for col in sorted(all_columns):
+                            target_cols.append(f'"{col}"')
+                            if col in file_cols:
+                                select_parts.append(f'"{col}"')
+                            else:
+                                select_parts.append('NULL')
+                        
+                        # Add source file column
+                        target_cols.append(f'"{source_column_name}"')
+                        select_parts.append(f'"{source_column_name}"')
+                        
+                        target_col_list = ', '.join(target_cols)
+                        select_expr = ', '.join(select_parts)
+                        
+                        conn.execute(f'INSERT INTO "{self.table_name}" ({target_col_list}) SELECT {select_expr} FROM ({read_function_with_source});')
+                    
+                except Exception as e:
+                    self.error.emit(f"Error processing {file_path}: {str(e)}")
+                    self.finished.emit()
+                    return
+                
+                # Update progress (70% allocated for file processing)
+                self.progress.emit(20 + int((i / total_files) * 70))
+            
+            # Get row count
+            row_count = conn.execute(f'SELECT COUNT(*) FROM "{self.table_name}"').fetchone()[0]
+            file_count = len(self.file_paths)
+            
+            # Success message
+            self.progress.emit(100)
+            self.success.emit(f"Successfully imported {file_count} CSV files into table '{self.table_name}' ({row_count} rows total)")
+            
+        except Exception as e:
+            self.error.emit(f"Error during bulk CSV import: {str(e)}")
         finally:
             self.finished.emit()
             
