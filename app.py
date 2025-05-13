@@ -816,15 +816,34 @@ class QueryTab(QWidget):
             
         # Get the item at the position
         item = table.itemAt(pos)
-        if not item:
-            return
-            
+        
         menu = QMenu()
         
-        # Copy cell value action
-        copy_cell_action = QAction("Copy Value", table)
-        copy_cell_action.triggered.connect(lambda: self.copy_cell_value(item))
-        menu.addAction(copy_cell_action)
+        # Copy cell value action (only if a cell is clicked)
+        if item:
+            copy_cell_action = QAction("Copy Value", table)
+            copy_cell_action.triggered.connect(lambda: self.copy_cell_value(item))
+            menu.addAction(copy_cell_action)
+            
+            # Get row and column indices
+            row = item.row()
+            column = item.column()
+            
+            # Copy row action
+            copy_row_action = QAction(f"Copy Row {row + 1}", table)
+            copy_row_action.triggered.connect(lambda: self.copy_row(table, row))
+            menu.addAction(copy_row_action)
+            
+            # Copy column action
+            header_text = table.horizontalHeaderItem(column).text() if table.horizontalHeaderItem(column) else f"Column_{column}"
+            copy_column_action = QAction(f"Copy Column '{header_text}'", table)
+            copy_column_action.triggered.connect(lambda: self.copy_column(table, column))
+            menu.addAction(copy_column_action)
+        
+        # Copy headers action
+        copy_headers_action = QAction("Copy Headers", table)
+        copy_headers_action.triggered.connect(lambda: self.copy_headers(table))
+        menu.addAction(copy_headers_action)
         
         # Copy table action
         copy_table_action = QAction("Copy Table", table)
@@ -845,6 +864,59 @@ class QueryTab(QWidget):
         # Copy to clipboard
         clipboard = QApplication.clipboard()
         clipboard.setText(value)
+        
+    def copy_row(self, table, row):
+        """Copy a single row to the clipboard."""
+        if not table or row < 0 or row >= table.rowCount():
+            return
+            
+        row_data = []
+        for col in range(table.columnCount()):
+            item = table.item(row, col)
+            value = item.text() if item else ""
+            row_data.append(value)
+        
+        # Copy to clipboard as tab-separated text
+        clipboard = QApplication.clipboard()
+        clipboard.setText("\t".join(row_data))
+        
+    def copy_column(self, table, column):
+        """Copy a single column to the clipboard."""
+        if not table or column < 0 or column >= table.columnCount():
+            return
+            
+        column_data = []
+        
+        # Get the column header
+        header_item = table.horizontalHeaderItem(column)
+        header_text = header_item.text() if header_item else f"Column_{column}"
+        
+        # Add header as first item
+        column_data.append(header_text)
+        
+        # Add column data
+        for row in range(table.rowCount()):
+            item = table.item(row, column)
+            value = item.text() if item else ""
+            column_data.append(value)
+        
+        # Copy to clipboard as newline-separated text
+        clipboard = QApplication.clipboard()
+        clipboard.setText("\n".join(column_data))
+        
+    def copy_headers(self, table):
+        """Copy the table headers to the clipboard."""
+        if not table or table.columnCount() == 0:
+            return
+            
+        headers = []
+        for col in range(table.columnCount()):
+            header_item = table.horizontalHeaderItem(col)
+            headers.append(header_item.text() if header_item else f"Column_{col}")
+        
+        # Copy to clipboard as tab-separated text
+        clipboard = QApplication.clipboard()
+        clipboard.setText("\t".join(headers))
         
     def copy_table_contents(self, table):
         """Copy the entire table contents to the clipboard."""
