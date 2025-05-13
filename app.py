@@ -941,6 +941,23 @@ class QueryTab(QWidget):
         
         # Results section
         layout.addWidget(QLabel("Results:"))
+        
+        # Filter bar
+        filter_layout = QHBoxLayout()
+        filter_label = QLabel("Filter:")
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("Type to filter results...")
+        self.filter_input.setClearButtonEnabled(True)  # Add a clear button inside the input field
+        self.filter_input.textChanged.connect(self.filter_results)  # Connect to textChanged for dynamic filtering
+        
+        self.filter_count_label = QLabel("")
+        
+        filter_layout.addWidget(filter_label)
+        filter_layout.addWidget(self.filter_input, 1)  # Give the filter input stretch
+        filter_layout.addWidget(self.filter_count_label)
+        
+        layout.addLayout(filter_layout)
+        
         self.results_table = QTableWidget()
         self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -952,6 +969,55 @@ class QueryTab(QWidget):
         
         layout.addWidget(self.results_table, 1)  # Give the results table more vertical space
         
+        # Initialize filter variables
+        self.all_rows_visible = True  # Track if all rows are currently visible
+        
+        # Set up keyboard shortcuts
+        self.filter_shortcut = QAction(self)
+        self.filter_shortcut.setShortcut("Ctrl+F")
+        self.filter_shortcut.triggered.connect(self.focus_filter)
+        self.addAction(self.filter_shortcut)
+        
+    def focus_filter(self):
+        """Focus the filter input field."""
+        self.filter_input.setFocus()
+        self.filter_input.selectAll()  # Also select any existing text for easy replacement
+    
+    def filter_results(self):
+        """Filter the results table based on the filter text."""
+        filter_text = self.filter_input.text().strip().lower()
+        
+        # Show all rows if filter is empty
+        if not filter_text:
+            for row in range(self.results_table.rowCount()):
+                self.results_table.setRowHidden(row, False)
+            self.filter_count_label.setText("")
+            self.all_rows_visible = True
+            return
+        
+        # Count how many rows match the filter
+        visible_count = 0
+        total_count = self.results_table.rowCount()
+        
+        # Check each row
+        for row in range(total_count):
+            # Check if any cell in this row contains the filter text
+            row_matches = False
+            for col in range(self.results_table.columnCount()):
+                item = self.results_table.item(row, col)
+                if item and filter_text in item.text().lower():
+                    row_matches = True
+                    break
+            
+            # Show/hide row based on match
+            self.results_table.setRowHidden(row, not row_matches)
+            if row_matches:
+                visible_count += 1
+        
+        # Update filter count label
+        self.filter_count_label.setText(f"Showing {visible_count} of {total_count} rows")
+        self.all_rows_visible = (visible_count == total_count)
+    
     def show_results_context_menu(self, pos):
         """Shows the context menu for the results table cells."""
         # Get the table widget (sender)
@@ -1739,7 +1805,22 @@ class DuckDBApp(QMainWindow):
             current_width = table_widget.columnWidth(col)
             if current_width > 300:
                 table_widget.setColumnWidth(col, 300)
-
+                
+        # Reset filter state in the parent tab
+        parent_tab = self.find_parent_tab_for_table(table_widget)
+        if parent_tab:
+            # Clear the filter input (which will trigger showing all rows)
+            parent_tab.filter_input.clear()
+            parent_tab.filter_count_label.setText("")
+            parent_tab.all_rows_visible = True
+    
+    def find_parent_tab_for_table(self, table_widget):
+        """Find the parent QueryTab that contains this table widget."""
+        for tab in self.query_tabs:
+            if hasattr(tab, 'results_table') and tab.results_table == table_widget:
+                return tab
+        return None
+    
     def _ensure_pagination_controls(self, tab_index=None):
         """Create or update pagination controls if needed."""
         if tab_index is None:
