@@ -1343,10 +1343,6 @@ class DuckDBApp(QMainWindow):
         import_parquet_action = QAction("Import &Parquet...", self)
         import_parquet_action.triggered.connect(self.import_parquet)
         import_menu.addAction(import_parquet_action)
-        
-        bulk_parquet_import_action = QAction("Bulk Import Parquet Files from &Folder...", self)
-        bulk_parquet_import_action.triggered.connect(self.import_parquet_folder)
-        import_menu.addAction(bulk_parquet_import_action)
 
         import_excel_action = QAction("Import &Excel...", self)
         import_excel_action.triggered.connect(self.import_excel)
@@ -1355,6 +1351,10 @@ class DuckDBApp(QMainWindow):
         bulk_excel_import_action = QAction("Bulk Import Excel Files from &Folder...", self)
         bulk_excel_import_action.triggered.connect(self.import_excel_folder)
         import_menu.addAction(bulk_excel_import_action)
+        
+        bulk_csv_import_action = QAction("Bulk Import CSV Files from F&older...", self)
+        bulk_csv_import_action.triggered.connect(self.import_csv_folder)
+        import_menu.addAction(bulk_csv_import_action)
         
         # --- Export Menu ---
         export_menu = menubar.addMenu("&Export")
@@ -2520,38 +2520,51 @@ class DuckDBApp(QMainWindow):
             # Call the starter function which sets up the thread
             self._start_import_thread(self._execute_import_core, filePath, read_function)
 
-    def import_parquet(self):
-        """Imports data from a Parquet file into a table with options (uses thread)."""
-        if not self.db_conn:
-            QMessageBox.warning(self, "Warning", "Please connect to a database first.")
-            return
-
-        options = QFileDialog.Option.DontUseNativeDialog
-        filePath, _ = QFileDialog.getOpenFileName(self, "Import Parquet File", "",
-                                                "Parquet Files (*.parquet);;All Files (*)", options=options)
-        if filePath:
-            # Escape backslashes in filepath for SQL
-            escaped_filePath = filePath.replace('\\', '\\\\')
-            read_function = f"read_parquet('{escaped_filePath}')"
-            self._start_import_thread(self._execute_import_core, filePath, read_function)
-            
-    def import_parquet_folder(self):
-        """Import multiple Parquet files from a folder and append to a single table."""
+    def import_csv_folder(self):
+        """Import multiple CSV files from a folder and append to a single table."""
         # Check if we have a database connection
         if not self.db_conn:
             QMessageBox.warning(self, "Warning", "Please connect to a database first.")
             return
             
-        folder_path = QFileDialog.getExistingDirectory(self, "Select Folder with Parquet Files")
+        folder_path = QFileDialog.getExistingDirectory(self, "Select Folder with CSV Files")
         if not folder_path:
             return
             
-        # Find all Parquet files in the folder
-        parquet_files = glob.glob(os.path.join(folder_path, '*.parquet'))
+        # Find all CSV files in the folder
+        csv_files = []
+        for ext in ['.csv', '.tsv', '.txt']:
+            csv_files.extend([f for f in glob.glob(os.path.join(folder_path, f'*{ext}'))])
         
-        if not parquet_files:
-            QMessageBox.warning(self, "Warning", "No Parquet files found in the folder.")
+        if not csv_files:
+            QMessageBox.warning(self, "Warning", "No CSV files found in the folder.")
             return
+            
+        # Ask for delimiter
+        delimiters = [("Auto-detect (default)", None), ("Comma (,)", ","), ("Tab (\\t)", "\t"), 
+                     ("Semicolon (;)", ";"), ("Pipe (|)", "|"), ("Other", "custom")]
+        
+        delimiter_items = [f"{name}" for name, _ in delimiters]
+        delimiter_choice, ok = QInputDialog.getItem(self, "CSV Delimiter", 
+                                                 "Select the delimiter used in the CSV files:", 
+                                                 delimiter_items, 0, False)
+        if not ok:
+            return  # User cancelled
+        
+        # Get the delimiter value
+        selected_delimiter = None
+        for i, (name, value) in enumerate(delimiters):
+            if delimiter_items[i] == delimiter_choice:
+                selected_delimiter = value
+                break
+        
+        # If "Other" was selected, ask for the custom delimiter
+        if selected_delimiter == "custom":
+            custom_delimiter, ok = QInputDialog.getText(self, "Custom Delimiter", 
+                                                    "Enter the custom delimiter character:")
+            if not ok or not custom_delimiter:
+                return  # User cancelled or entered empty delimiter
+            selected_delimiter = custom_delimiter
             
         # Ask for table operation mode
         options = ["Create new table", "Add to existing table", "Replace existing table"]
@@ -2612,16 +2625,17 @@ class DuckDBApp(QMainWindow):
         use_common_only = col_strategy == col_options[0]
         
         # Create a progress dialog
-        self.progress = QProgressDialog("Preparing to import Parquet files...", "Cancel", 0, 100, self)
+        self.progress = QProgressDialog("Preparing to import CSV files...", "Cancel", 0, 100, self)
         self.progress.setWindowModality(Qt.WindowModality.WindowModal)
         self.progress.show()
         
         # Create a worker to run in a separate thread
         worker_thread = QThread()
-        worker = BulkParquetImportWorker(
+        worker = BulkCSVImportWorker(
             self._get_new_db_connection,
-            parquet_files,
+            csv_files,
             table_name,
+            selected_delimiter,
             mode,
             use_common_only
         )
@@ -2646,6 +2660,21 @@ class DuckDBApp(QMainWindow):
         
         # Start the thread
         worker_thread.start()
+
+    def import_parquet(self):
+        """Imports data from a Parquet file into a table with options (uses thread)."""
+        if not self.db_conn:
+            QMessageBox.warning(self, "Warning", "Please connect to a database first.")
+            return
+
+        options = QFileDialog.Option.DontUseNativeDialog
+        filePath, _ = QFileDialog.getOpenFileName(self, "Import Parquet File", "",
+                                                "Parquet Files (*.parquet);;All Files (*)", options=options)
+        if filePath:
+            # Escape backslashes in filepath for SQL
+            escaped_filePath = filePath.replace('\\', '\\\\')
+            read_function = f"read_parquet('{escaped_filePath}')"
+            self._start_import_thread(self._execute_import_core, filePath, read_function)
 
     def import_excel(self):
         """Import data from an Excel file into a DuckDB table."""
@@ -3427,9 +3456,6 @@ class BulkExcelImportWorker(QObject):
                 for col in sorted(columns_to_use):
                     schema_parts.append(f'"{col}" VARCHAR')
                 
-                # Add source_file column to schema
-                schema_parts.append('"source_file" VARCHAR')
-                
                 schema_sql = ", ".join(schema_parts)
                 conn.execute(f'CREATE TABLE IF NOT EXISTS "{self.table_name}" ({schema_sql})')
             
@@ -3450,11 +3476,7 @@ class BulkExcelImportWorker(QObject):
                 for col in columns_to_use:
                     if col not in existing_column_names:
                         conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col}" VARCHAR')
-                
-                # Ensure source_file column exists
-                if 'source_file' not in existing_column_names:
-                    conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "source_file" VARCHAR')
-            
+                        
             self.progress.emit(20)
             
             # Step 2: Process each file - using pandas instead of read_excel_auto
@@ -3466,13 +3488,9 @@ class BulkExcelImportWorker(QObject):
                     # Read the Excel file using pandas
                     df = pd.read_excel(file_path, sheet_name=self.sheet_name)
                     
-                    # Add source filename column
-                    file_name = os.path.basename(file_path)
-                    df['source_file'] = file_name
-                    
                     if self.use_common_only:
                         # Filter to only include common columns
-                        df = df[list(common_columns) + ['source_file']]
+                        df = df[list(common_columns)]
                     else:
                         # For all columns, add missing columns as NULL
                         for col in all_columns:
@@ -3519,18 +3537,19 @@ class BulkExcelImportWorker(QObject):
         self.is_cancelled = True
 
 
-class BulkParquetImportWorker(QObject):
-    """Worker class for importing multiple Parquet files in a background thread."""
+class BulkCSVImportWorker(QObject):
+    """Worker class for importing multiple CSV files in a background thread."""
     finished = pyqtSignal()
     error = pyqtSignal(str)
     success = pyqtSignal(str)
     progress = pyqtSignal(int)
     
-    def __init__(self, db_conn_func, file_paths, table_name, operation_mode, use_common_only):
+    def __init__(self, db_conn_func, file_paths, table_name, delimiter, operation_mode, use_common_only):
         super().__init__()
         self.db_conn_func = db_conn_func
         self.file_paths = file_paths
         self.table_name = table_name
+        self.delimiter = delimiter  # Could be None for auto-detect
         self.operation_mode = operation_mode  # "Create new table", "Add to existing table", "Replace existing table"
         self.use_common_only = use_common_only
         self.is_cancelled = False
@@ -3539,45 +3558,34 @@ class BulkParquetImportWorker(QObject):
         try:
             conn = self.db_conn_func()
             
-            # Check validity of parquet files
-            valid_files = []
+            # Step 1: Analyze schemas from all files
+            all_columns = set()
+            common_columns = None
+            file_schemas = {}
+            
             self.progress.emit(5)
+            total_files = len(self.file_paths)
             
             for i, file_path in enumerate(self.file_paths):
                 if self.is_cancelled:
                     return
                 
+                # Read CSV file header only to get schema
                 try:
-                    # Just try to read the metadata to verify it's a valid parquet file
-                    pd.read_parquet(file_path, engine='pyarrow').columns
-                    valid_files.append(file_path)
-                except Exception as e:
-                    print(f"Warning: Could not read Parquet file {file_path}: {str(e)}")
+                    # Build DuckDB read function based on delimiter
+                    escaped_path = file_path.replace("'", "''").replace('\\', '\\\\')
+                    if self.delimiter is None:
+                        # Auto-detect
+                        read_function = f"read_csv_auto('{escaped_path}')"
+                    else:
+                        # Use specified delimiter
+                        escaped_delimiter = self.delimiter.replace("'", "''")
+                        read_function = f"read_csv('{escaped_path}', delim='{escaped_delimiter}', header=true, auto_detect=true)"
                     
-                # Update progress (10% of total for file validation)
-                self.progress.emit(5 + int((i / len(self.file_paths)) * 5))
-            
-            if not valid_files:
-                self.error.emit("No valid Parquet files found.")
-                self.finished.emit()
-                return
-                
-            # Step 1: Analyze schemas from all valid files
-            all_columns = set()
-            common_columns = None
-            file_schemas = {}
-            
-            self.progress.emit(10)
-            total_valid_files = len(valid_files)
-            
-            for i, file_path in enumerate(valid_files):
-                if self.is_cancelled:
-                    return
-                
-                # Read Parquet file header only to get schema
-                try:
-                    df_columns = pd.read_parquet(file_path, engine='pyarrow').columns
-                    columns = set(df_columns)
+                    # Get columns from the CSV by reading the header only
+                    result = conn.execute(f"SELECT * FROM {read_function} LIMIT 0").description
+                    columns = {desc[0] for desc in result}
+                    
                     file_schemas[file_path] = columns
                     
                     # Track all possible columns
@@ -3591,12 +3599,12 @@ class BulkParquetImportWorker(QObject):
                 except Exception as e:
                     print(f"Warning: Error reading schema from {file_path}: {str(e)}")
                 
-                # Update progress (10% for schema analysis)
-                self.progress.emit(10 + int((i / total_valid_files) * 10))
+                # Update progress (15% for schema analysis)
+                self.progress.emit(5 + int((i / total_files) * 15))
             
             # Handle case where there are no common columns
             if self.use_common_only and not common_columns:
-                self.error.emit("No common columns found across Parquet files. Try using 'All columns' option.")
+                self.error.emit("No common columns found across CSV files. Try using 'All columns' option.")
                 self.finished.emit()
                 return
                 
@@ -3612,9 +3620,6 @@ class BulkParquetImportWorker(QObject):
                 schema_parts = []
                 for col in sorted(columns_to_use):
                     schema_parts.append(f'"{col}" VARCHAR')
-                
-                # Add source_file column to schema
-                schema_parts.append('"source_file" VARCHAR')
                 
                 schema_sql = ", ".join(schema_parts)
                 conn.execute(f'CREATE TABLE IF NOT EXISTS "{self.table_name}" ({schema_sql})')
@@ -3636,49 +3641,62 @@ class BulkParquetImportWorker(QObject):
                 for col in columns_to_use:
                     if col not in existing_column_names:
                         conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "{col}" VARCHAR')
-                
-                # Ensure source_file column exists
-                if 'source_file' not in existing_column_names:
-                    conn.execute(f'ALTER TABLE "{self.table_name}" ADD COLUMN "source_file" VARCHAR')
-            
+                        
             self.progress.emit(20)
             
             # Step 2: Process each file
-            for i, file_path in enumerate(valid_files):
+            for i, file_path in enumerate(self.file_paths):
                 if self.is_cancelled:
                     return
                 
                 try:
-                    # Read the Parquet file using pandas
-                    df = pd.read_parquet(file_path, engine='pyarrow')
-                    
-                    # Add source filename column
+                    # Get file name for source tracking
                     file_name = os.path.basename(file_path)
-                    df['source_file'] = file_name
+                    escaped_file_name = file_name.replace("'", "''")
+                    
+                    # Create DuckDB read function based on delimiter
+                    escaped_path = file_path.replace("'", "''").replace('\\', '\\\\')
+                    if self.delimiter is None:
+                        # Auto-detect
+                        read_function = f"read_csv_auto('{escaped_path}')"
+                    else:
+                        # Use specified delimiter
+                        escaped_delimiter = self.delimiter.replace("'", "''")
+                        read_function = f"read_csv('{escaped_path}', delim='{escaped_delimiter}', header=true, auto_detect=true)"
+                    
+                    # Get columns for this specific file
+                    file_cols = file_schemas[file_path]
+                    
+                    # Add source_file column to track which file data came from
+                    select_with_source = f"SELECT *, '{escaped_file_name}' AS source_file FROM {read_function}"
                     
                     if self.use_common_only:
-                        # Filter to only include common columns
-                        df = df[list(common_columns) + ['source_file']]
+                        # For common columns approach
+                        col_list = ', '.join([f'"{col}"' for col in sorted(common_columns)]) + ', source_file'
+                        query = f'INSERT INTO "{self.table_name}" ({col_list}) SELECT {col_list} FROM ({select_with_source});'
                     else:
-                        # For all columns, add missing columns as NULL
-                        for col in all_columns:
-                            if col not in df.columns:
-                                df[col] = None
+                        # For all columns approach, use NULL for missing columns
+                        target_cols = []
+                        select_parts = []
+                        
+                        for col in sorted(all_columns):
+                            target_cols.append(f'"{col}"')
+                            if col in file_cols:
+                                select_parts.append(f'"{col}"')
+                            else:
+                                select_parts.append('NULL')
+                        
+                        # Add source_file column
+                        target_cols.append('source_file')
+                        select_parts.append('source_file')
+                        
+                        target_col_list = ', '.join(target_cols)
+                        select_expr = ', '.join(select_parts)
+                        
+                        query = f'INSERT INTO "{self.table_name}" ({target_col_list}) SELECT {select_expr} FROM ({select_with_source});'
                     
-                    # Create a temporary table for this file's data
-                    temp_table = f"temp_import_{i}"
-                    
-                    # Use duckdb's DataFrame registration
-                    conn.register(temp_table, df)
-                    
-                    # Insert into main table
-                    target_cols = ", ".join([f'"{col}"' for col in sorted(df.columns)])
-                    source_cols = ", ".join([f'"{col}"' for col in sorted(df.columns)])
-                    
-                    conn.execute(f'INSERT INTO "{self.table_name}" ({target_cols}) SELECT {source_cols} FROM {temp_table};')
-                    
-                    # Unregister the temporary table
-                    conn.unregister(temp_table)
+                    # Execute the insert
+                    conn.execute(query)
                     
                 except Exception as e:
                     self.error.emit(f"Error processing {file_path}: {str(e)}")
@@ -3686,18 +3704,18 @@ class BulkParquetImportWorker(QObject):
                     return
                 
                 # Update progress (70% allocated for file processing)
-                self.progress.emit(20 + int((i / total_valid_files) * 70))
+                self.progress.emit(20 + int((i / total_files) * 70))
             
             # Get row count
             row_count = conn.execute(f'SELECT COUNT(*) FROM "{self.table_name}"').fetchone()[0]
-            file_count = len(valid_files)
+            file_count = len(self.file_paths)
             
             # Success message
             self.progress.emit(100)
-            self.success.emit(f"Successfully imported {file_count} Parquet files into table '{self.table_name}' ({row_count} rows total)")
+            self.success.emit(f"Successfully imported {file_count} CSV files into table '{self.table_name}' ({row_count} rows total)")
             
         except Exception as e:
-            self.error.emit(f"Error during bulk Parquet import: {str(e)}")
+            self.error.emit(f"Error during bulk CSV import: {str(e)}")
         finally:
             self.finished.emit()
             
