@@ -2171,6 +2171,13 @@ class DuckDBApp(QMainWindow):
             print(f"Worker executing: {drop_query}")
             db_conn_worker.execute(drop_query)
             
+            # Ensure transaction is committed after drop
+            db_conn_worker.execute("COMMIT;")
+            
+            # Check for cancellation before table creation
+            if worker_ref.is_cancelled:
+                raise InterruptedError("Import cancelled after table drop.")
+                
             # Create the new table from source, without constraints
             query = f'CREATE TABLE {quoted_table_name} AS {select_with_source};'
             # No DELETE, ALTER, or extra schema checks needed here for Replace mode
@@ -2307,6 +2314,13 @@ class DuckDBApp(QMainWindow):
                 print(f"Worker executing: {drop_query}")
                 db_conn_worker.execute(drop_query)
                 
+                # Ensure transaction is committed after drop
+                db_conn_worker.execute("COMMIT;")
+                
+                # Check for cancellation before table creation
+                if worker_ref.is_cancelled:
+                    raise InterruptedError("Import cancelled after table drop.")
+                    
                 # Create the new table from source, without constraints
                 query = f'CREATE TABLE {quoted_table_name} AS {select_from_view};'
                 # No DELETE, ALTER, or extra schema checks needed here for Replace mode
@@ -2421,10 +2435,15 @@ class DuckDBApp(QMainWindow):
         if sheet_name:
             progress_text = f"Importing {os.path.basename(file_path)} (Sheet: {sheet_name})..."
         self.progress = QProgressDialog(progress_text, "Cancel", 0, 0, self)
-        self.progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress.setWindowModality(Qt.WindowModality.ApplicationModal)  # More blocking to prevent UI interaction
         self.progress.setWindowTitle("Importing Data")
         self.progress.setValue(0)
+        
+        # Process pending events before showing the dialog to ensure UI is responsive
+        QCoreApplication.processEvents()
         self.progress.show()
+        # Process events again after show to ensure dialog is displayed
+        QCoreApplication.processEvents()
 
         # --- Setup Thread and Worker ---
         self.import_thread = QThread(self)
@@ -2480,7 +2499,7 @@ class DuckDBApp(QMainWindow):
         except RuntimeError:
             # Handle case where dialog was already deleted
             pass
-            
+
     def _on_import_finished(self):
         """Clean up resources after import thread is finished."""
         print("Import thread finished.")
@@ -2628,7 +2647,7 @@ class DuckDBApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to read first Excel file: {str(e)}")
             return
-            
+
         if not first_file_sheets:
             QMessageBox.warning(self, "Warning", "No sheets found in the first Excel file.")
             return
