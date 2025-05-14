@@ -3672,8 +3672,11 @@ class BulkCSVImportWorker(QObject):
                     
                     if self.use_common_only:
                         # For common columns approach
-                        col_list = ', '.join([f'"{col}"' for col in sorted(common_columns)]) + ', source_file'
-                        query = f'INSERT INTO "{self.table_name}" ({col_list}) SELECT {col_list} FROM ({select_with_source});'
+                        columns_list = ', '.join([f'"{col}"' for col in sorted(common_columns)])
+                        # Add source_file column separately
+                        target_cols = columns_list + ', source_file'
+                        source_cols = columns_list + ', source_file'
+                        query = f'INSERT INTO "{self.table_name}" ({target_cols}) SELECT {source_cols} FROM ({select_with_source});'
                     else:
                         # For all columns approach, use NULL for missing columns
                         target_cols = []
