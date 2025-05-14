@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 import duckdb
 import os
 import json
@@ -2449,25 +2449,63 @@ class DuckDBApp(QMainWindow):
     # --- UI Update Slots ---
     def _on_import_success(self, message):
         print("Import Success (UI Thread):", message)
-        if self.progress: self.progress.close()
+        try:
+            if hasattr(self, 'progress') and self.progress is not None:
+                if self.progress.isVisible():
+                    self.progress.close()
+        except RuntimeError:
+            # Handle case where dialog was already deleted
+            pass
         QMessageBox.information(self, "Success", message)
         self.load_tables() # Refresh table list in UI thread
 
     def _on_import_error(self, error_message):
         print("Import Error (UI Thread):", error_message)
-        if self.progress: self.progress.close()
+        try:
+            if hasattr(self, 'progress') and self.progress is not None:
+                if self.progress.isVisible():
+                    self.progress.close()
+        except RuntimeError:
+            # Handle case where dialog was already deleted
+            pass
         QMessageBox.critical(self, "Import Error", error_message)
         # Optionally reload tables even on error?
         # self.load_tables()
 
+    def _safe_update_progress(self, value):
+        """Safely update progress dialog value, handling cases where dialog might be closed/deleted."""
+        try:
+            if hasattr(self, 'progress') and self.progress is not None and self.progress.isVisible():
+                self.progress.setValue(value)
+        except RuntimeError:
+            # Handle case where dialog was already deleted
+            pass
+            
     def _on_import_finished(self):
+        """Clean up resources after import thread is finished."""
         print("Import thread finished.")
         # Ensure progress dialog is closed
-        if hasattr(self, 'progress') and self.progress and self.progress.isVisible():
-            self.progress.close()
-        # Clean up references (optional, depends on PyQt version/gc)
-        self.import_thread = None
+        if hasattr(self, 'progress') and self.progress is not None:
+            try:
+                if self.progress.isVisible():
+                    self.progress.close()
+            except RuntimeError:
+                # Handle case where dialog was already deleted
+                pass
+            self.progress = None
+            
+        # Clean up references properly to prevent thread leak
+        if hasattr(self, 'import_thread') and self.import_thread is not None:
+            try:
+                # Important: wait for thread to actually finish before removing references
+                if self.import_thread.isRunning():
+                    self.import_thread.wait(3000)  # Wait up to 3 seconds for thread to finish
+            except Exception as e:
+                print(f"Error during thread cleanup: {e}")
+                
+        # Now clear the references
         self.import_worker = None
+        self.import_thread = None
 
     def import_csv(self):
         """Imports data from a CSV file into a table with options (uses thread)."""
@@ -2666,6 +2704,15 @@ class DuckDBApp(QMainWindow):
         self.progress.setWindowModality(Qt.WindowModality.WindowModal)
         self.progress.show()
         
+        # Clean up any existing threads/workers to prevent memory leaks
+        if hasattr(self, 'import_thread') and self.import_thread is not None:
+            if self.import_thread.isRunning():
+                self.import_thread.quit()
+                self.import_thread.wait(1000)  # Wait up to 1 second for thread to finish
+            self.import_thread = None
+        if hasattr(self, 'import_worker'):
+            self.import_worker = None
+            
         # Create a worker to run in a separate thread
         worker_thread = QThread()
         worker = BulkExcelImportWorker(
@@ -2682,7 +2729,7 @@ class DuckDBApp(QMainWindow):
         worker.error.connect(self._on_import_error)
         worker.success.connect(self._on_import_success)
         worker.finished.connect(worker_thread.quit)
-        worker.finished.connect(self.progress.close)
+        
         worker.finished.connect(self._on_import_finished)
         
         # Start the worker
@@ -2817,6 +2864,15 @@ class DuckDBApp(QMainWindow):
         self.progress.setWindowModality(Qt.WindowModality.WindowModal)
         self.progress.show()
         
+        # Clean up any existing threads/workers to prevent memory leaks
+        if hasattr(self, 'import_thread') and self.import_thread is not None:
+            if self.import_thread.isRunning():
+                self.import_thread.quit()
+                self.import_thread.wait(1000)  # Wait up to 1 second for thread to finish
+            self.import_thread = None
+        if hasattr(self, 'import_worker'):
+            self.import_worker = None
+            
         # Create a worker to run in a separate thread
         worker_thread = QThread()
         worker = BulkCSVImportWorker(
@@ -2833,7 +2889,7 @@ class DuckDBApp(QMainWindow):
         worker.error.connect(self._on_import_error)
         worker.success.connect(self._on_import_success)
         worker.finished.connect(worker_thread.quit)
-        worker.finished.connect(self.progress.close)
+        
         worker.finished.connect(self._on_import_finished)
         
         # Start the worker
@@ -3495,32 +3551,34 @@ class BulkExcelImportWorker(QObject):
                     return
                 
                 try:
-                    # Read the Excel file using pandas
-                    df = pd.read_excel(file_path, sheet_name=self.sheet_name)
-                    
-                    if self.use_common_only:
-                        # Filter to only include common columns
-                        df = df[list(common_columns)]
-                    else:
-                        # For all columns, add missing columns as NULL
-                        for col in all_columns:
-                            if col not in df.columns:
-                                df[col] = None
-                    
-                    # Create a temporary table for this file's data
                     temp_table = f"temp_import_{i}"
-                    
-                    # Use duckdb's DataFrame registration
-                    conn.register(temp_table, df)
-                    
-                    # Insert into main table
-                    target_cols = ", ".join([f'"{col}"' for col in sorted(df.columns)])
-                    source_cols = ", ".join([f'"{col}"' for col in sorted(df.columns)])
-                    
-                    conn.execute(f'INSERT INTO "{self.table_name}" ({target_cols}) SELECT {source_cols} FROM {temp_table};')
-                    
-                    # Unregister the temporary table
-                    conn.unregister(temp_table)
+                    try:
+                        # Read the Excel file using pandas
+                        df = pd.read_excel(file_path, sheet_name=self.sheet_name)
+                        
+                        if self.use_common_only:
+                            # Filter to only include common columns
+                            df = df[list(common_columns)]
+                        else:
+                            # For all columns, add missing columns as NULL
+                            for col in all_columns:
+                                if col not in df.columns:
+                                    df[col] = None
+                        
+                        # Use duckdb's DataFrame registration
+                        conn.register(temp_table, df)
+                        
+                        # Insert into main table
+                        target_cols = ", ".join([f'"{col}"' for col in sorted(df.columns)])
+                        source_cols = ", ".join([f'"{col}"' for col in sorted(df.columns)])
+                        
+                        conn.execute(f'INSERT INTO "{self.table_name}" ({target_cols}) SELECT {source_cols} FROM {temp_table};')
+                    finally:
+                        # Unregister the temporary table even if an error occurred
+                        try:
+                            conn.unregister(temp_table)
+                        except:
+                            pass  # Ignore errors during unregistration
                     
                 except Exception as e:
                     self.error.emit(f"Error processing {file_path}: {str(e)}")
@@ -3654,37 +3712,39 @@ class BulkCSVImportWorker(QObject):
                     return
                 
                 try:
-                    # Read the CSV file based on delimiter
-                    if self.delimiter is None:
-                        # Auto-detect
-                        df = pd.read_csv(file_path)
-                    else:
-                        df = pd.read_csv(file_path, delimiter=self.delimiter)
-                    
-                    # Process columns based on strategy
-                    if self.use_common_only:
-                        # Filter to only include common columns
-                        df = df[list(common_columns)]
-                    else:
-                        # For all columns, add missing columns as NULL
-                        for col in all_columns:
-                            if col not in df.columns:
-                                df[col] = None
-                    
-                    # Create a temporary table with the data
                     temp_table = f"temp_import_{i}"
-                    
-                    # Use duckdb's DataFrame registration
-                    conn.register(temp_table, df)
-                    
-                    # Insert into main table
-                    target_cols = ", ".join([f'"{col}"' for col in sorted(df.columns)])
-                    source_cols = ", ".join([f'"{col}"' for col in sorted(df.columns)])
-                    
-                    conn.execute(f'INSERT INTO "{self.table_name}" ({target_cols}) SELECT {source_cols} FROM {temp_table};')
-                    
-                    # Unregister the temporary table
-                    conn.unregister(temp_table)
+                    try:
+                        # Read the CSV file based on delimiter
+                        if self.delimiter is None:
+                            # Auto-detect
+                            df = pd.read_csv(file_path)
+                        else:
+                            df = pd.read_csv(file_path, delimiter=self.delimiter)
+                        
+                        # Process columns based on strategy
+                        if self.use_common_only:
+                            # Filter to only include common columns
+                            df = df[list(common_columns)]
+                        else:
+                            # For all columns, add missing columns as NULL
+                            for col in all_columns:
+                                if col not in df.columns:
+                                    df[col] = None
+                        
+                        # Use duckdb's DataFrame registration
+                        conn.register(temp_table, df)
+                        
+                        # Insert into main table
+                        target_cols = ", ".join([f'"{col}"' for col in sorted(df.columns)])
+                        source_cols = ", ".join([f'"{col}"' for col in sorted(df.columns)])
+                        
+                        conn.execute(f'INSERT INTO "{self.table_name}" ({target_cols}) SELECT {source_cols} FROM {temp_table};')
+                    finally:
+                        # Unregister the temporary table even if an error occurred
+                        try:
+                            conn.unregister(temp_table)
+                        except:
+                            pass  # Ignore errors during unregistration
                     
                 except Exception as e:
                     self.error.emit(f"Error processing {file_path}: {str(e)}")
@@ -3716,4 +3776,5 @@ if __name__ == "__main__":
     main_win = DuckDBApp()
     main_win.show()
     sys.exit(app.exec()) 
+
 
