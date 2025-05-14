@@ -25,11 +25,10 @@ A powerful desktop application for interacting with DuckDB databases through a u
   - Import files containing the same sheet name
   - Choose between using only common columns or all columns
   - Add to existing table, create new, or replace existing
-- **NEW**: Bulk import multiple Parquet files from a folder
-  - Automatically finds and combines all parquet files
+- **NEW**: Bulk import multiple CSV files from a folder
+  - Auto-detect or specify delimiter for CSV files
   - Choose between using only common columns or all columns
   - Add to existing table, create new, or replace existing
-  - Tracks source filename for every imported row
 
 ### Data Export
 - Export query results to CSV
@@ -96,7 +95,7 @@ python app.py
 - Choose File → Import → CSV/Parquet/Excel
 - Select your file and follow the import wizard
 - For bulk Excel import, select "Bulk Import Excel Files from Folder"
-- For bulk Parquet import, select "Bulk Import Parquet Files from Folder"
+- For bulk CSV import, select "Bulk Import CSV Files from Folder"
 
 ### Exporting Results
 - Run a query to get results
