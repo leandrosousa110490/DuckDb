@@ -20,6 +20,7 @@ import pandas as pd
 import csv
 import glob
 from enhanced_table_view import EnhancedTableViewDialog
+from chart_view import ChartViewDialog
 
 DARK_STYLESHEET = """
     QWidget {
@@ -942,6 +943,11 @@ class QueryTab(QWidget):
         self.analyze_results_button.setToolTip("Open results in an advanced, filterable table view")
         self.analyze_results_button.clicked.connect(self.show_enhanced_table_view)
         button_layout.addWidget(self.analyze_results_button)
+
+        self.create_chart_button = QPushButton("Create Chart")
+        self.create_chart_button.setToolTip("Open results in an interactive chart builder")
+        self.create_chart_button.clicked.connect(self.show_chart_view_dialog)
+        button_layout.addWidget(self.create_chart_button)
         
         query_layout.addLayout(button_layout)
         layout.addLayout(query_layout)
@@ -986,31 +992,27 @@ class QueryTab(QWidget):
         self.addAction(self.filter_shortcut)
         
     def show_enhanced_table_view(self):
-        if self.results_table.rowCount() == 0:
-            QMessageBox.information(self, "No Results", "There are no results to analyze.")
+        if not hasattr(self, 'current_data') or not self.current_data:
+            QMessageBox.information(self, "No Data", "Please run a query to get results first.")
+            return
+        
+        dialog = EnhancedTableViewDialog(self.current_data, self.current_headers, self)
+        dialog.exec()
+
+    def show_chart_view_dialog(self):
+        if not hasattr(self, 'current_data') or not self.current_data or not self.current_headers:
+            QMessageBox.information(self, "No Data", "Please run a query and get results before creating a chart.")
             return
 
-        headers = [self.results_table.horizontalHeaderItem(col).text() 
-                   for col in range(self.results_table.columnCount())]
-        data = []
-        for row_idx in range(self.results_table.rowCount()):
-            row_data = []
-            if not self.results_table.isRowHidden(row_idx): # Only include visible rows if table is filtered
-                for col_idx in range(self.results_table.columnCount()):
-                    item = self.results_table.item(row_idx, col_idx)
-                    row_data.append(item.text() if item else "")
-                data.append(tuple(row_data))
-        
-        if not data:
-            QMessageBox.information(self, "No Visible Results", 
-                                    "No visible data to analyze (perhaps all rows are filtered out in the main table?).")
-            return
+        # Ensure data is in a suitable list of lists/tuples format for the dialog
+        # If self.current_data is already in this format, no change needed.
+        # If it's, for example, a list of QTableWidgetItems, extract text.
+        # Assuming self.current_data and self.current_headers are already correctly populated
+        # by run_query or similar methods.
 
-        # Ensure QApplication instance exists if dialog is modal or requires it implicitly
-        # Generally, the main app instance is sufficient.
-        dialog = EnhancedTableViewDialog(data=data, headers=headers, parent=self)
-        dialog.exec() # Show as a modal dialog
-        
+        dialog = ChartViewDialog(self.current_data, self.current_headers, self)
+        dialog.exec() 
+
     def focus_filter(self):
         """Focus the filter input field."""
         self.filter_input.setFocus()
@@ -1782,6 +1784,10 @@ class DuckDBApp(QMainWindow):
         tab_index = getattr(self, 'current_tab_for_query', self.query_tab_widget.currentIndex())
         query_tab = self.query_tabs[tab_index]
         results_table = query_tab.results_table
+
+        # Store the data and headers in the QueryTab instance
+        query_tab.current_data = data
+        query_tab.current_headers = headers
         
         if headers: # SELECT query with results
             # Update table with the returned data
