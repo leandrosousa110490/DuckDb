@@ -21,6 +21,8 @@ import csv
 import glob
 from enhanced_table_view import EnhancedTableViewDialog
 from chart_view import ChartViewDialog
+from excel_viewer_dialog import ExcelViewDialog
+from json_viewer_dialog import JsonViewDialog
 
 DARK_STYLESHEET = """
     QWidget {
@@ -1362,6 +1364,14 @@ class DuckDBApp(QMainWindow):
         file_menu.addAction(close_action)
 
         file_menu.addSeparator()
+
+        view_excel_action = QAction("View/Annotate Excel File...", self)
+        view_excel_action.triggered.connect(self.view_excel_file)
+        file_menu.addAction(view_excel_action)
+
+        view_json_action = QAction("View JSON File...", self)
+        view_json_action.triggered.connect(self.view_json_file)
+        file_menu.addAction(view_json_action)
 
         exit_action = QAction("&Exit", self)
         exit_action.triggered.connect(self.close)
@@ -3508,6 +3518,98 @@ class DuckDBApp(QMainWindow):
         manage_action = QAction("Manage Saved Queries...", self)
         manage_action.triggered.connect(self.manage_saved_queries)
         self.saved_queries_menu.addAction(manage_action)
+
+    def view_excel_file(self):
+        # if not self.db_conn: # Removed database connection check
+        #     QMessageBox.warning(self, "Database Needed", "Please connect to or create a database first. The annotations will be saved in this database.")
+        #     return
+
+        options = QFileDialog.Option.DontUseNativeDialog 
+
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Excel File to View", "", 
+                                                 "Excel Files (*.xlsx *.xls *.xlsm)", options=options)
+        if not file_path:
+            return
+
+        try:
+            xls = pd.ExcelFile(file_path)
+            sheet_names = xls.sheet_names
+            if not sheet_names:
+                QMessageBox.warning(self, "No Sheets", "The selected Excel file contains no sheets.")
+                return
+
+            sheet_name, ok = QInputDialog.getItem(self, "Select Sheet", 
+                                                "Choose a sheet to view:", sheet_names, 0, False)
+            if not ok or not sheet_name:
+                return # User cancelled sheet selection
+            
+            # Launch the ExcelViewDialog
+            # We need to pass the self._get_new_db_connection so the dialog can create its own
+            # connections if it were to run operations in a separate thread (though currently it doesn't for saving).
+            # For simplicity and direct saving, passing the main app's function is fine.
+            dialog = ExcelViewDialog(file_path, sheet_name, self)
+            dialog.exec() # Show as modal dialog
+
+            # After dialog closes, refresh table list in case a new table was created
+            self.load_tables()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error Reading Excel", f"Could not process the Excel file: {e}")
+
+    def view_json_file(self):
+        options = QFileDialog.Option.DontUseNativeDialog
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select JSON File to View", "", 
+                                                 "JSON Files (*.json);;All Files (*)", options=options)
+        if not file_path:
+            return
+
+        try:
+            # Try to parse the JSON to check its structure first
+            with open(file_path, 'r', encoding='utf-8') as f:
+                json_content = json.load(f)
+            
+            # Check for our specific annotation file structure
+            if isinstance(json_content, dict) and \
+               "original_excel_file_path" in json_content and \
+               "original_sheet_name" in json_content and \
+               "annotated_data" in json_content and \
+               isinstance(json_content["annotated_data"], list):
+                
+                excel_path = json_content["original_excel_file_path"]
+                sheet_name = json_content["original_sheet_name"]
+                annotations = json_content["annotated_data"]
+                
+                # Verify the original Excel file still exists
+                if not os.path.exists(excel_path):
+                    QMessageBox.warning(self, "File Not Found", 
+                                        f"The original Excel file specified in the JSON could not be found:\n{excel_path}\n\nOpening JSON in raw/table view instead.")
+                    # Fallback to normal JSON viewer if Excel file is missing
+                    dialog = JsonViewDialog(file_path=file_path, parent=self)
+                    dialog.exec()
+                    return
+
+                QMessageBox.information(self, "Annotation File Detected", 
+                                        f"This JSON file appears to be an annotation for:\nExcel: {os.path.basename(excel_path)}\nSheet: {sheet_name}\n\nAttempting to load the Excel file with these annotations.")
+                
+                # Launch ExcelViewDialog with annotation data
+                # Ensure ExcelViewDialog is modified to accept and use 'annotations_to_load'
+                excel_dialog = ExcelViewDialog(file_path=excel_path, 
+                                               sheet_name=sheet_name, 
+                                               annotations_to_load=annotations, 
+                                               parent=self)
+                excel_dialog.exec()
+            else:
+                # Not an annotation file, or structure is different, open in standard JSON viewer
+                dialog = JsonViewDialog(file_path=file_path, parent=self)
+                dialog.exec()
+
+        except json.JSONDecodeError:
+            QMessageBox.critical(self, "JSON Error", "Could not parse the JSON file. It may be corrupted.\nOpening in raw text view attempt.")
+            # Fallback for corrupted JSON, try to show raw if JsonViewDialog can handle it, or just error
+            dialog = JsonViewDialog(file_path=file_path, parent=self) # JsonViewDialog text_edit will show error
+            dialog.exec()
+        except Exception as e: 
+            QMessageBox.critical(self, "Error", f"Could not open JSON viewer or process annotation: {e}")
 
 
 class BulkExcelImportWorker(QObject):
