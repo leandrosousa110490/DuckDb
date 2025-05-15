@@ -2156,7 +2156,7 @@ class DuckDBApp(QMainWindow):
         if worker_ref.is_cancelled:
              raise InterruptedError("Import cancelled before execution.")
 
-        select_with_source = f"SELECT *, '{escaped_file_name}' AS source_file FROM {read_function_sql}"
+        select_with_source = f"SELECT * FROM {read_function_sql}"
         quoted_table_name = quote_id(table_name)
 
         if mode == "Create New Table":
@@ -2170,9 +2170,6 @@ class DuckDBApp(QMainWindow):
             drop_query = f'DROP TABLE IF EXISTS {quoted_table_name} CASCADE;'
             print(f"Worker executing: {drop_query}")
             db_conn_worker.execute(drop_query)
-            
-            # Ensure transaction is committed after drop
-            db_conn_worker.execute("COMMIT;")
             
             # Check for cancellation before table creation
             if worker_ref.is_cancelled:
@@ -2198,16 +2195,14 @@ class DuckDBApp(QMainWindow):
             missing_required = []
             for lower_target_col, (orig_target_col, _, is_not_null, default_val, is_pk) in target_schema.items():
                 if is_not_null and default_val is None and lower_target_col not in source_schema:
-                     if lower_target_col != 'source_file':
-                        missing_required.append(orig_target_col)
+                    missing_required.append(orig_target_col)
             
             # Raise error if ANY required column is missing
             if missing_required:
                 raise ValueError(f"Target table '{table_name}' requires column(s) not found in source file '{file_name}': {', '.join(missing_required)}")
             # --- End check --- 
 
-            # Add source_file to the expected source schema (using lowercase key)
-            source_schema['source_file'] = ('source_file', 'VARCHAR')
+            # No longer adding source_file to schema
 
             alter_statements = []
             # Compare using lowercase keys
@@ -2228,7 +2223,7 @@ class DuckDBApp(QMainWindow):
             # Get the actual source columns for explicit column mapping, using original case
             source_cols_result = db_conn_worker.execute(f"SELECT * FROM {read_function_sql} LIMIT 0").description
             if source_cols_result:
-                orig_source_cols = [desc[0] for desc in source_cols_result] + ['source_file']
+                orig_source_cols = [desc[0] for desc in source_cols_result]
                 # Quote column names only when needed
                 cols_str = ', '.join([quote_id(col) for col in orig_source_cols])
                 query = f'INSERT INTO {quoted_table_name} ({cols_str}) ({select_with_source});'
@@ -2289,7 +2284,6 @@ class DuckDBApp(QMainWindow):
             print(f"Worker reading Excel: {file_path} Sheet: {sheet_name}")
             # NOTE: Cancellation during pd.read_excel is not directly supported here.
             df = pd.read_excel(file_path, sheet_name=sheet_name)
-            df['source_file'] = escaped_file_name # Add source file column
 
             if worker_ref.is_cancelled:
                 raise InterruptedError("Import cancelled after Excel read.")
@@ -2314,9 +2308,6 @@ class DuckDBApp(QMainWindow):
                 print(f"Worker executing: {drop_query}")
                 db_conn_worker.execute(drop_query)
                 
-                # Ensure transaction is committed after drop
-                db_conn_worker.execute("COMMIT;")
-                
                 # Check for cancellation before table creation
                 if worker_ref.is_cancelled:
                     raise InterruptedError("Import cancelled after table drop.")
@@ -2334,19 +2325,13 @@ class DuckDBApp(QMainWindow):
 
                 source_schema = self._get_source_schema_from_df(df) # Schema from DF
                 if source_schema is None: raise ValueError("Could not get source schema from DataFrame.")
-                # source_file is already in DF schema, ensure lowercase key maps to tuple
-                if 'source_file' in source_schema:
-                     orig_name, type = source_schema['source_file']
-                     source_schema['source_file'] = (orig_name, type)
-                else: # Should have been added earlier
-                    source_schema['source_file'] = ('source_file', 'VARCHAR')
+                # source_file is no longer added to the schema
 
                 # --- Check for missing required columns --- 
                 missing_required = []
                 for lower_target_col, (orig_target_col, _, is_not_null, default_val, is_pk) in target_schema.items():
                     if is_not_null and default_val is None and lower_target_col not in source_schema:
-                         if lower_target_col != 'source_file':
-                            missing_required.append(orig_target_col)
+                        missing_required.append(orig_target_col)
                 
                 # Raise error if ANY required column is missing
                 if missing_required:
@@ -2594,6 +2579,11 @@ class DuckDBApp(QMainWindow):
 
     def import_excel(self):
         """Import data from an Excel file into a DuckDB table."""
+        # Check if a database is connected
+        if not self.db_conn:
+            QMessageBox.warning(self, "Warning", "Please connect to a database first.")
+            return
+            
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Import Excel File", "", "Excel Files (*.xlsx *.xls *.xlsm)"
         )
@@ -2618,8 +2608,44 @@ class DuckDBApp(QMainWindow):
         if not ok or not sheet_name:
             return
             
-        # Start the import thread
-        self._start_import_thread(self._execute_excel_import_core, file_path, sheet_name)
+        # Get import options
+        table_name, mode = self._get_import_options(file_path)
+        if not table_name or not mode:
+            return # User cancelled options
+            
+        # Start the import directly without going through _start_import_thread
+        # Setup Progress Dialog
+        progress_text = f"Importing {os.path.basename(file_path)} (Sheet: {sheet_name})..."
+        self.progress = QProgressDialog(progress_text, "Cancel", 0, 0, self)
+        self.progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.progress.setWindowTitle("Importing Data")
+        self.progress.setValue(0)
+        
+        # Process pending events before showing the dialog to ensure UI is responsive
+        QCoreApplication.processEvents()
+        self.progress.show()
+        # Process events again after show to ensure dialog is displayed
+        QCoreApplication.processEvents()
+
+        # Setup Thread and Worker
+        self.import_thread = QThread(self)
+        args = (table_name, mode, file_path, sheet_name)
+        self.import_worker = ImportWorker(self._get_new_db_connection, self._execute_excel_import_core, *args)
+        self.import_worker.moveToThread(self.import_thread)
+
+        # Connect Signals/Slots
+        self.import_thread.started.connect(self.import_worker.run)
+        self.import_worker.finished.connect(self.import_thread.quit)
+        self.import_worker.finished.connect(self.import_worker.deleteLater)
+        self.import_thread.finished.connect(self.import_thread.deleteLater)
+
+        self.import_worker.error.connect(self._on_import_error)
+        self.import_worker.success.connect(self._on_import_success)
+        self.import_worker.finished.connect(self._on_import_finished)
+        self.progress.canceled.connect(self.import_worker.cancel)
+
+        # Start Thread
+        self.import_thread.start()
 
     def import_excel_folder(self):
         """Import multiple Excel files from a folder and append to a single table."""
