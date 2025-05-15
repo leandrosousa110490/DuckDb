@@ -14,7 +14,7 @@ from PyQt6.QtGui import (
     QPalette, QColor, QAction, QSyntaxHighlighter, QTextCharFormat, QFont,
     QTextCursor, QStandardItemModel, QStandardItem
 )
-from PyQt6.QtCore import Qt, QRegularExpression, QThread, QObject, pyqtSignal, QStringListModel, QRect, QSize
+from PyQt6.QtCore import Qt, QRegularExpression, QThread, QObject, pyqtSignal, QStringListModel, QRect, QSize, QCoreApplication
 import re
 import pandas as pd
 import csv
