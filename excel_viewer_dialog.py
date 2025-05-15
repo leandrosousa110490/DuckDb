@@ -6,6 +6,7 @@ from PyQt6.QtCore import Qt
 import pandas as pd
 import os # Import the os module
 import json
+import datetime # Add datetime import
 
 class ExcelViewDialog(QDialog):
     def __init__(self, file_path, sheet_name, annotations_to_load=None, parent=None):
@@ -142,6 +143,20 @@ class ExcelViewDialog(QDialog):
         temp_df_for_export = self.df.copy() # Start with original data
         temp_df_for_export.insert(0, "_IsSelected", checkbox_states)
         temp_df_for_export.insert(1, "_Comment", comment_texts)
+
+        # Convert datetime columns to ISO format strings before saving to JSON
+        for col in temp_df_for_export.columns:
+            if pd.api.types.is_datetime64_any_dtype(temp_df_for_export[col].dtype):
+                # Convert to ISO format, NaT becomes None (null in JSON)
+                temp_df_for_export[col] = temp_df_for_export[col].apply(lambda x: x.isoformat() if pd.notnull(x) else None)
+            elif temp_df_for_export[col].dtype == 'object':
+                # For object columns, check if elements are datetime instances
+                # This handles cases where a column might be mixed type but contains datetimes
+                def convert_if_datetime(x):
+                    if isinstance(x, (datetime.datetime, datetime.date, pd.Timestamp)):
+                        return x.isoformat() if pd.notnull(x) else None
+                    return x
+                temp_df_for_export[col] = temp_df_for_export[col].apply(convert_if_datetime)
 
         try:
             # Check if file exists and ask for overwrite confirmation
