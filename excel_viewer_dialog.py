@@ -23,7 +23,7 @@ class ExcelViewDialog(QDialog):
 
         # Table Widget for displaying data
         self.table_widget = QTableWidget()
-        self.table_widget.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers) # Cells not editable by default
+        self.table_widget.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked) # Allow editing on double click
         self.layout.addWidget(self.table_widget)
 
         # JSON Save Area
@@ -60,11 +60,11 @@ class ExcelViewDialog(QDialog):
             # self.close()
             # return
 
-        # +1 for the checkbox column
-        self.table_widget.setColumnCount(len(self.df.columns) + 1)
+        # +2 for the checkbox and comment columns
+        self.table_widget.setColumnCount(len(self.df.columns) + 2) 
         self.table_widget.setRowCount(len(self.df))
 
-        headers = ["Select"] + self.df.columns.tolist()
+        headers = ["Select", "_Comment"] + self.df.columns.tolist()
         self.table_widget.setHorizontalHeaderLabels(headers)
 
         for row_idx, row_data in self.df.iterrows():
@@ -72,22 +72,30 @@ class ExcelViewDialog(QDialog):
             chk_item = QTableWidgetItem()
             chk_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
             
-            # Set initial check state if annotations are provided (simple index-based matching)
             initial_check_state = Qt.CheckState.Unchecked
+            initial_comment_text = "" # Default empty comment
+
             if self.annotations_to_load and row_idx < len(self.annotations_to_load):
                 annotation_for_row = self.annotations_to_load[row_idx]
-                if isinstance(annotation_for_row, dict) and "_IsSelected" in annotation_for_row:
-                    if annotation_for_row["_IsSelected"] == True: # Explicitly check for True
+                if isinstance(annotation_for_row, dict):
+                    if "_IsSelected" in annotation_for_row and annotation_for_row["_IsSelected"] == True:
                         initial_check_state = Qt.CheckState.Checked
+                    if "_Comment" in annotation_for_row: 
+                        initial_comment_text = str(annotation_for_row["_Comment"])
+            
             chk_item.setCheckState(initial_check_state)
             self.table_widget.setItem(row_idx, 0, chk_item)
+
+            # Comment item
+            comment_item = QTableWidgetItem(initial_comment_text)
+            comment_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsEditable)
+            self.table_widget.setItem(row_idx, 1, comment_item)
 
             # Data items
             for col_idx, cell_data in enumerate(row_data):
                 item = QTableWidgetItem(str(cell_data) if pd.notna(cell_data) else "")
-                # Make data cells non-editable by default, but selectable
                 item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-                self.table_widget.setItem(row_idx, col_idx + 1, item) # +1 due to checkbox col
+                self.table_widget.setItem(row_idx, col_idx + 2, item) # +2 due to checkbox and comment cols
         
         self.table_widget.resizeColumnsToContents()
         self.table_widget.horizontalHeader().setStretchLastSection(True)
@@ -120,11 +128,20 @@ class ExcelViewDialog(QDialog):
         # Create a new DataFrame with the checkbox states
         data_to_save = self.df.copy()
         checkbox_states = []
+        comment_texts = [] # New list for comments
         for row_idx in range(self.table_widget.rowCount()):
             chk_item = self.table_widget.item(row_idx, 0)
             checkbox_states.append(chk_item.checkState() == Qt.CheckState.Checked)
+            
+            comment_item = self.table_widget.item(row_idx, 1) # Comment is in column 1
+            comment_texts.append(comment_item.text() if comment_item else "") # Get text, default to empty
         
-        data_to_save.insert(0, "_IsSelected", checkbox_states) # Prepend the selection column
+        # Prepend the selection and comment columns. Order matters for to_dict('records') if we want consistency.
+        # However, since it becomes a list of dicts, the key is what matters.
+        # Let's add _IsSelected first, then _Comment, then original data.
+        temp_df_for_export = self.df.copy() # Start with original data
+        temp_df_for_export.insert(0, "_IsSelected", checkbox_states)
+        temp_df_for_export.insert(1, "_Comment", comment_texts)
 
         try:
             # Check if file exists and ask for overwrite confirmation
@@ -140,7 +157,7 @@ class ExcelViewDialog(QDialog):
             output_json_structure = {
                 "original_excel_file_path": self.file_path,
                 "original_sheet_name": self.sheet_name,
-                "annotated_data": data_to_save.to_dict(orient='records') # Convert df to list of dicts
+                "annotated_data": temp_df_for_export.to_dict(orient='records') # Use the new df with comments
             }
             
             # Convert the whole structure to JSON string

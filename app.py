@@ -3547,7 +3547,7 @@ class DuckDBApp(QMainWindow):
             # We need to pass the self._get_new_db_connection so the dialog can create its own
             # connections if it were to run operations in a separate thread (though currently it doesn't for saving).
             # For simplicity and direct saving, passing the main app's function is fine.
-            dialog = ExcelViewDialog(file_path, sheet_name, self)
+            dialog = ExcelViewDialog(file_path, sheet_name, annotations_to_load=None, parent=self)
             dialog.exec() # Show as modal dialog
 
             # After dialog closes, refresh table list in case a new table was created
