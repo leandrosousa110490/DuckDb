@@ -24,6 +24,15 @@ class ExcelViewDialog(QDialog):
 
         self.layout = QVBoxLayout(self)
 
+        # Filter input
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Filter:"))
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("Type to filter table content...")
+        self.filter_input.textChanged.connect(self._apply_filter)
+        filter_layout.addWidget(self.filter_input)
+        self.layout.addLayout(filter_layout)
+
         # Table Widget for displaying data
         self.table_widget = QTableWidget()
         self.table_widget.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked) # Allow editing on double click
@@ -106,6 +115,25 @@ class ExcelViewDialog(QDialog):
         
         self.table_widget.resizeColumnsToContents()
         self.table_widget.horizontalHeader().setStretchLastSection(True)
+
+    def _apply_filter(self):
+        filter_text = self.filter_input.text().lower().strip()
+
+        for row_idx in range(self.table_widget.rowCount()):
+            if not filter_text: # If filter is empty, show all rows
+                self.table_widget.setRowHidden(row_idx, False)
+                continue
+
+            row_matches = False
+            # Iterate from column 1 (skip "Select" checkbox column)
+            # Column 1 is _Comment, columns 2 onwards are data from self.df
+            for col_idx in range(1, self.table_widget.columnCount()): 
+                item = self.table_widget.item(row_idx, col_idx)
+                if item and item.text().lower().strip().__contains__(filter_text):
+                    row_matches = True
+                    break
+            
+            self.table_widget.setRowHidden(row_idx, not row_matches)
 
     def show_table_context_menu(self, pos):
         item = self.table_widget.itemAt(pos)
