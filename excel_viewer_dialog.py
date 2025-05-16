@@ -1,8 +1,10 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, 
-    QPushButton, QLabel, QLineEdit, QMessageBox, QApplication, QFileDialog
+    QPushButton, QLabel, QLineEdit, QMessageBox, QApplication, QFileDialog,
+    QMenu
 )
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QAction
 import pandas as pd
 import os # Import the os module
 import json
@@ -25,6 +27,8 @@ class ExcelViewDialog(QDialog):
         # Table Widget for displaying data
         self.table_widget = QTableWidget()
         self.table_widget.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked) # Allow editing on double click
+        self.table_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu) # Enable context menu
+        self.table_widget.customContextMenuRequested.connect(self.show_table_context_menu) # Connect slot
         self.layout.addWidget(self.table_widget)
 
         # JSON Save Area
@@ -100,6 +104,113 @@ class ExcelViewDialog(QDialog):
         
         self.table_widget.resizeColumnsToContents()
         self.table_widget.horizontalHeader().setStretchLastSection(True)
+
+    def show_table_context_menu(self, pos):
+        item = self.table_widget.itemAt(pos)
+        menu = QMenu(self)
+        
+        if item:
+            copy_cell_action = QAction("Copy Cell Value", self)
+            copy_cell_action.triggered.connect(lambda: self.copy_cell_value(item))
+            menu.addAction(copy_cell_action)
+
+            # Note: row and column are 0-indexed from the QTableWidgetItem
+            row = item.row()
+            column = item.column()
+
+            copy_row_action = QAction(f"Copy Row {row + 1}", self)
+            copy_row_action.triggered.connect(lambda: self.copy_row(self.table_widget, row))
+            menu.addAction(copy_row_action)
+
+            # For ExcelView, column 0 is 'Select', column 1 is '_Comment'. Data starts at 2 for headers from df.
+            # The actual header text for data columns is self.df.columns[column - 2] if column >=2
+            # Header for column 0 is "Select", for 1 is "_Comment"
+            header_text = ""
+            if self.table_widget.horizontalHeaderItem(column):
+                 header_text = self.table_widget.horizontalHeaderItem(column).text()
+            else:
+                 header_text = f"Column_{column+1}" # Fallback
+            
+            copy_column_action = QAction(f"Copy Column '{header_text}'", self)
+            copy_column_action.triggered.connect(lambda: self.copy_column(self.table_widget, column))
+            menu.addAction(copy_column_action)
+        
+        menu.addSeparator()
+
+        copy_headers_action = QAction("Copy Headers Only", self)
+        copy_headers_action.triggered.connect(lambda: self.copy_headers(self.table_widget))
+        menu.addAction(copy_headers_action)
+
+        copy_table_action = QAction("Copy Entire Table (with Headers)", self)
+        copy_table_action.triggered.connect(lambda: self.copy_table_contents(self.table_widget))
+        menu.addAction(copy_table_action)
+            
+        menu.exec(self.table_widget.mapToGlobal(pos))
+
+    def copy_cell_value(self, item):
+        if item:
+            QApplication.clipboard().setText(item.text())
+
+    def copy_row(self, table_widget, row):
+        if not table_widget or row < 0 or row >= table_widget.rowCount():
+            return
+        row_data = []
+        for col_idx in range(table_widget.columnCount()):
+            item = table_widget.item(row, col_idx)
+            # For checkbox column, copy its checked state as True/False string
+            if col_idx == 0 and item and item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                row_data.append(str(item.checkState() == Qt.CheckState.Checked))
+            else:
+                row_data.append(item.text() if item else "")
+        QApplication.clipboard().setText("\t".join(row_data))
+
+    def copy_column(self, table_widget, column):
+        if not table_widget or column < 0 or column >= table_widget.columnCount():
+            return
+        column_data = []
+        header_item = table_widget.horizontalHeaderItem(column)
+        header_text = header_item.text() if header_item else f"Column_{column + 1}"
+        column_data.append(header_text)
+
+        for row_idx in range(table_widget.rowCount()):
+            item = table_widget.item(row_idx, column)
+            if column == 0 and item and item.flags() & Qt.ItemFlag.ItemIsUserCheckable: # Checkbox column
+                column_data.append(str(item.checkState() == Qt.CheckState.Checked))
+            else:
+                column_data.append(item.text() if item else "")
+        QApplication.clipboard().setText("\n".join(column_data))
+
+    def copy_headers(self, table_widget):
+        if not table_widget or table_widget.columnCount() == 0:
+            return
+        headers_list = []
+        for col_idx in range(table_widget.columnCount()):
+            header_item = table_widget.horizontalHeaderItem(col_idx)
+            headers_list.append(header_item.text() if header_item else f"Column_{col_idx + 1}")
+        QApplication.clipboard().setText("\t".join(headers_list))
+
+    def copy_table_contents(self, table_widget):
+        if not table_widget or table_widget.rowCount() == 0 or table_widget.columnCount() == 0:
+            return
+        
+        content_lines = []
+        headers_list = []
+        for col_idx in range(table_widget.columnCount()):
+            header_item = table_widget.horizontalHeaderItem(col_idx)
+            headers_list.append(header_item.text() if header_item else f"Column_{col_idx + 1}")
+        content_lines.append("\t".join(headers_list))
+
+        for row_idx in range(table_widget.rowCount()):
+            row_data = []
+            for col_idx in range(table_widget.columnCount()):
+                item = table_widget.item(row_idx, col_idx)
+                if col_idx == 0 and item and item.flags() & Qt.ItemFlag.ItemIsUserCheckable: # Checkbox column
+                     row_data.append(str(item.checkState() == Qt.CheckState.Checked))
+                else:
+                    row_data.append(item.text() if item else "")
+            content_lines.append("\t".join(row_data))
+        
+        QApplication.clipboard().setText("\n".join(content_lines))
 
     def save_to_json_file(self): 
         if self.df is None:
