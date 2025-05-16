@@ -115,6 +115,8 @@ class QueryFileDialog(QDialog):
         self.results_table.verticalHeader().setVisible(False)
         self.results_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.results_table.customContextMenuRequested.connect(self._show_results_table_context_menu)
+        # Style selected cells to have a light blue background
+        self.results_table.setStyleSheet("QTableWidget::item:selected { background-color: #DCEBFF; color: black; }")
         main_layout.addWidget(self.results_table, 2) # Give results table more stretch
 
         # Status bar (optional, for messages)
@@ -226,6 +228,7 @@ class QueryFileDialog(QDialog):
                 
                 self.status_label.setText(f"Sheet '{sheet_name}' loaded. Query it as '{fixed_alias}'.")
                 self.query_editor.setPlaceholderText(f"Example: SELECT * FROM {fixed_alias} WHERE ...")
+                self._trigger_auto_query() # Run auto-query after sheet is loaded
             except Exception as e:
                 QMessageBox.critical(self, "Sheet Load Error", f"Could not load sheet '{sheet_name}': {e}")
                 self.status_label.setText(f"Error loading sheet '{sheet_name}'.")
@@ -254,7 +257,7 @@ class QueryFileDialog(QDialog):
         if not query:
             QMessageBox.warning(self, "Input Error", "Query cannot be empty.")
             return
-
+        
         fixed_alias = "Data"
         final_query = query
         file_ext = ""

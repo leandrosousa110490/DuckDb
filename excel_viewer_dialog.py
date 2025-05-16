@@ -29,6 +29,8 @@ class ExcelViewDialog(QDialog):
         self.table_widget.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked) # Allow editing on double click
         self.table_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu) # Enable context menu
         self.table_widget.customContextMenuRequested.connect(self.show_table_context_menu) # Connect slot
+        # Style selected cells to have a light blue background
+        self.table_widget.setStyleSheet("QTableWidget::item:selected { background-color: #DCEBFF; color: black; }")
         self.layout.addWidget(self.table_widget)
 
         # JSON Save Area
