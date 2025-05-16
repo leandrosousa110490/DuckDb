@@ -166,10 +166,9 @@ class QueryFileDialog(QDialog):
                 if hasattr(self, 'currently_registered_excel_sheet_name') and self.currently_registered_excel_sheet_name:
                     try:
                         self.db_conn.unregister("Data")
-                        print("Unregistered 'Data' from previous Excel load during non-Excel file selection.")
-                        self.currently_registered_excel_sheet_name = None
-                    except Exception as e:
-                        print(f"Error unregistering 'Data' during non-Excel file selection: {e}")
+                        print(f"QueryFileDialog: Unregistered 'Data' (Excel sheet: {self.currently_registered_excel_sheet_name}).")
+                    except Exception as e_unreg:
+                        print(f"QueryFileDialog: Error unregistering 'Data': {e_unreg}")
                 
                 self.query_editor.setPlaceholderText(f"Example: SELECT * FROM Data WHERE ...")
                 self._trigger_auto_query() # Auto-query for CSV/Parquet/JSON
@@ -290,12 +289,17 @@ class QueryFileDialog(QDialog):
             # A CSV, Parquet, or JSON file is selected, and the query uses the "Data" alias.
             # We need to create a temporary view for this query.
             read_func_str = None
+            
+            # Prepare path for SQL: replace backslashes and escape single quotes
+            path_for_sql = self.file_path.replace('\\', '/') # Replace backslashes with forward slashes
+            path_for_sql = path_for_sql.replace("'", "''")   # Escape single quotes for SQL
+
             if file_ext == '.csv':
-                read_func_str = f"read_csv_auto('{self.file_path.replace('\\', '/')}')"
+                read_func_str = f"read_csv_auto('{path_for_sql}')"
             elif file_ext == '.parquet':
-                read_func_str = f"read_parquet('{self.file_path.replace('\\', '/')}')"
+                read_func_str = f"read_parquet('{path_for_sql}')"
             elif file_ext == '.json':
-                read_func_str = f"read_json_auto('{self.file_path.replace('\\', '/')}')"
+                read_func_str = f"read_json_auto('{path_for_sql}')"
             else:
                 QMessageBox.warning(self, "File Type Error", f"Cannot create a queryable view for file type: {file_ext}")
                 return
@@ -459,8 +463,9 @@ class QueryFileDialog(QDialog):
                 # If an Excel sheet was actively registered as "Data", unregister it.
                 if hasattr(self, 'currently_registered_excel_sheet_name') and self.currently_registered_excel_sheet_name:
                     try:
-                        self.db_conn.unregister("Data")
-                        print(f"QueryFileDialog: Unregistered '{Data}' (Excel sheet: {self.currently_registered_excel_sheet_name}).")
+                        self.db_conn.unregister("Data") # Target alias is the string "Data"
+                        # Correctly use the literal string 'Data' in the informational print message
+                        print(f"QueryFileDialog: Unregistered 'Data' (Excel sheet: {self.currently_registered_excel_sheet_name}).")
                     except Exception as e_unreg:
                         print(f"QueryFileDialog: Error unregistering 'Data': {e_unreg}")
                 
