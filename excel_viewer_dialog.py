@@ -234,9 +234,14 @@ class ExcelViewDialog(QDialog):
             row_data = []
             for col_idx in range(table_widget.columnCount()):
                 item = table_widget.item(row_idx, col_idx)
-                if col_idx == 0 and item and item.flags() & Qt.ItemFlag.ItemIsUserCheckable: # Checkbox column
-                     row_data.append(str(item.checkState() == Qt.CheckState.Checked))
-                else:
+                if col_idx == 0: # Specifically handle the 'Select' checkbox column (column index 0)
+                    if item: # Check if item exists
+                        # Directly use checkState, convert to "True" or "False" string
+                        is_checked = (item.checkState() == Qt.CheckState.Checked)
+                        row_data.append(str(is_checked))
+                    else:
+                        row_data.append("False") # Default to "False" if item is unexpectedly None for checkbox col
+                else: # For other columns (Comment column and data columns)
                     row_data.append(item.text() if item else "")
             content_lines.append("\t".join(row_data))
         
