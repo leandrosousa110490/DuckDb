@@ -1,10 +1,12 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QTableWidget, QTableWidgetItem, QLabel, QApplication, QHeaderView,
-    QMenu
+    QMenu, QPushButton, QFileDialog, QMessageBox
 )
 from PyQt6.QtGui import QAction
 from PyQt6.QtCore import Qt
 import re
+import pandas as pd
+import os
 
 class EnhancedTableViewDialog(QDialog):
     def __init__(self, data, headers, parent=None):
@@ -34,6 +36,17 @@ class EnhancedTableViewDialog(QDialog):
         self.table_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table_widget.customContextMenuRequested.connect(self.show_table_context_menu)
         self.layout.addWidget(self.table_widget)
+
+        # Download buttons
+        download_layout = QHBoxLayout()
+        self.download_csv_button = QPushButton("Download View as CSV")
+        self.download_csv_button.clicked.connect(self._download_current_view_as_csv)
+        download_layout.addWidget(self.download_csv_button)
+
+        self.download_excel_button = QPushButton("Download View as Excel")
+        self.download_excel_button.clicked.connect(self._download_current_view_as_excel)
+        download_layout.addWidget(self.download_excel_button)
+        self.layout.addLayout(download_layout)
 
         self.populate_table()
 
@@ -142,6 +155,77 @@ class EnhancedTableViewDialog(QDialog):
             content_lines.append("\t".join(row_data))
         
         QApplication.clipboard().setText("\n".join(content_lines))
+
+    def _get_current_view_data_as_df(self):
+        """Helper to get current table_widget data (visible rows) as a DataFrame."""
+        if self.table_widget.rowCount() == 0:
+            return pd.DataFrame()
+
+        headers = []
+        for col_idx in range(self.table_widget.columnCount()):
+            header_item = self.table_widget.horizontalHeaderItem(col_idx)
+            headers.append(header_item.text() if header_item else f"Column_{col_idx + 1}")
+        
+        all_row_data = []
+        for row_idx in range(self.table_widget.rowCount()):
+            if self.table_widget.isRowHidden(row_idx):
+                continue # Skip hidden rows
+            
+            row_data = []
+            for col_idx in range(self.table_widget.columnCount()):
+                item = self.table_widget.item(row_idx, col_idx)
+                row_data.append(item.text() if item else "")
+            all_row_data.append(row_data)
+        
+        if not all_row_data: # If all rows were hidden
+            return pd.DataFrame(columns=headers) 
+            
+        return pd.DataFrame(all_row_data, columns=headers)
+
+    def _download_current_view_as_csv(self):
+        df_to_save = self._get_current_view_data_as_df()
+        if df_to_save.empty and self.table_widget.rowCount() > 0: # Table has data, but all are filtered out
+            QMessageBox.information(self, "No Visible Data", "No data matches the current filter criteria to download.")
+            return
+        elif df_to_save.empty:
+            QMessageBox.information(self, "No Data", "There is no data in the table to download.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Current View as CSV", "", "CSV Files (*.csv);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            df_to_save.to_csv(file_path, index=False, encoding='utf-8')
+            QMessageBox.information(self, "Success", f"Current view saved to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error Saving CSV", f"Could not save current view to CSV.\\n{e}")
+
+    def _download_current_view_as_excel(self):
+        df_to_save = self._get_current_view_data_as_df()
+        if df_to_save.empty and self.table_widget.rowCount() > 0: # Table has data, but all are filtered out
+            QMessageBox.information(self, "No Visible Data", "No data matches the current filter criteria to download.")
+            return
+        elif df_to_save.empty:
+            QMessageBox.information(self, "No Data", "There is no data in the table to download.")
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Current View as Excel", "", "Excel Files (*.xlsx);;All Files (*)"
+        )
+        if not file_path:
+            return
+        
+        if not file_path.lower().endswith('.xlsx'):
+            file_path += '.xlsx'
+
+        try:
+            df_to_save.to_excel(file_path, index=False, engine='openpyxl')
+            QMessageBox.information(self, "Success", f"Current view saved to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error Saving Excel", f"Could not save current view to Excel.\\n{e}")
 
     def _evaluate_condition(self, cell_value_str, operator, filter_value_str):
         cell_value_str_lower = cell_value_str.lower()

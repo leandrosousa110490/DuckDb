@@ -42,6 +42,17 @@ class ExcelViewDialog(QDialog):
         self.table_widget.setStyleSheet("QTableWidget::item:selected { background-color: #DCEBFF; color: black; }")
         self.layout.addWidget(self.table_widget)
 
+        # Download buttons for ExcelViewDialog
+        view_download_layout = QHBoxLayout()
+        self.download_view_csv_button = QPushButton("Download View as CSV")
+        self.download_view_csv_button.clicked.connect(self._download_view_as_csv)
+        view_download_layout.addWidget(self.download_view_csv_button)
+
+        self.download_view_excel_button = QPushButton("Download View as Excel")
+        self.download_view_excel_button.clicked.connect(self._download_view_as_excel)
+        view_download_layout.addWidget(self.download_view_excel_button)
+        self.layout.addLayout(view_download_layout) # Add this before JSON save layout
+
         # JSON Save Area
         save_layout = QHBoxLayout()
         save_layout.addWidget(QLabel("Save to JSON File:"))
@@ -246,6 +257,84 @@ class ExcelViewDialog(QDialog):
             content_lines.append("\t".join(row_data))
         
         QApplication.clipboard().setText("\n".join(content_lines))
+
+    def _get_view_table_data_as_df(self, include_select_col_as_bool=False):
+        """Helper to get current table_widget data as a DataFrame.
+           Handles visible rows only if filter is active.
+           Converts 'Select' column to boolean if requested.
+        """
+        if self.table_widget.rowCount() == 0:
+            return pd.DataFrame()
+
+        headers = []
+        for col_idx in range(self.table_widget.columnCount()):
+            header_item = self.table_widget.horizontalHeaderItem(col_idx)
+            headers.append(header_item.text() if header_item else f"Column_{col_idx + 1}")
+        
+        all_row_data = []
+        for row_idx in range(self.table_widget.rowCount()):
+            if self.table_widget.isRowHidden(row_idx): # Export only visible rows if filter is active
+                continue
+            row_data = []
+            for col_idx in range(self.table_widget.columnCount()):
+                item = self.table_widget.item(row_idx, col_idx)
+                if col_idx == 0: # 'Select' checkbox column
+                    is_checked = False # Default
+                    if item:
+                        is_checked = (item.checkState() == Qt.CheckState.Checked)
+                    row_data.append(is_checked if include_select_col_as_bool else str(is_checked))
+                else:
+                    row_data.append(item.text() if item else "")
+            all_row_data.append(row_data)
+        
+        return pd.DataFrame(all_row_data, columns=headers)
+
+    def _download_view_as_csv(self):
+        if self.table_widget.rowCount() == 0:
+            QMessageBox.information(self, "No Data", "There is no data in the table to download.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save View as CSV", "", "CSV Files (*.csv);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            # For CSV, we want the "Select" column as "True"/"False" strings
+            df_to_save = self._get_view_table_data_as_df(include_select_col_as_bool=False) 
+            if df_to_save.empty:
+                 QMessageBox.information(self, "No Visible Data", "No visible data to download (check filter)." )
+                 return
+            df_to_save.to_csv(file_path, index=False, encoding='utf-8')
+            QMessageBox.information(self, "Success", f"Table view saved to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error Saving CSV", f"Could not save table view to CSV.\\n{e}")
+
+    def _download_view_as_excel(self):
+        if self.table_widget.rowCount() == 0:
+            QMessageBox.information(self, "No Data", "There is no data in the table to download.")
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save View as Excel", "", "Excel Files (*.xlsx);;All Files (*)"
+        )
+        if not file_path:
+            return
+        
+        if not file_path.lower().endswith('.xlsx'):
+            file_path += '.xlsx'
+
+        try:
+            # For Excel, it's better to have actual boolean True/False for the 'Select' column
+            df_to_save = self._get_view_table_data_as_df(include_select_col_as_bool=True)
+            if df_to_save.empty:
+                 QMessageBox.information(self, "No Visible Data", "No visible data to download (check filter)." )
+                 return
+            df_to_save.to_excel(file_path, index=False, engine='openpyxl')
+            QMessageBox.information(self, "Success", f"Table view saved to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error Saving Excel", f"Could not save table view to Excel.\\n{e}")
 
     def save_to_json_file(self): 
         if self.df is None:

@@ -119,6 +119,17 @@ class QueryFileDialog(QDialog):
         self.results_table.setStyleSheet("QTableWidget::item:selected { background-color: #DCEBFF; color: black; }")
         main_layout.addWidget(self.results_table, 2) # Give results table more stretch
 
+        # Download buttons
+        download_layout = QHBoxLayout()
+        self.download_csv_button = QPushButton("Download as CSV")
+        self.download_csv_button.clicked.connect(self._download_results_as_csv)
+        download_layout.addWidget(self.download_csv_button)
+
+        self.download_excel_button = QPushButton("Download as Excel")
+        self.download_excel_button.clicked.connect(self._download_results_as_excel)
+        download_layout.addWidget(self.download_excel_button)
+        main_layout.addLayout(download_layout)
+
         # Status bar (optional, for messages)
         self.status_label = QLabel("")
         main_layout.addWidget(self.status_label)
@@ -371,6 +382,69 @@ class QueryFileDialog(QDialog):
                     print(f"Temporary view '{fixed_alias}' unregistered after query.")
                 except Exception as e_unreg_temp:
                     print(f"Error unregistering temporary view '{fixed_alias}': {e_unreg_temp}")
+
+    def _get_table_data_as_df(self):
+        if self.results_table.rowCount() == 0:
+            return pd.DataFrame()
+
+        headers = []
+        for col in range(self.results_table.columnCount()):
+            header_item = self.results_table.horizontalHeaderItem(col)
+            headers.append(header_item.text() if header_item else f"Column_{col+1}")
+        
+        all_row_data = []
+        for row_idx in range(self.results_table.rowCount()):
+            row_data = []
+            for col_idx in range(self.results_table.columnCount()):
+                item = self.results_table.item(row_idx, col_idx)
+                row_data.append(item.text() if item else "")
+            all_row_data.append(row_data)
+        
+        return pd.DataFrame(all_row_data, columns=headers)
+
+    def _download_results_as_csv(self):
+        if self.results_table.rowCount() == 0:
+            QMessageBox.information(self, "No Data", "There is no data in the table to download.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save as CSV", "", "CSV Files (*.csv);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            df = self._get_table_data_as_df()
+            df.to_csv(file_path, index=False, encoding='utf-8')
+            QMessageBox.information(self, "Success", f"Results saved to {file_path}")
+            self.status_label.setText(f"Results saved as CSV: {os.path.basename(file_path)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error Saving CSV", f"Could not save results to CSV.\\n{e}")
+            self.status_label.setText("Error saving CSV.")
+
+    def _download_results_as_excel(self):
+        if self.results_table.rowCount() == 0:
+            QMessageBox.information(self, "No Data", "There is no data in the table to download.")
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save as Excel", "", "Excel Files (*.xlsx);;All Files (*)"
+        )
+        if not file_path:
+            return
+        
+        # Ensure .xlsx extension
+        if not file_path.lower().endswith('.xlsx'):
+            file_path += '.xlsx'
+
+        try:
+            df = self._get_table_data_as_df()
+            df.to_excel(file_path, index=False, engine='openpyxl')
+            QMessageBox.information(self, "Success", f"Results saved to {file_path}")
+            self.status_label.setText(f"Results saved as Excel: {os.path.basename(file_path)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error Saving Excel", f"Could not save results to Excel.\\n{e}")
+            self.status_label.setText("Error saving Excel.")
 
     def _show_results_table_context_menu(self, position):
         menu = QMenu()
