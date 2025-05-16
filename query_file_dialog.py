@@ -6,7 +6,7 @@ import re
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog,
     QLabel, QLineEdit, QTextEdit, QTableWidget, QTableWidgetItem,
-    QMessageBox, QComboBox, QHeaderView
+    QMessageBox, QComboBox, QHeaderView, QMenu, QApplication
 )
 from PyQt6.QtGui import QSyntaxHighlighter, QTextCharFormat, QColor, QFont
 from PyQt6.QtCore import Qt, QRegularExpression
@@ -113,6 +113,8 @@ class QueryFileDialog(QDialog):
         self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.results_table.verticalHeader().setVisible(False)
+        self.results_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.results_table.customContextMenuRequested.connect(self._show_results_table_context_menu)
         main_layout.addWidget(self.results_table, 2) # Give results table more stretch
 
         # Status bar (optional, for messages)
@@ -363,6 +365,90 @@ class QueryFileDialog(QDialog):
                 except Exception as e_unreg_temp:
                     print(f"Error unregistering temporary view '{fixed_alias}': {e_unreg_temp}")
 
+    def _show_results_table_context_menu(self, position):
+        menu = QMenu()
+        copy_cell_action = menu.addAction("Copy Cell Value")
+        copy_row_action = menu.addAction("Copy Row")
+        copy_column_action = menu.addAction("Copy Column (with Header)")
+        copy_table_action = menu.addAction("Copy Table (with Headers)")
+
+        action = menu.exec(self.results_table.mapToGlobal(position))
+
+        if action == copy_cell_action:
+            self._copy_cell_value()
+        elif action == copy_row_action:
+            self._copy_row_content()
+        elif action == copy_column_action:
+            self._copy_column_content_with_header()
+        elif action == copy_table_action:
+            self._copy_table_content_with_headers()
+
+    def _copy_cell_value(self):
+        selected_items = self.results_table.selectedItems()
+        if selected_items:
+            clipboard = QApplication.clipboard()
+            clipboard.setText(selected_items[0].text())
+            self.status_label.setText("Cell value copied.")
+        else:
+            self.status_label.setText("No cell selected to copy.")
+
+    def _copy_row_content(self):
+        selected_indexes = self.results_table.selectedIndexes()
+        if not selected_indexes:
+            self.status_label.setText("No row selected to copy.")
+            return
+
+        selected_row = selected_indexes[0].row()
+        row_data = []
+        for col in range(self.results_table.columnCount()):
+            item = self.results_table.item(selected_row, col)
+            row_data.append(item.text() if item else "")
+        
+        clipboard = QApplication.clipboard()
+        clipboard.setText("\t".join(row_data))
+        self.status_label.setText(f"Row {selected_row + 1} copied.")
+
+    def _copy_column_content_with_header(self):
+        selected_indexes = self.results_table.selectedIndexes()
+        if not selected_indexes:
+            self.status_label.setText("No column selected to copy.")
+            return
+
+        selected_col = selected_indexes[0].column()
+        header_item = self.results_table.horizontalHeaderItem(selected_col)
+        header_text = header_item.text() if header_item else f"Column {selected_col + 1}"
+        
+        col_data = [header_text]
+        for row in range(self.results_table.rowCount()):
+            item = self.results_table.item(row, selected_col)
+            col_data.append(item.text() if item else "")
+            
+        clipboard = QApplication.clipboard()
+        clipboard.setText("\n".join(col_data))
+        self.status_label.setText(f"Column '{header_text}' copied.")
+
+    def _copy_table_content_with_headers(self):
+        if self.results_table.rowCount() == 0:
+            self.status_label.setText("Table is empty, nothing to copy.")
+            return
+
+        headers = []
+        for col in range(self.results_table.columnCount()):
+            header_item = self.results_table.horizontalHeaderItem(col)
+            headers.append(header_item.text() if header_item else f"Column {col + 1}")
+        
+        table_data_str = ["\t".join(headers)]
+        for row in range(self.results_table.rowCount()):
+            row_data = []
+            for col in range(self.results_table.columnCount()):
+                item = self.results_table.item(row, col)
+                row_data.append(item.text() if item else "")
+            table_data_str.append("\t".join(row_data))
+            
+        clipboard = QApplication.clipboard()
+        clipboard.setText("\n".join(table_data_str))
+        self.status_label.setText("Table content with headers copied.")
+
     def closeEvent(self, event):
         # Clean up DuckDB connection when dialog closes
         if self.db_conn:
@@ -383,7 +469,6 @@ class QueryFileDialog(QDialog):
 
 if __name__ == '__main__':
     # This is for testing the dialog independently
-    from PyQt6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     dialog = QueryFileDialog()
     dialog.show()
