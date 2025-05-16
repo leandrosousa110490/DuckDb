@@ -168,6 +168,7 @@ class QueryFileDialog(QDialog):
                         print(f"Error unregistering 'Data' during non-Excel file selection: {e}")
                 
                 self.query_editor.setPlaceholderText(f"Example: SELECT * FROM Data WHERE ...")
+                self._trigger_auto_query() # Auto-query for CSV/Parquet/JSON
 
 
     def load_excel_sheets(self):
@@ -193,6 +194,11 @@ class QueryFileDialog(QDialog):
             self.file_label.setText("Error reading Excel. Select another file.")
             self.sheet_selector_label.setVisible(False)
             self.sheet_selector.setVisible(False)
+            self.status_label.setText(f"Error loading sheet '{self.sheet_names[0]}'.")
+            self.currently_registered_excel_sheet_name = None # Clear tracker on error
+            self.query_editor.setPlainText("") # Clear query on error
+            self.results_table.setRowCount(0)
+            self.results_table.setColumnCount(0)
             
     def sheet_changed(self, index):
         if not self.file_path or not self.sheet_names or index < 0 or index >= len(self.sheet_names):
@@ -222,6 +228,20 @@ class QueryFileDialog(QDialog):
                 QMessageBox.critical(self, "Sheet Load Error", f"Could not load sheet '{sheet_name}': {e}")
                 self.status_label.setText(f"Error loading sheet '{sheet_name}'.")
                 self.currently_registered_excel_sheet_name = None # Clear tracker on error
+                self.query_editor.setPlainText("") # Clear query on error
+                self.results_table.setRowCount(0)
+                self.results_table.setColumnCount(0)
+
+    def _trigger_auto_query(self):
+        if not self.file_path and not self.currently_registered_excel_sheet_name:
+            # No file/sheet loaded that can be aliased as "Data" yet
+            return 
+        
+        default_query = "SELECT * FROM Data LIMIT 100;"
+        self.query_editor.setPlainText(default_query)
+        # Small delay or QTimer.singleShot might be good if run_query relies on UI fully settling,
+        # but usually direct call is fine if setup is complete.
+        self.run_query()
 
     def run_query(self):
         if not self.db_conn:
