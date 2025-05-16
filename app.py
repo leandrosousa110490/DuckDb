@@ -1045,306 +1045,41 @@ class QueryTab(QWidget):
             QMessageBox.critical(self, "Error", f"Could not open web chart builder: {e}")
 
     def _generate_chart_builder_html(self, data_list_of_dicts, headers_list):
-        js_data = json.dumps(data_list_of_dicts) 
-        js_headers = json.dumps(headers_list)
-
-        return f"""<!DOCTYPE html>
-<html>
-<head>
-    <title>DuckDB Web Chart Builder</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-    <style>
-        html, body {{ height: 100%; margin: 0; padding: 0; }} /* Ensure body can expand */
-        body {{ font-family: sans-serif; display: flex; flex-direction: column; align-items: center; background-color: #f0f2f5; color: #333; padding: 20px; box-sizing: border-box; }}
-        h2 {{ color: #1a1a1a; margin-top: 0; margin-bottom: 15px; text-align: center; flex-shrink: 0; }}
-        .controls {{ display: grid; grid-template-columns: auto auto; gap: 12px 24px; margin-bottom: 20px; padding: 20px; border: 1px solid #ccc; border-radius: 8px; background-color: #ffffff; box-shadow: 0 4px 8px rgba(0,0,0,0.1); flex-shrink: 0; /* Prevent controls from shrinking */ }}
-        .controls label {{ font-weight: bold; text-align: right; padding-top: 8px; }}
-        .controls select, .controls button {{ padding: 10px; border-radius: 5px; border: 1px solid #ddd; min-width: 180px; background-color: #fff; box-sizing: border-box; }}
-        .controls button {{ background-color: #007bff; color: white; cursor: pointer; transition: background-color 0.3s ease; }}
-        .controls button:hover {{ background-color: #0056b3; }}
-        #chartDiv {{ width: 95%; /* max-width: 1000px; REMOVED to allow wider chart */ flex-grow: 1; /* Allow chart to take available vertical space */ min-height: 400px; /* Minimum height for the chart */ border: 1px solid #ccc; background-color: #fff; box-shadow: 0 4px 8px rgba(0,0,0,0.1); margin-bottom: 20px; /* Add some space at the bottom */}}
-        .control-group {{ display: contents; }}
-        select {{ height: 38px; }}
-    </style>
-</head>
-<body>
-    <h2>DuckDB Web Chart Builder</h2>
-    
-    <div class="controls">
-        <div class="control-group">
-            <label for="chartType">Chart Type:</label>
-            <select id="chartType">
-                <option value="Bar">Bar</option>
-                <option value="Line">Line</option>
-                <option value="Scatter">Scatter</option>
-                <option value="Pie">Pie</option>
-                <option value="Histogram">Histogram</option>
-            </select>
-        </div>
-
-        <div class="control-group">
-            <label id="xAxisLabel" for="xAxis">X-Axis:</label>
-            <select id="xAxis"></select>
-        </div>
-
-        <div class="control-group">
-            <label id="yAxisLabel" for="yAxis">Y-Axis:</label>
-            <select id="yAxis"></select>
-        </div>
-
-        <div class="control-group" id="yAggGroup">
-            <label for="yAgg">Y-Axis Aggregation:</label>
-            <select id="yAgg">
-                <option value="None">None</option>
-                <option value="Sum">Sum</option>
-                <option value="Average">Average</option>
-                <option value="Count">Count</option>
-                <option value="Min">Min</option>
-                <option value="Max">Max</option>
-            </select>
-        </div>
-
-        <div class="control-group">
-            <label for="colorBy">Group/Color By:</label>
-            <select id="colorBy"></select>
-        </div>
-
-        <div class="control-group" id="histValueColGroup">
-            <label for="histValueCol">Value (for Histogram):</label>
-            <select id="histValueCol"></select>
-        </div>
-
-        <div></div><!-- Placeholder for grid alignment -->
-        <button id="renderButton">Render Chart</button>
-    </div>
-
-    <div id="chartDiv"></div>
-
-    <script>
-        const rawData = {js_data};
-        const headers = {js_headers};
-
-        function populateSelect(selectId, optionsArray, includeNone = false, defaultSelection = null) {{
-            const select = document.getElementById(selectId);
-            select.innerHTML = ''; 
-            if (includeNone) {{
-                const noneOption = document.createElement('option');
-                noneOption.value = 'None';
-                noneOption.textContent = 'None';
-                select.appendChild(noneOption);
-            }}
-            optionsArray.forEach(optionValue => {{
-                const option = document.createElement('option');
-                option.value = optionValue;
-                option.textContent = optionValue;
-                select.appendChild(option);
-            }});
-            if (defaultSelection && optionsArray.includes(defaultSelection)) select.value = defaultSelection;
-            else if (optionsArray.length > 0 && !includeNone) select.value = optionsArray[0];
-        }}
-
-        populateSelect('xAxis', headers, false, headers.length > 0 ? headers[0] : null);
-        populateSelect('yAxis', headers, false, headers.length > 1 ? headers[1] : (headers.length > 0 ? headers[0] : null) );
-        populateSelect('colorBy', headers, true);
-        populateSelect('histValueCol', headers, false, headers.length > 0 ? headers[0] : null);
-
-        const chartTypeSelect = document.getElementById('chartType');
-        const xAxisSelect = document.getElementById('xAxis');
-        const yAxisSelect = document.getElementById('yAxis');
-        const yAggSelect = document.getElementById('yAgg');
-        const colorBySelect = document.getElementById('colorBy');
-        const histValueColSelect = document.getElementById('histValueCol');
-        const renderButton = document.getElementById('renderButton');
-        
-        const yAggGroup = document.getElementById('yAggGroup');
-        const histValueColGroup = document.getElementById('histValueColGroup');
-        const yAxisEl = document.getElementById('yAxis');
-        const yAxisLabelEl = document.getElementById('yAxisLabel');
-        const xAxisLabelEl = document.getElementById('xAxisLabel');
-
-        function updateControlVisibility() {{
-            const chartType = chartTypeSelect.value;
-            const isBarLinePie = ['Bar', 'Line', 'Pie'].includes(chartType);
-            const isScatter = chartType === 'Scatter';
-            const isHistogram = chartType === 'Histogram';
-
-            yAxisEl.style.display = (isBarLinePie || isScatter) ? '' : 'none';
-            yAxisLabelEl.style.display = (isBarLinePie || isScatter) ? '' : 'none';
-            yAggGroup.style.display = isBarLinePie ? '' : 'none';
+        """Generates the HTML for the web chart builder by loading a template and injecting data."""
+        try:
+            template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chart_builder_template.html")
+            with open(template_path, "r", encoding="utf-8") as f:
+                html_content = f.read()
             
-            document.getElementById('xAxis').style.display = ''; 
-            xAxisLabelEl.style.display = '';
-            histValueColGroup.style.display = isHistogram ? '' : 'none';
-
-            if (chartType === 'Pie') {{
-                xAxisLabelEl.textContent = 'Labels (Names):';
-                yAxisLabelEl.textContent = 'Values:';
-            }} else if (isHistogram) {{
-                 xAxisLabelEl.textContent = 'Value to Bin:';
-                 yAxisLabelEl.style.display = 'none'; 
-                 yAxisEl.style.display = 'none';
-                 yAggGroup.style.display = 'none';
-            }} else {{
-                xAxisLabelEl.textContent = 'X-Axis:';
-                yAxisLabelEl.textContent = 'Y-Axis:';
-            }}
-        }}
-
-        chartTypeSelect.addEventListener('change', updateControlVisibility);
-        updateControlVisibility(); 
-
-        renderButton.addEventListener('click', () => {{
-            const chartType = chartTypeSelect.value;
-            const xCol = xAxisSelect.value;
-            let yCol = yAxisSelect.value;
-            const yAgg = yAggSelect.value;
-            const colorCol = colorBySelect.value === 'None' ? null : colorBySelect.value;
-            const histValCol = histValueColSelect.value;
-
-            if (!rawData || rawData.length === 0) {{
-                document.getElementById('chartDiv').innerHTML = 'No data to display.';
-                return;
-            }}
+            # Prepare <option> tags for header dropdowns for the original template structure
+            none_option_html = '<option value="">None</option>'
+            header_options_html = "".join([f'<option value="{h}">{h}</option>' for h in headers_list])
             
-            let MOCK_PANDAS_DF = JSON.parse(JSON.stringify(rawData)); // Deep copy
+            xaxis_options = none_option_html + header_options_html
+            yaxis_options = none_option_html + header_options_html
+            coloraxis_options = none_option_html + header_options_html
 
-            function getNumericValue(value) {{
-                if (value === null || value === undefined || value === '') return null;
-                const num = parseFloat(String(value).replace(/,/g, '')); // Handle commas in numbers
-                return isNaN(num) ? null : num; // Return null if not a number
-            }}
+            # Prepare HTML for the draggable fields list
+            fields_list_items_html = "".join([f'<li data-field-name="{h}">{h}</li>' for h in headers_list])
 
-            let traces = [];
-            let layout = {{ title: `${{chartType}} Chart for ${{yCol || histValCol}} by ${{xCol}}` }};
-            let processedData = MOCK_PANDAS_DF;
-
-            try {{
-                if (yAgg !== 'None' && (chartType === 'Bar' || chartType === 'Line' || chartType === 'Pie')) {{
-                    const groups = {{}};
-                    processedData.forEach(row => {{
-                        const xVal = row[xCol];
-                        const colorVal = colorCol ? row[colorCol] : '__NO_COLOR__';
-                        const groupKey = `${{xVal}}_${{colorVal}}`;
-                        
-                        if (!groups[groupKey]) {{
-                            groups[groupKey] = {{ x: xVal, color: colorCol ? colorVal : null, values: [], sum: 0, count: 0 }};
-                        }}
-                        const val = getNumericValue(row[yCol]);
-                        if (val !== null) {{
-                           groups[groupKey].values.push(val);
-                           groups[groupKey].sum += val;
-                        }}
-                        groups[groupKey].count++; // Count all rows for the group, even if yVal is null for some aggs
-                    }});
-
-                    const aggResults = Object.values(groups).map(g => {{
-                        let aggValue;
-                        if (yAgg === 'Sum') aggValue = g.sum;
-                        else if (yAgg === 'Average') aggValue = g.count > 0 ? g.sum / g.count : 0;
-                        else if (yAgg === 'Count') aggValue = g.count;
-                        else if (yAgg === 'Min') aggValue = g.values.length > 0 ? Math.min(...g.values) : null;
-                        else if (yAgg === 'Max') aggValue = g.values.length > 0 ? Math.max(...g.values) : null;
-                        else {{ aggValue = g.sum; }} // Default for None when it shouldn't be here
-                        return {{ [xCol]: g.x, [yCol]: aggValue, ...(g.color && {{[colorCol]: g.color}}) }};
-                    }});
-                    processedData = aggResults;
-                }}
-
-                if (chartType === 'Bar' || chartType === 'Line') {{
-                    layout.xaxis = {{ title: xCol }};
-                    layout.yaxis = {{ title: yCol }};
-                    if (colorCol) {{
-                        const uniqueColors = [...new Set(processedData.map(item => item[colorCol]))].sort();
-                        uniqueColors.forEach(colorVal => {{
-                            const colorData = processedData.filter(item => item[colorCol] === colorVal);
-                            traces.push({{
-                                type: chartType.toLowerCase(),
-                                x: colorData.map(item => item[xCol]),
-                                y: colorData.map(item => item[yCol]),
-                                name: String(colorVal)
-                            }});
-                        }});
-                    }} else {{
-                        traces.push({{
-                            type: chartType.toLowerCase(),
-                            x: processedData.map(item => item[xCol]),
-                            y: processedData.map(item => item[yCol]),
-                            name: yCol
-                        }});
-                    }}
-                }} else if (chartType === 'Scatter') {{
-                    layout.xaxis = {{ title: xCol }};
-                    layout.yaxis = {{ title: yCol }};
-                    if (colorCol) {{
-                        const uniqueColors = [...new Set(MOCK_PANDAS_DF.map(item => item[colorCol]))].sort();
-                        uniqueColors.forEach(colorVal => {{
-                            const colorData = MOCK_PANDAS_DF.filter(item => item[colorCol] === colorVal);
-                            traces.push({{
-                                type: 'scatter', mode: 'markers',
-                                x: colorData.map(item => getNumericValue(item[xCol])),
-                                y: colorData.map(item => getNumericValue(item[yCol])),
-                                text: colorData.map(item => `${{xCol}}: ${{item[xCol]}}<br>${{yCol}}: ${{item[yCol]}}${{colorCol ? `<br>${{colorCol}}: ${{item[colorCol]}}` : ''}}`),
-                                hoverinfo: 'text',
-                                name: String(colorVal)
-                            }});
-                        }});
-                    }} else {{
-                        traces.push({{
-                            type: 'scatter', mode: 'markers',
-                            x: MOCK_PANDAS_DF.map(item => getNumericValue(item[xCol])),
-                            y: MOCK_PANDAS_DF.map(item => getNumericValue(item[yCol])),
-                            text: MOCK_PANDAS_DF.map(item => `${{xCol}}: ${{item[xCol]}}<br>${{yCol}}: ${{item[yCol]}}`),
-                            hoverinfo: 'text'
-                        }});
-                    }}
-                }} else if (chartType === 'Pie') {{
-                    let labels, values;
-                    if (yAgg === 'Count' && yAggGroup.style.display !== 'none') {{ 
-                        const counts = {{}};
-                        MOCK_PANDAS_DF.forEach(row => {{ counts[row[xCol]] = (counts[row[xCol]] || 0) + 1; }});
-                        labels = Object.keys(counts);
-                        values = Object.values(counts);
-                    }} else {{ 
-                        labels = processedData.map(item => item[xCol]);
-                        values = processedData.map(item => getNumericValue(item[yCol]));
-                    }}
-                    traces.push({{ type: 'pie', labels: labels, values: values, hoverinfo: 'label+percent+value', textinfo: 'percent' }});
-                }} else if (chartType === 'Histogram') {{
-                    layout.xaxis = {{ title: histValCol }};
-                    layout.yaxis = {{ title: 'Count' }};
-                    const numericHistValues = MOCK_PANDAS_DF.map(item => getNumericValue(item[histValCol])).filter(v => v !== null);
-                    if (colorCol) {{
-                         const uniqueColors = [...new Set(MOCK_PANDAS_DF.map(item => item[colorCol]))].sort();
-                         uniqueColors.forEach(colorVal => {{
-                            const colorData = MOCK_PANDAS_DF.filter(item => item[colorCol] === colorVal);
-                            traces.push({{ 
-                                type: 'histogram', 
-                                x: colorData.map(item => getNumericValue(item[histValCol])).filter(v => v !== null), 
-                                name: String(colorVal) 
-                            }});
-                         }});
-                         layout.barmode = 'overlay';
-                    }} else {{
-                        traces.push({{ type: 'histogram', x: numericHistValues }});
-                    }}
-                    traces.forEach(trace => trace.opacity = 0.75);
-                }}
-                layout.title = `${{chartType}} of ${{yCol && yAxisEl.style.display !== 'none'? yCol : (chartType === 'Histogram' ? histValCol : xCol)}}`;
-                if (chartType !== 'Pie' && chartType !== 'Histogram' && xCol) layout.title += ` by ${{xCol}}`;
-                if (colorCol) layout.title += ` (Colored by ${{colorCol}})`;
-
-                Plotly.newPlot('chartDiv', traces, layout, {{responsive: true}});
-            }} catch (err) {{
-                document.getElementById('chartDiv').innerHTML = `Error rendering chart: ${{err.message}}. Check console for details.`;
-                console.error("Chart rendering error:", err);
-            }}
-        }});
-        // Trigger initial render if data available and relevant columns selected
-        if (headers.length > 0) renderButton.click();
-    </script>
-</body>
-</html>
-""".strip()
+            # Replace placeholders in the template
+            # These placeholders are based on the *original* HTML structure in chart_builder_template.html
+            html_content = html_content.replace("{chart_data_json}", json.dumps(data_list_of_dicts))
+            html_content = html_content.replace("{headers_json}", json.dumps(headers_list))
+            html_content = html_content.replace("{xAxisOptions}", xaxis_options)
+            html_content = html_content.replace("{yAxisOptions}", yaxis_options)
+            html_content = html_content.replace("{colorAxisOptions}", coloraxis_options)
+            html_content = html_content.replace("{fields_list_html}", fields_list_items_html) # Added this line
+            
+            return html_content
+            
+        except Exception as e:
+            # Fallback error message if the template is not found or other error
+            print(f"Error in _generate_chart_builder_html: {e}") # Log error to console
+            return f"""<!DOCTYPE html><html><head><title>Error</title></head>
+                    <body><h1>Error generating chart page:</h1><pre>{str(e)}</pre>
+                    <p>Ensure 'chart_builder_template.html' is in the same directory as the application and placeholders are correct.</p>
+                    </body></html>"""
 
     def focus_filter(self):
         """Focus the filter input field."""

@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>DuckDB Web Chart Builder</title>
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
+    <style>
+        body, html { height: 100%; margin: 0; font-family: Arial, sans-serif; display: flex; flex-direction: column; }
+        
+        .container { display: flex; flex: 1; overflow: hidden; }
+        .controls-panel { 
+            width: 280px; 
+            padding: 15px; 
+            border-right: 1px solid #ccc; 
+            background-color: #f9f9f9; 
+            overflow-y: auto; 
+            display: flex;
+            flex-direction: column;
+        }
+        .chart-area { 
+            flex-grow: 1; 
+            padding: 15px; 
+            display: flex; 
+            flex-direction: column; 
+            overflow: hidden;
+        }
+        #chartDiv { 
+            flex-grow: 1; 
+            border: 1px solid #ddd; 
+            background-color: #fff; 
+            min-height: 300px; 
+            display: flex; 
+            align-items: center; 
+            justify-content: center; 
+            text-align: center; 
+            color: #777;
+        }
+
+        .fields-list-container { flex-shrink: 0; margin-bottom: 15px; }
+        .fields-list { 
+            list-style-type: none; 
+            padding: 0; 
+            margin-top: 5px; 
+            max-height: 250px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            background-color: #fff;
+            border-radius: 4px;
+        }
+        .fields-list li { 
+            padding: 8px 10px; 
+            margin: 0;
+            background-color: #f0f0f0; 
+            border-bottom: 1px solid #ddd; 
+            cursor: grab; 
+            font-size: 0.9em;
+        }
+        .fields-list li:last-child { border-bottom: none; }
+        .fields-list li:hover { background-color: #e0e0e0; }
+
+        .drop-zones-container { display: flex; justify-content: space-between; margin-bottom: 15px; flex-shrink: 0; }
+        .drop-zone-wrapper { flex: 1; margin: 0 5px; }
+        .drop-zone-wrapper:first-child { margin-left: 0; }
+        .drop-zone-wrapper:last-child { margin-right: 0; }
+        .drop-zone { 
+            padding: 10px;
+            border: 2px dashed #aaa; 
+            border-radius: 4px; 
+            background-color: #f0f0f0;
+            min-height: 40px; 
+            display: flex; 
+            align-items: center; 
+            justify-content: center; 
+            text-align: center; 
+            font-size: 0.9em;
+            transition: background-color 0.2s ease;
+        }
+        .drop-zone.placeholder { color: #777; font-style: italic; }
+        .drop-zone.sortable-ghost { background-color: #d0e0ff !important; /* Highlight when dragging over */}
+        .drop-zone .field-item { 
+            padding: 6px 10px; 
+            background-color: #007bff; 
+            color: white; 
+            border-radius: 3px; 
+            margin: 2px;
+            font-size: 0.9em;
+            cursor: pointer;
+            display: inline-block;
+        }
+
+        .chart-config-container { flex-shrink: 0; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; font-size: 0.95em; }
+        select, .controls-panel button { 
+            width: 100%; 
+            padding: 8px 10px; 
+            margin-bottom: 12px; 
+            border-radius: 4px; 
+            border: 1px solid #ccc; 
+            box-sizing: border-box; 
+            background-color: #fff;
+            font-size: 0.9em;
+        }
+        .controls-panel button { 
+            background-color: #28a745; 
+            color: white; 
+            cursor: pointer; 
+            transition: background-color 0.2s ease;
+        }
+        .controls-panel button:hover { background-color: #218838; }
+        h3 { margin-top: 0; margin-bottom: 10px; color: #333; font-size: 1.1em; border-bottom: 1px solid #eee; padding-bottom: 5px; }
+        hr { margin: 20px 0; border: 0; border-top: 1px solid #ddd; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="controls-panel">
+            <div class="fields-list-container">
+                <h3>Available Fields</h3>
+                <ul id="fieldsList" class="fields-list">
+                    {fields_list_html} 
+                </ul>
+            </div>
+
+            <hr>
+            <div class="chart-config-container">
+                <h3>Chart Configuration</h3>
+                <label for="chartType">Chart Type:</label>
+                <select id="chartType" onchange="renderChart()">
+                    <option value="bar">Bar Chart</option>
+                    <option value="line">Line Chart</option>
+                    <option value="scatter">Scatter Plot</option>
+                    <option value="pie">Pie Chart</option>
+                    <option value="histogram">Histogram</option>
+                    <option value="box">Box Plot</option>
+                </select>
+
+                <label for="aggregation">Aggregation (Y-Axis/Value):</label>
+                <select id="aggregation" onchange="renderChart()">
+                    <option value="sum">Sum</option>
+                    <option value="avg">Average</option>
+                    <option value="count">Count</option>
+                    <option value="min">Min</option>
+                    <option value="max">Max</option>
+                    <option value="none">None (Direct Value)</option>
+                </select>
+                
+                <label for="showTooltips">Show Tooltips:</label>
+                <input type="checkbox" id="showTooltips" onchange="renderChart()" checked>
+
+                <button onclick="renderChart()">Render Chart</button>
+            </div>
+        </div>
+
+        <div class="chart-area">
+            <div class="drop-zones-container">
+                <div class="drop-zone-wrapper">
+                    <label for="xAxisDropZone">X-Axis:</label>
+                    <div id="xAxisDropZone" class="drop-zone placeholder">Drop X Field</div>
+                </div>
+                <div class="drop-zone-wrapper">
+                    <label for="yAxisDropZone">Y-Axis / Value:</label>
+                    <div id="yAxisDropZone" class="drop-zone placeholder">Drop Y Field</div>
+                </div>
+                <div class="drop-zone-wrapper">
+                    <label for="colorDropZone">Color / Group By:</label>
+                    <div id="colorDropZone" class="drop-zone placeholder">Drop Group Field</div>
+                </div>
+            </div>
+            <div id="chartDiv">Drop fields and select chart type to render.</div>
+        </div>
+    </div>
+
+    <script>
+        const chartData = {chart_data_json};
+        const headers = {headers_json};
+        let currentChart = null;
+
+        const xAxisDropZoneEl = document.getElementById('xAxisDropZone');
+        const yAxisDropZoneEl = document.getElementById('yAxisDropZone');
+        const colorDropZoneEl = document.getElementById('colorDropZone');
+        const fieldsListEl = document.getElementById('fieldsList');
+
+        let xField = null;
+        let yField = null;
+        let colorField = null;
+
+        function formatNumber(num) {
+            if (typeof num !== 'number' || isNaN(num)) {
+                return num; // Return as is if not a valid number
+            }
+
+            let value = parseFloat(num.toFixed(2)); // Round to 2 decimal places
+            const sign = value < 0 ? "-" : "";
+            const absValue = Math.abs(value);
+
+            if (absValue >= 1.0e+9) { // Billions
+                return sign + (absValue / 1.0e+9).toFixed(1) + 'B';
+            } else if (absValue >= 1.0e+6) { // Millions
+                return sign + (absValue / 1.0e+6).toFixed(1) + 'M';
+            } else if (absValue >= 1.0e+3) { // Thousands
+                return sign + (absValue / 1.0e+3).toFixed(1) + 'k';
+            }
+            // For numbers less than 1000, or if specific non-suffixed formatting is needed:
+            return sign + absValue.toFixed(2); // Ensure two decimal places for smaller numbers too
+        }
+
+        function updateDropZoneVisual(zoneElement, fieldName, placeholderText) {
+            if (!zoneElement) return;
+            zoneElement.innerHTML = ''; 
+            if (fieldName) {
+                const fieldItem = document.createElement('span');
+                fieldItem.className = 'field-item';
+                fieldItem.textContent = fieldName;
+                fieldItem.dataset.fieldName = fieldName; 
+                zoneElement.appendChild(fieldItem);
+                zoneElement.classList.remove('placeholder');
+            } else {
+                zoneElement.textContent = placeholderText;
+                zoneElement.classList.add('placeholder');
+            }
+        }
+        
+        function createDropZoneClickHandler(zoneElement, fieldSetterFunction, placeholderText) {
+            zoneElement.addEventListener('click', function(event) {
+                if (event.target.classList.contains('field-item')) {
+                    fieldSetterFunction(null);
+                    updateDropZoneVisual(zoneElement, null, placeholderText);
+                    renderChart();
+                }
+            });
+        }
+
+        createDropZoneClickHandler(xAxisDropZoneEl, (val) => xField = val, 'Drop X Field');
+        createDropZoneClickHandler(yAxisDropZoneEl, (val) => yField = val, 'Drop Y Field');
+        createDropZoneClickHandler(colorDropZoneEl, (val) => colorField = val, 'Drop Group Field');
+
+        new Sortable(fieldsListEl, {
+            group: { name: 'shared', pull: 'clone', put: false },
+            animation: 150,
+            sort: false,
+             // Prevent removal of items from the source list on drop
+            onClone: function (/**Event*/evt) { 
+                // console.log('cloned', evt.item);
+            }
+        });
+
+        [xAxisDropZoneEl, yAxisDropZoneEl, colorDropZoneEl].forEach((zone, index) => {
+            new Sortable(zone, {
+                group: 'shared',
+                animation: 150,
+                onAdd: function (evt) {
+                    const itemEl = evt.item; // The dragged element (clone from fieldsList)
+                    const fieldName = itemEl.dataset.fieldName; // Get field name from data attribute
+                    
+                    // Remove the item added by SortableJS (it's the li from the source list)
+                    itemEl.parentNode.removeChild(itemEl);
+                    
+                    // Update the correct field variable and the UI
+                    let placeholderText = 'Drop Field';
+                    if (zone === xAxisDropZoneEl) {
+                        if (xField && xField !== fieldName) { /* Optionally handle if a field was already there */ }
+                        xField = fieldName;
+                        placeholderText = 'Drop X Field';
+                    } else if (zone === yAxisDropZoneEl) {
+                        if (yField && yField !== fieldName) { /* Optionally handle */ }
+                        yField = fieldName;
+                        placeholderText = 'Drop Y Field';
+                    } else if (zone === colorDropZoneEl) {
+                        if (colorField && colorField !== fieldName) { /* Optionally handle */ }
+                        colorField = fieldName;
+                        placeholderText = 'Drop Group Field';
+                    }
+                    updateDropZoneVisual(zone, fieldName, placeholderText);
+                    renderChart();
+                },
+                // Optional: onRemove if you want to clear field if dragged out and not to another zone
+                // onRemove: function(evt) { ... }
+            });
+        });
+
+        document.addEventListener('DOMContentLoaded', function() {
+            updateDropZoneVisual(xAxisDropZoneEl, xField, 'Drop X Field');
+            updateDropZoneVisual(yAxisDropZoneEl, yField, 'Drop Y Field');
+            updateDropZoneVisual(colorDropZoneEl, colorField, 'Drop Group Field');
+            renderChart(); 
+        });
+
+        function renderChart() {
+            const chartType = document.getElementById('chartType').value.toLowerCase();
+            const aggregation = document.getElementById('aggregation').value;
+            const showTooltips = document.getElementById('showTooltips').checked;
+            const chartDiv = document.getElementById('chartDiv');
+
+            console.log("Attempting to render chart:", { xField, yField, colorField, chartType, aggregation, showTooltips });
+
+            if (currentChart && typeof Plotly.purge === 'function') {
+                Plotly.purge(chartDiv);
+                currentChart = null; // Reset currentChart
+            }
+
+            // Use D&D fields: xField, yField, colorField
+            const xAxisField = xField;
+            const yAxisField = yField;
+            const colorAxisField = colorField;
+
+            // Validation (adapted from original full script)
+            if (!yAxisField && chartType !== 'histogram' && !(aggregation === 'count' && xAxisField)) {
+                chartDiv.innerHTML = 'Please select a Y-Axis/Value field (or X-Axis for Count aggregation).';
+                return;
+            }
+            if (!xAxisField && (chartType !== 'pie' && chartType !== 'histogram') && !(aggregation === 'count' && yAxisField) ) {
+                 if (chartType === 'pie' && yAxisField) { /* Pie can work with just Y */ } 
+                 else if (chartType === 'histogram' && (yAxisField || xAxisField) ) { /* Histogram can work with just Y or X */ } 
+                 else {
+                    chartDiv.innerHTML = 'Please select an X-Axis field (or Y-Axis for Count aggregation).';
+                    return;
+                 }
+            }
+            if (chartData.length === 0) {
+                chartDiv.innerHTML = 'No data available to render the chart.';
+                return;
+            }
+
+            let plotTraces = []; // Changed variable name to avoid conflict
+            let layout = {
+                title: `${chartType.charAt(0).toUpperCase() + chartType.slice(1)} Chart`,
+                xaxis: { title: xAxisField || (chartType === 'histogram' && (yAxisField || xAxisField) ? (yAxisField || xAxisField) : 'Category') },
+                yaxis: { 
+                    title: yAxisField || (aggregation === 'count' ? 'Count' : 'Value'),
+                    tickformat: ",.1s"
+                },
+                height: chartDiv.clientHeight > 100 ? chartDiv.clientHeight - 20 : 450, 
+                width: chartDiv.clientWidth > 100 ? chartDiv.clientWidth - 20 : 700,
+                margin: { t: 50, b: 50, l: 60, r: 30 }, // Adjusted margins
+                hovermode: showTooltips ? 'closest' : false // Control overall hover behavior
+            };
+
+            const xValues = xAxisField ? chartData.map(row => row[xAxisField]) : null;
+            let yValues = yAxisField ? chartData.map(row => row[yAxisField]) : null;
+            const colorValues = colorAxisField ? chartData.map(row => row[colorAxisField]) : null;
+
+            if (colorAxisField && ['bar', 'line', 'scatter', 'box'].includes(chartType)) {
+                const uniqueGroups = [...new Set(colorValues.filter(cv => cv !== null && cv !== undefined))].sort();
+                uniqueGroups.forEach(group => {
+                    const groupDataIndices = chartData.map((row, idx) => row[colorAxisField] === group ? idx : -1).filter(idx => idx !== -1);
+                    const groupX = xAxisField ? groupDataIndices.map(i => chartData[i][xAxisField]) : Array(groupDataIndices.length).fill(String(group));
+                    let groupY = yAxisField ? groupDataIndices.map(i => chartData[i][yAxisField]) : null;
+                    
+                    let processedY = groupY;
+                    let processedX = groupX;
+
+                    if (yAxisField && aggregation !== 'none' && chartType !== 'box' && chartType !== 'scatter') {
+                        const aggregationMap = new Map();
+                        const currentXValuesForAgg = xAxisField ? groupX : [String(group)];
+                        
+                        for(let i = 0; i < currentXValuesForAgg.length; i++) {
+                            const key = currentXValuesForAgg[i];
+                            const val = parseFloat(groupY ? groupY[i] : 1); 
+                            if (!aggregationMap.has(key)) aggregationMap.set(key, []);
+                            if (aggregation === 'count') aggregationMap.get(key).push(1);
+                            else if (!isNaN(val)) aggregationMap.get(key).push(val);
+                        }
+                        processedX = [...aggregationMap.keys()];
+                        processedY = processedX.map(key => {
+                            const values = aggregationMap.get(key);
+                            if (!values || values.length === 0) return aggregation === 'count' ? 0 : null; // Return null for non-count aggs if no data
+                            if (aggregation === 'sum') return values.reduce((a, b) => a + b, 0);
+                            if (aggregation === 'avg') return values.reduce((a, b) => a + b, 0) / values.length;
+                            if (aggregation === 'count') return values.length;
+                            if (aggregation === 'min') return Math.min(...values);
+                            if (aggregation === 'max') return Math.max(...values);
+                            return null;
+                        });
+                        layout.xaxis = { title: xAxisField || colorAxisField };
+                    } else if (!yAxisField && aggregation === 'count') {
+                        const countMap = new Map();
+                        const valuesToCount = xAxisField ? groupX : [String(group)];
+                        valuesToCount.forEach(key => countMap.set(key, (countMap.get(key) || 0) + 1));
+                        processedX = [...countMap.keys()];
+                        processedY = processedX.map(key => countMap.get(key));
+                        layout.yaxis = { title: 'Count' };
+                        layout.xaxis = { title: xAxisField || colorAxisField };
+                    }
+
+                    let currentTrace = { x: processedX, y: processedY, name: String(group), type: chartType };
+                    if (chartType === 'scatter') currentTrace.mode = 'markers';
+                    if (chartType === 'line') currentTrace.mode = 'lines+markers';
+                    if (chartType === 'box') { 
+                        currentTrace.y = groupY ? groupY.map(v => parseFloat(v)).filter(v => !isNaN(v)) : []; 
+                        currentTrace.x = xAxisField ? groupX : undefined; 
+                        currentTrace.name = String(group); 
+                    }
+                    
+                    currentTrace.hoverinfo = showTooltips ? 'all' : 'none';
+
+                    if (showTooltips) {
+                        if (chartType === 'pie') {
+                            currentTrace.hoverinfo = 'label+percent+value';
+                            currentTrace.textinfo = 'label+percent+value';
+                        } else if (chartType === 'bar' || chartType === 'line' || chartType === 'scatter') {
+                            currentTrace.text = processedY ? processedY.map(v => formatNumber(v)) : [];
+                            currentTrace.textposition = 'auto';
+                            currentTrace.hovertemplate = `<b>${xAxisField || 'Category'}:</b> %{x}<br><b>${yAxisField || 'Value'}:</b> %{y:,.2f}<extra></extra>`;
+                            if (colorAxisField && group) { // group is the legend item name
+                                currentTrace.hovertemplate = `<b>${colorAxisField}:</b> ${group}<br><b>${xAxisField || 'Category'}:</b> %{x}<br><b>${yAxisField || 'Value'}:</b> %{y:,.2f}<extra></extra>`;
+                            }
+
+                            if (chartType === 'line') currentTrace.mode = 'lines+markers+text';
+                            if (chartType === 'scatter') currentTrace.mode = 'markers+text';
+                        }
+                    } else {
+                        currentTrace.hoverinfo = 'none'; // Explicitly turn off if showTooltips is false
+                        if (chartType === 'pie') {
+                            currentTrace.textinfo = 'none';
+                        }
+                        // For other types, text is implicitly off if not set, and mode doesn't include 'text'
+                    }
+
+                    plotTraces.push(currentTrace);
+                });
+                 if (chartType === 'bar' && colorAxisField) layout.barmode = 'group';
+
+            } else { // No color grouping or specific chart types like pie/histogram
+                let processedY = yValues;
+                let processedX = xValues;
+
+                if (yAxisField && aggregation !== 'none' && chartType !== 'box' && chartType !== 'scatter' && chartType !== 'pie' && chartType !== 'histogram') {
+                    const aggregationMap = new Map();
+                    if (xAxisField) {
+                        for(let i = 0; i < xValues.length; i++) {
+                            const key = xValues[i];
+                            const val = parseFloat(yValues[i]);
+                            if (!aggregationMap.has(key)) aggregationMap.set(key, []);
+                             if (aggregation === 'count') aggregationMap.get(key).push(1);
+                            else if (!isNaN(val)) aggregationMap.get(key).push(val);
+                        }
+                        processedX = [...aggregationMap.keys()];
+                        processedY = processedX.map(key => {
+                            const values = aggregationMap.get(key);
+                            if (!values || values.length === 0) return aggregation === 'count' ? 0 : null;
+                            if (aggregation === 'sum') return values.reduce((a, b) => a + b, 0);
+                            if (aggregation === 'avg') return values.reduce((a, b) => a + b, 0) / values.length;
+                            if (aggregation === 'count') return values.length;
+                            if (aggregation === 'min') return Math.min(...values);
+                            if (aggregation === 'max') return Math.max(...values);
+                            return null;
+                        });
+                    } else { 
+                        const allRelevantYValues = yValues.map(v => aggregation === 'count' ? 1 : parseFloat(v)).filter(v => !isNaN(v));
+                        if (allRelevantYValues.length > 0) {
+                            if (aggregation === 'sum' || aggregation === 'avg') processedY = [allRelevantYValues.reduce((a, b) => a + b, 0) / (aggregation === 'avg' ? allRelevantYValues.length : 1)];
+                            else if (aggregation === 'count') processedY = [allRelevantYValues.length];
+                            else if (aggregation === 'min') processedY = [Math.min(...allRelevantYValues)];
+                            else if (aggregation === 'max') processedY = [Math.max(...allRelevantYValues)];
+                            processedX = [yAxisField]; 
+                        } else { processedY = []; processedX = []; }
+                        layout.xaxis = {title: 'Category'}; 
+                    }
+                } else if (!yAxisField && aggregation === 'count') { 
+                    const countMap = new Map();
+                    if (xAxisField) {
+                        xValues.forEach(key => countMap.set(key, (countMap.get(key) || 0) + 1));
+                        processedX = [...countMap.keys()];
+                        processedY = processedX.map(key => countMap.get(key));
+                    } else { 
+                        processedX = ["Total Rows"];
+                        processedY = [chartData.length];
+                    }
+                    layout.yaxis = { title: 'Count' };
+                }
+
+                let baseTrace = { x: processedX, y: processedY, type: chartType }; // Default trace
+
+                if (chartType === 'pie') {
+                    let pieLabels, pieValues;
+                    if (xAxisField && yAxisField) {
+                        const pieMap = new Map();
+                        // Use already aggregated processedX and processedY if available from above block
+                        const labelsForPie = (aggregation !=='none' && xAxisField) ? processedX : xValues;
+                        const valuesForPie = (aggregation !=='none' && yAxisField) ? processedY : yValues;
+
+                        for(let i=0; i < labelsForPie.length; i++){ 
+                            const key = labelsForPie[i]; 
+                            const val = parseFloat(valuesForPie[i]);
+                            if(!pieMap.has(key)) pieMap.set(key, 0);
+                            if(!isNaN(val)) pieMap.set(key, pieMap.get(key) + val); 
+                        }
+                        pieLabels = [...pieMap.keys()]; pieValues = pieLabels.map(k => pieMap.get(k));
+                    } else if (yAxisField) { 
+                        const valueMap = new Map();
+                        const valuesToCategorize = (aggregation !== 'none' && !xAxisField) ? processedY : yValues; // Use processed if available & no specific X labels
+                        valuesToCategorize.forEach(val_orig => {
+                            const val = String(val_orig); // Ensure key is string for map
+                            const numVal = parseFloat(val_orig);
+                            if (aggregation === 'count' || (aggregation === 'none' && isNaN(numVal))) {
+                                valueMap.set(val, (valueMap.get(val) || 0) + 1);
+                            } else if (!isNaN(numVal)) { 
+                                valueMap.set(val, (valueMap.get(val) || 0) + numVal);
+                            } else { // Fallback for non-numeric if not specifically counting, count them too
+                                valueMap.set(val, (valueMap.get(val) || 0) + 1);
+                            }
+                        });
+                        pieLabels = [...valueMap.keys()]; pieValues = pieLabels.map(k => valueMap.get(k));
+                    } else { chartDiv.innerHTML = 'For Pie chart, select Y-Axis (Values) and optionally X-Axis (Labels).'; return; }
+                    baseTrace = { type: 'pie', labels: pieLabels, values: pieValues, 
+                                  hoverinfo: showTooltips ? 'label+percent+value' : 'none', 
+                                  texttemplate: showTooltips ? pieValues.map((v, i) => `${pieLabels[i]}: ${formatNumber(v)} (%{percent})`).join('<br>') : '',
+                                  textinfo: showTooltips ? 'label+percent+value' : 'none' }; 
+                    layout.title = `Pie Chart of ${yAxisField}` + (xAxisField ? ` by ${xAxisField}` : ``);
+                    layout.xaxis = undefined; layout.yaxis = undefined; // Pie doesn't use cartesian axes
+                } else if (chartType === 'histogram') {
+                    const valuesForHist = yAxisField ? yValues : (xAxisField ? xValues : []);
+                    if (colorAxisField) { 
+                        plotTraces = []; 
+                        const uniqueGroups = [...new Set(colorValues.filter(cv => cv !== null && cv !== undefined))].sort();
+                        uniqueGroups.forEach(group => {
+                            const groupDataIndices = chartData.map((row, idx) => row[colorAxisField] === group ? idx : -1).filter(idx => idx !== -1);
+                            const groupVals = groupDataIndices.map(i => valuesForHist[i]);
+                            plotTraces.push({ 
+                                x: groupVals.map(v => parseFloat(v)).filter(v => !isNaN(v)), 
+                                type: 'histogram', 
+                                name: String(group), 
+                                opacity: 0.7,
+                                hoverinfo: showTooltips ? 'all' : 'none',
+                                hovertemplate: showTooltips ? `<b>Range:</b> %{x}<br><b>Count:</b> %{y}<extra></extra>`: '',
+                                // Text on histograms is generally not shown per bar due to overlaps, controlled by histnorm or other layout attrs if needed
+                            });
+                        });
+                        layout.barmode = 'overlay'; baseTrace = null; 
+                    } else {
+                        baseTrace = { 
+                            x: valuesForHist.map(v => parseFloat(v)).filter(v => !isNaN(v)), 
+                            type: 'histogram',
+                            hoverinfo: showTooltips ? 'all' : 'none',
+                            hovertemplate: showTooltips ? `<b>Range:</b> %{x}<br><b>Count:</b> %{y}<extra></extra>`: ''
+                             // Text on histograms is generally not shown per bar
+                        };
+                    }
+                    layout.xaxis = { title: yAxisField || xAxisField || 'Value' }; 
+                    layout.yaxis = { title: "Frequency", tickformat: ",.0f" }; // Corrected: Double quotes. Histograms usually have integer counts
+                } else if (chartType === 'box') {
+                     baseTrace = { 
+                         y: yAxisField ? yValues.map(v=>parseFloat(v)).filter(v=>!isNaN(v)) : [], 
+                         type: 'box',
+                         hoverinfo: showTooltips ? 'all' : 'none',
+                         hovertemplate: showTooltips ? '<b>%{x}</b><br>Min: %{y[0]:.2f}<br>Q1: %{y[1]:.2f}<br>Median: %{y[2]:.2f}<br>Q3: %{y[3]:.2f}<br>Max: %{y[4]:.2f}<extra></extra>' : ''
+                         // Box plots typically don't show text values on the plot itself directly
+                    };
+                     if (xAxisField) { baseTrace.x = xValues; } // Group boxes by xField categories
+                     layout.yaxis = { title: yAxisField, tickformat: ",.1s" }; // Corrected: Double quotes. Apply to box plot Y-axis too
+                     layout.xaxis = { title: xAxisField };
+                }
+
+                if (showTooltips) {
+                    if (baseTrace && baseTrace.type && (baseTrace.type === 'bar' || baseTrace.type === 'line' || baseTrace.type === 'scatter')) {
+                        baseTrace.text = processedY ? processedY.map(v => formatNumber(v)) : [];
+                        baseTrace.textposition = 'auto';
+                        baseTrace.hovertemplate = `<b>${xAxisField || 'Category'}:</b> %{x}<br><b>${yAxisField || 'Value'}:</b> %{y:,.2f}<extra></extra>`;
+
+                        if (baseTrace.type === 'line') baseTrace.mode = 'lines+markers+text';
+                        if (baseTrace.type === 'scatter') baseTrace.mode = 'markers+text';
+                    }
+                     // hoverinfo for pie, histogram, box already handled within their specific blocks or by hovertemplate
+                } else {
+                     if (baseTrace) baseTrace.hoverinfo = 'none'; // General override for non-tooltips
+                     // For non-pie charts, if tooltips are off, ensure text is not displayed
+                     if (baseTrace && baseTrace.type && (baseTrace.type === 'bar' || baseTrace.type === 'line' || baseTrace.type === 'scatter')) {
+                        // No explicit text/textposition, mode will not include 'text' if not set prior
+                        if (baseTrace.type === 'line' && baseTrace.mode && baseTrace.mode.includes('+text')) {
+                            baseTrace.mode = baseTrace.mode.replace('+text', '');
+                        }
+                        if (baseTrace.type === 'scatter' && baseTrace.mode && baseTrace.mode.includes('+text')) {
+                           baseTrace.mode = baseTrace.mode.replace('+text', '');
+                        }
+                     }
+                }
+                
+                // Ensure hoverinfo is set for baseTrace if not pie/hist/box and not already set by hovertemplate
+                if (baseTrace && baseTrace.type && !['pie', 'histogram', 'box'].includes(baseTrace.type)) {
+                     if (!baseTrace.hovertemplate) { // Only set hoverinfo if hovertemplate hasn't been set
+                        baseTrace.hoverinfo = showTooltips ? 'all' : 'none';
+                     }
+                }
+
+                if (chartType === 'scatter' && baseTrace && !baseTrace.mode) baseTrace.mode = 'markers'; // ensure mode is set
+                if (chartType === 'line' && baseTrace && !baseTrace.mode) baseTrace.mode = 'lines+markers'; // ensure mode is set
+                
+                if (baseTrace && (baseTrace.x !== undefined || baseTrace.labels !== undefined)) plotTraces.push(baseTrace);
+            }
+            
+            // Update layout title
+            let chartTitle = `${chartType.charAt(0).toUpperCase() + chartType.slice(1)}`;
+            if (yAxisField) chartTitle += ` of ${yAxisField}`;
+            else if (aggregation === 'count' && xAxisField) chartTitle += ` Count by ${xAxisField}`;
+            else if (xAxisField) chartTitle += ` of ${xAxisField}`;
+            else chartTitle += ` Chart`;
+            if (xAxisField && yAxisField && chartType !=='pie' && !(chartType==='histogram' && !yAxisField)) chartTitle += ` by ${xAxisField}`;
+            if (colorAxisField) chartTitle += ` (Grouped by ${colorAxisField})`;
+            layout.title = chartTitle;
+
+            if (plotTraces.length > 0 && plotTraces.some(t => (t.x && t.x.length > 0) || (t.labels && t.labels.length > 0) || (t.values && t.values.length > 0) ) ) {
+                 currentChart = Plotly.newPlot('chartDiv', plotTraces, layout, {responsive: true});
+            } else {
+                 chartDiv.innerHTML = 'Cannot render chart. Check field selections, data types (Y-axis for aggregations should be numeric), and ensure data is available.';
+            }
+        }
+    </script>
+</body>
+</html> 
