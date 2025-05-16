@@ -23,6 +23,7 @@ import glob
 from enhanced_table_view import EnhancedTableViewDialog
 from excel_viewer_dialog import ExcelViewDialog
 from json_viewer_dialog import JsonViewDialog
+from query_file_dialog import QueryFileDialog # Added import
 
 DARK_STYLESHEET = """
     QWidget {
@@ -1439,6 +1440,11 @@ class DuckDBApp(QMainWindow):
         view_json_action.triggered.connect(self.view_json_file)
         file_menu.addAction(view_json_action)
 
+        query_file_action = QAction("&Query File...", self)
+        query_file_action.triggered.connect(self.open_query_file_dialog)
+        file_menu.addAction(query_file_action)
+
+        file_menu.addSeparator()
         exit_action = QAction("&Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
@@ -3676,6 +3682,10 @@ class DuckDBApp(QMainWindow):
             dialog.exec()
         except Exception as e: 
             QMessageBox.critical(self, "Error", f"Could not open JSON viewer or process annotation: {e}")
+
+    def open_query_file_dialog(self):
+        dialog = QueryFileDialog(self)
+        dialog.exec()
 
 
 class BulkExcelImportWorker(QObject):
